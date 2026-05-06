@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ lecture.title }} · LectureMind 讲义</title>
+  {% if katex_assets_available %}
+  <link rel="stylesheet" href="assets/katex/katex.min.css" />
+  {% endif %}
+  <style>
+{{ css_inline }}
+  </style>
+  {% if copilot_css_inline %}
+  <style>
+{{ copilot_css_inline }}
+  </style>
+  {% endif %}
+</head>
+<body data-bv="{{ lecture.bv_id }}">
+  <a class="topbar-back" href="/">← 返回讲义库</a>
+
+  <header class="cover">
+    {% if cover_url %}
+    <div class="cover-img" style="background-image:url('{{ cover_url }}')"></div>
+    {% endif %}
+    <div class="cover-meta">
+      <h1>{{ lecture.title | rich_text }}</h1>
+      <div class="meta-line">
+        <span>UP {{ lecture.author }}</span>
+        <span>·</span>
+        <span>时长 {{ lecture.duration | fmt_dur }}</span>
+        <span>·</span>
+        <a href="{{ bili_link(lecture.bv_id, 0) }}" target="_blank" rel="noopener">原视频 ↗</a>
+      </div>
+      {% if lecture.one_liner %}
+      <p class="one-liner">{{ lecture.one_liner | rich_text }}</p>
+      {% endif %}
+      {% if lecture.core_question %}
+      <div class="hero-question">
+        <span>核心问题</span>
+        <p>{{ lecture.core_question | rich_text }}</p>
+      </div>
+      {% endif %}
+      {% if lecture.domain_tags %}
+      <div class="tags">
+        {% for tag in lecture.domain_tags %}<span class="tag">#{{ tag }}</span>{% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </header>
+
+  <nav class="chapter-nav" aria-label="章节导航">
+    <ol>
+      {% for ch in lecture.chapters %}
+      <li><a href="#chapter-{{ ch.index }}"><span class="num">{{ ch.index }}</span>{{ ch.title | rich_text }}</a></li>
+      {% endfor %}
+    </ol>
+  </nav>
+
+  <main class="content">
+    {% if mainline_items %}
+    <section class="mainline-section">
+      <h2>主线推进路径</h2>
+      <div class="mainline-steps">
+        {% for item in mainline_items %}
+        <article class="mainline-step">
+          <span class="path-step">{{ loop.index }}</span>
+          <p>{{ item | rich_text }}</p>
+        </article>
+        {% endfor %}
+      </div>
+      {% if timeline_turning_points or timeline_state_evolution %}
+      <details class="mainline-details">
+        <summary>展开关键转折与信息演化</summary>
+        {% if timeline_turning_points %}
+        <div class="timeline-subsection">
+          <h3>关键转折</h3>
+          <div class="timeline-detail-list">
+            {% for item in timeline_turning_points %}
+            <article class="timeline-detail-item{% if not item.time %} no-time{% endif %}">
+              {% if item.time %}<span class="timeline-time">{{ item.time }}</span>{% endif %}
+              <p>{{ item.text | rich_text }}</p>
+            </article>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        {% if timeline_state_evolution %}
+        <div class="timeline-subsection">
+          <h3>信息演化</h3>
+          <div class="timeline-detail-list">
+            {% for item in timeline_state_evolution %}
+            <article class="timeline-detail-item{% if not item.time %} no-time{% endif %}">
+              {% if item.time %}<span class="timeline-time">{{ item.time }}</span>{% endif %}
+              <p>{{ item.text | rich_text }}</p>
+            </article>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+      </details>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% for ch in lecture.chapters %}
+    <section class="chapter" id="chapter-{{ ch.index }}"
+             data-ref-kind="chapter" data-ref-id="{{ ch.index }}"
+             data-ch-start="{{ ch.start | int }}" data-ch-end="{{ ch.end | int }}">
+      <header class="chapter-head">
+        <div>
+          <span class="chapter-no">章节 {{ ch.index }}</span>
+          <h2>{{ ch.title | rich_text }}</h2>
+        </div>
+        <a class="anchor-btn" href="{{ bili_link(lecture.bv_id, ch.start) }}" target="_blank" rel="noopener">
+          {{ ch.start | fmt_ts }} – {{ ch.end | fmt_ts }} · 在 B 站定位看 ↗
+        </a>
+      </header>
+
+      {% if ch.learning_goal %}
+      <div class="learning-goal">
+        <span>本章问题</span>
+        <p>{{ ch.learning_goal | rich_text }}</p>
+      </div>
+      {% endif %}
+
+      {% if ch.summary %}
+      <div class="chapter-summary rich-text">{{ ch.summary | rich_text }}</div>
+      {% endif %}
+
+      {% if ch.teaching_notes %}
+      <div class="teaching-notes">
+        <h3>讲解</h3>
+        {% for note in ch.teaching_notes %}
+        <div class="rich-paragraph">{{ note | rich_text }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if ch.process_steps %}
+      <div class="process-steps">
+        <h3>过程拆解</h3>
+        <ol>
+          {% for step in ch.process_steps %}
+          <li>{{ step | rich_text }}</li>
+          {% endfor %}
+        </ol>
+      </div>
+      {% endif %}
+
+      {% if ch.frames %}
+      <div class="frame-strip">
+        {% for fr in ch.frames %}
+        <figure class="frame frame-compact"
+                {% if frame_id_map and fr.path in frame_id_map %}id="frame-{{ frame_id_map[fr.path] }}" data-ref-kind="frame" data-ref-id="{{ frame_id_map[fr.path] }}"{% endif %}>
+          <img src="{{ frame_url(fr.path) }}" alt="frame at {{ fr.ts | fmt_ts }}" loading="lazy" />
+          <figcaption>
+            <a href="{{ bili_link(lecture.bv_id, fr.ts) }}" target="_blank" rel="noopener">⚓ {{ fr.ts | fmt_ts }}</a>
+            {% if frame_id_map and fr.path in frame_id_map %}<span class="frame-id">F{{ frame_id_map[fr.path] }}</span>{% endif %}
+            {% if fr.visual_type %}<span class="visual-type">{{ fr.visual_type }}</span>{% endif %}
+            {% if fr.caption %} · {{ fr.caption | rich_text }}{% endif %}
+          </figcaption>
+        </figure>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% set evidence = namespace(has_frame_details=false) %}
+      {% for fr in ch.frames %}
+        {% if fr.insight or fr.selected_reason or fr.ocr_text %}
+          {% set evidence.has_frame_details = true %}
+        {% endif %}
+      {% endfor %}
+      {% if evidence.has_frame_details or ch.points %}
+      <details class="evidence-details">
+        <summary>展开证据与引文</summary>
+        {% if evidence.has_frame_details %}
+        <div class="evidence-group">
+          <h4>图像补充</h4>
+          {% for fr in ch.frames %}
+          {% if fr.insight or fr.selected_reason or fr.ocr_text %}
+          <article class="evidence-item">
+            <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, fr.ts) }}" target="_blank" rel="noopener">⚓ {{ fr.ts | fmt_ts }}</a>
+            {% if fr.selected_reason or fr.insight %}
+            <p>{{ (fr.selected_reason or fr.insight) | rich_text }}</p>
+            {% endif %}
+            {% if fr.ocr_text %}
+            <details class="frame-ocr">
+              <summary>画面 OCR</summary>
+              <pre>{{ fr.ocr_text }}</pre>
+            </details>
+            {% endif %}
+          </article>
+          {% endif %}
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% if ch.points %}
+        <div class="evidence-group">
+          <h4>论点与引文</h4>
+          <ul class="points">
+            {% for p in ch.points %}
+            <li class="point point-compact">
+              <div class="point-row">
+                <span class="point-text">{{ p.text | rich_text }}</span>
+                <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, p.ts) }}" target="_blank" rel="noopener">⚓ {{ p.ts | fmt_ts }}</a>
+              </div>
+              {% if p.quote %}
+              <blockquote>{{ p.quote | rich_text }}</blockquote>
+              {% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+      </details>
+      {% endif %}
+
+      {% if ch.pitfalls %}
+      <div class="pitfalls">
+        <h3>易错点</h3>
+        <ul>
+          {% for item in ch.pitfalls %}
+          <li>{{ item | rich_text }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+
+      {% if ch.key_takeaways %}
+      <div class="key-takeaways">
+        <h3>本章关键结论</h3>
+        <ul>
+          {% for item in ch.key_takeaways %}
+          <li>{{ item | rich_text }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    {% if type_recap %}
+    <section class="adaptive-section {{ type_recap.style }}">
+      <h2>{{ type_recap.title }}</h2>
+      <div class="unit-grid">
+        {% for unit in type_recap.units %}
+        <article class="unit-card">
+          <span class="unit-type">{{ unit.type }}</span>
+          <h3>{{ unit.title | rich_text }}</h3>
+          {% if unit.explanation %}<p>{{ unit.explanation | rich_text }}</p>{% endif %}
+          <a href="{{ bili_link(lecture.bv_id, unit.ts) }}" target="_blank" rel="noopener">⚓ {{ unit.ts | fmt_ts }}</a>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% if lecture.glossary %}
+    <section class="glossary">
+      <h2>术语速查</h2>
+      <dl>
+        {% for g in lecture.glossary %}
+        <dt>
+          <a href="{{ bili_link(lecture.bv_id, g.ts) }}" target="_blank" rel="noopener">⚓ {{ g.ts | fmt_ts }}</a>
+          <strong>{{ g.term | rich_text }}</strong>
+        </dt>
+        {% if g.explanation %}<dd>{{ g.explanation | rich_text }}</dd>{% endif %}
+        {% endfor %}
+      </dl>
+    </section>
+    {% endif %}
+
+    {% if lecture.final_synthesis %}
+    <section class="final-synthesis">
+      <h2>最终综合</h2>
+      <div class="synthesis-body">{{ lecture.final_synthesis | rich_text }}</div>
+    </section>
+    {% endif %}
+
+    {% if lecture.review_questions %}
+    <section class="review-questions">
+      <h2>复习问题</h2>
+      <ul>
+        {% for q in lecture.review_questions %}
+        <li>{{ q | rich_text }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if lecture.render_plan.visual_evidence_section and global_visual_evidence %}
+    <section class="global-visual-evidence">
+      <h2>全局关键图解</h2>
+      {% for fr in global_visual_evidence %}
+      <figure class="frame evidence-card"
+              {% if frame_id_map and fr.path in frame_id_map %}id="frame-{{ frame_id_map[fr.path] }}" data-ref-kind="frame" data-ref-id="{{ frame_id_map[fr.path] }}"{% endif %}>
+        <img src="{{ frame_url(fr.path) }}" alt="frame at {{ fr.ts | fmt_ts }}" loading="lazy" />
+        <figcaption>
+          <a href="{{ bili_link(lecture.bv_id, fr.ts) }}" target="_blank" rel="noopener">⚓ {{ fr.ts | fmt_ts }}</a>
+          {% if fr.visual_type %}<span class="visual-type">{{ fr.visual_type }}</span>{% endif %}
+          {% if fr.caption %} · {{ fr.caption | rich_text }}{% endif %}
+        </figcaption>
+        {% if fr.selected_reason or fr.insight or fr.ocr_text %}
+        <details class="evidence-details">
+          <summary>展开图像说明</summary>
+          {% if fr.selected_reason or fr.insight %}
+          <p>{{ (fr.selected_reason or fr.insight) | rich_text }}</p>
+          {% endif %}
+          {% if fr.ocr_text %}
+          <details class="frame-ocr">
+            <summary>画面 OCR</summary>
+            <pre>{{ fr.ocr_text }}</pre>
+          </details>
+          {% endif %}
+        </details>
+        {% endif %}
+      </figure>
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if lecture.render_plan.completeness_card %}
+    <section class="completeness-card">
+      <div>
+        <h2>学习闭环检查</h2>
+        <p>{{ (lecture.completeness.notes or "已检查主线闭环、图文材料和可复用知识单元。") | rich_text }}</p>
+      </div>
+      <dl>
+        <div>
+          <dt>主线闭环</dt>
+          <dd>{{ "是" if lecture.completeness.mainline_closed else "待补强" }}</dd>
+        </div>
+        <div>
+          <dt>无需看视频理解</dt>
+          <dd>{{ "是" if lecture.completeness.reader_can_understand_without_video else "待补强" }}</dd>
+        </div>
+        <div>
+          <dt>图文覆盖</dt>
+          <dd>{{ (lecture.completeness.visual_coverage or "未说明") | rich_text }}</dd>
+        </div>
+        <div>
+          <dt>知识沉淀</dt>
+          <dd>{{ "可复用" if lecture.completeness.topic_reusability else "有限" }}</dd>
+        </div>
+      </dl>
+      {% set missing = lecture.completeness.missing_prerequisites + lecture.completeness.missing_steps + lecture.completeness.missing_examples + lecture.completeness.missing_boundaries %}
+      {% if missing %}
+      <div class="missing-list">
+        <strong>仍需注意：</strong>
+        <ul>{% for item in missing %}<li>{{ item | rich_text }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="generation-info">
+      <h2>生成信息</h2>
+      <dl>
+        <div>
+          <dt>视频类型</dt>
+          <dd>{{ lecture.profile.primary_type }}</dd>
+        </div>
+        <div>
+          <dt>内容密度</dt>
+          <dd>{{ lecture.profile.density }}</dd>
+        </div>
+        <div>
+          <dt>生成模式</dt>
+          <dd>{{ lecture.generation_mode }}</dd>
+        </div>
+      </dl>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>由 LectureMind 自动生成 · {{ generated_at }}</span>
+    <span>·</span>
+    <a href="{{ bili_link(lecture.bv_id, 0) }}" target="_blank" rel="noopener">原视频 ↗</a>
+  </footer>
+
+  <!-- Copilot panel stub + loader.  The actual DOM is built lazily by
+       copilot.js on DOMContentLoaded so this element can live anywhere
+       in <body>; keeping it at the end avoids layout shift. -->
+  <aside id="cp-panel"
+         data-bv="{{ lecture.bv_id }}"
+         data-title="{{ lecture.title | default('', true) }}"></aside>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script defer src="/static/copilot.js"></script>
+
+  {% if katex_assets_available %}
+  <script defer src="assets/katex/katex.min.js"></script>
+  <script defer src="assets/katex/contrib/mhchem.min.js"></script>
+  <script defer src="assets/katex/contrib/auto-render.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      var target = document.querySelector(".content");
+      if (!target || !window.renderMathInElement) {
+        return;
+      }
+      window.renderMathInElement(target, {
+        delimiters: [
+          {left: "$$", right: "$$", display: true},
+          {left: "\\[", right: "\\]", display: true},
+          {left: "\\(", right: "\\)", display: false},
+          {left: "$", right: "$", display: false}
+        ],
+        throwOnError: false
+      });
+    });
+  </script>
+  {% endif %}
+</body>
+</html>

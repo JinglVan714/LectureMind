@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Env
+.env
+.env.*
+!.env.example
+.env.local
+
+# Runtime data
+data/
+*.log
+
+# --- Dev-only artefacts (kept out of the public repo) ---
+/README_develop.md
+/handoff.md
+/handoff_copilot.md
+/scripts/_debug_*.py
+/scripts/debug_*.py
+/scripts/_verify_*.py
+/docs/qa/
+/docs/superpowers/
+
+# IDE
+.vscode/
+.idea/
+.history/
+.windsurf/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artefacts
+dist/
+build/
+site/

@@ -1,0 +1,48 @@
+# Keep the build context lean: only ship code + project metadata.
+# Runtime data, caches, secrets, IDE state, and dev-only artefacts stay out.
+
+# --- VCS / IDE / OS ---
+.git/
+.gitignore
+.github/
+.history/
+.windsurf/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Python build / test caches ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+htmlcov/
+dist/
+build/
+site/
+
+# --- Secrets & local env ---
+.env
+.env.*
+!.env.example
+
+# --- Runtime data (mounted as a volume in compose) ---
+data/
+*.log
+
+# --- Tests & dev docs (image only needs `app/`) ---
+tests/
+docs/
+handoff*.md
+*.tmp
+*.bak
+
+# --- Optional: keep README so `pip install -e .` metadata works ---
+!README.md

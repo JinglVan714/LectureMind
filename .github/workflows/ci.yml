@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: regression (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Setup Node (for copilot.js syntax check)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[whisper]"
+          pip install pytest pytest-asyncio
+
+      - name: node --check copilot.js
+        run: node --check app/static/copilot.js
+
+      - name: compileall
+        run: python -m compileall app tests scripts
+
+      - name: pytest
+        run: python -m pytest tests/ -v
+        env:
+          # Smoke tests are offline by design; provide harmless placeholders
+          # so any code path that calls get_settings() does not crash.
+          DASHSCOPE_API_KEY: sk-ci-placeholder
+          BASIC_AUTH_USER: ci
+          BASIC_AUTH_PASSWORD: ci-password
+          DATA_DIR: ./data
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: lecturemind:ci

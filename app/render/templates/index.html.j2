@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LectureMind · 讲义库</title>
+  <style>
+{{ css_inline }}
+  </style>
+</head>
+<body class="index-page">
+  <header class="index-hero">
+    <h1>LectureMind</h1>
+    <p class="tagline">把 B 站视频变成能点回原片、能吃透的交互式讲义。</p>
+
+    <form class="submit-form" id="submit-form">
+      <input type="text" name="url" placeholder="粘贴 B 站链接或 BV 号" required />
+      <button type="submit">生成讲义</button>
+    </form>
+    <div class="job-status" id="job-status" hidden></div>
+  </header>
+
+  <main class="index-content">
+    <h2>已生成的讲义 <span class="count">{{ summaries | length }}</span></h2>
+    {% if not summaries %}
+      <p class="empty">还没有讲义。粘贴一个 B 站链接开始吧。</p>
+    {% else %}
+    <section class="library-controls" id="library-controls" aria-label="讲义库搜索筛选">
+      <label class="library-search">
+        <span>搜索</span>
+        <input type="search" id="library-search" placeholder="标题 / BV / 作者 / 方向 / 标签" autocomplete="off" />
+      </label>
+      <label class="library-filter">
+        <span>Domain</span>
+        <select id="library-filter-domain">
+          <option value="">全部领域</option>
+          {% for g in groups %}
+          {% if not g.needs_review %}<option value="{{ g.domain }}">{{ g.domain }}</option>{% endif %}
+          {% endfor %}
+        </select>
+      </label>
+      <label class="library-filter">
+        <span>Direction</span>
+        <select id="library-filter-direction">
+          <option value="">全部方向</option>
+        </select>
+      </label>
+      <label class="library-filter">
+        <span>状态</span>
+        <select id="library-filter-status">
+          <option value="">全部</option>
+          <option value="classified">已分类</option>
+          <option value="pending">待归类</option>
+        </select>
+      </label>
+      <button type="button" class="library-reset" id="library-filter-reset">重置</button>
+      <output class="library-result-count" id="library-result-count">{{ summaries | length }} / {{ summaries | length }}</output>
+    </section>
+    <p class="library-empty-state" id="library-empty-state" hidden>没有匹配的讲义，试试减少关键词或清空筛选。</p>
+    <div class="domain-tree" data-testid="domain-tree">
+      {% for g in groups %}
+      <details class="domain-group{% if g.needs_review %} needs-review{% endif %}" data-domain="{{ g.domain }}" open>
+        <summary class="domain-summary">
+          <span class="domain-caret" aria-hidden="true">▸</span>
+          <span class="domain-name">{{ g.domain }}</span>
+          <span class="domain-count">{{ g.count }}</span>
+          {% if g.needs_review %}
+          <span class="domain-badge" title="缺少 domain / direction 或被 LLM 归到「其他」">待手动归类</span>
+          {% endif %}
+        </summary>
+        {% if not g.needs_review and (g.directions | length) >= 5 %}
+        <div class="direction-fragment-hint">
+          当前领域已有 {{ g.directions | length }} 个方向；若多个方向语义相近，建议编辑卡片并复用已有中层方向。
+        </div>
+        {% endif %}
+
+        {% for d in g.directions %}
+        <details class="direction-group" {% if loop.first or g.needs_review %}open{% endif %}>
+          <summary class="direction-summary">
+            <span class="direction-caret" aria-hidden="true">▸</span>
+            <span class="direction-name">{{ d.direction or "（未指定方向）" }}</span>
+            <span class="direction-count">{{ d.count }}</span>
+          </summary>
+          <div class="card-grid">
+            {% for s in d.cards %}
+            <article class="card" data-bv="{{ s.bv_id }}"
+                     data-domain="{{ s.domain or '' }}"
+                     data-direction="{{ s.direction or '' }}"
+                     data-tags="{{ (s.domain_tags or []) | join(',') }}">
+              <a class="card-link" href="/reports/{{ s.bv_id }}.html">
+                {% set cover = index_cover_url(s) %}
+                {% if cover %}
+                <div class="card-cover" style="background-image:url('{{ cover }}')"></div>
+                {% else %}
+                <div class="card-cover placeholder"></div>
+                {% endif %}
+                <div class="card-body">
+                  <h3>{{ s.title or s.bv_id }}</h3>
+                  <div class="card-meta">
+                    <span>{{ s.author or "—" }}</span>
+                    <span>·</span>
+                    <span>{{ s.duration | fmt_dur }}</span>
+                  </div>
+                  {% if s.domain_tags %}
+                  <div class="card-tags">
+                    {% for t in s.domain_tags[:4] %}<span class="card-tag">{{ t }}</span>{% endfor %}
+                  </div>
+                  {% endif %}
+                  <div class="card-time">{{ s.created_at }}</div>
+                </div>
+              </a>
+              <button type="button" class="card-edit-btn" aria-label="编辑分类" data-edit-bv="{{ s.bv_id }}">✎</button>
+            </article>
+            {% endfor %}
+          </div>
+        </details>
+        {% endfor %}
+      </details>
+      {% endfor %}
+    </div>
+
+    <!-- Inline taxonomy editor (hidden until a pencil is clicked). -->
+    <dialog class="tax-editor" id="tax-editor" aria-label="编辑讲义分类">
+      <form method="dialog" id="tax-editor-form">
+        <header class="tax-editor-head">
+          <strong>编辑分类</strong>
+          <code class="tax-editor-bv" id="tax-editor-bv"></code>
+        </header>
+        <label class="tax-field">
+          <span>Domain</span>
+          <select id="tax-domain" required>
+            {% for d in domain_whitelist %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="tax-field">
+          <span>Direction</span>
+          <input type="text" id="tax-direction" maxlength="80" list="tax-direction-list" placeholder="例如：注意力机制" />
+          <datalist id="tax-direction-list"></datalist>
+        </label>
+        <div class="tax-direction-governance" id="tax-direction-governance" hidden>
+          <div class="tax-direction-hint" id="tax-direction-hint"></div>
+          <div class="tax-direction-suggestions" id="tax-direction-suggestions"></div>
+        </div>
+        <label class="tax-field">
+          <span>Tags</span>
+          <input type="text" id="tax-tags" maxlength="200" placeholder="逗号分隔，最多 8 个" />
+        </label>
+        <div class="tax-editor-status" id="tax-editor-status" hidden></div>
+        <footer class="tax-editor-actions">
+          <button type="button" class="tax-btn-cancel" id="tax-cancel">取消</button>
+          <button type="submit" class="tax-btn-save" id="tax-save">保存</button>
+        </footer>
+      </form>
+    </dialog>
+    {% endif %}
+  </main>
+
+  <footer class="footer">
+    <span>LectureMind · {{ generated_at }}</span>
+  </footer>
+
+  <script>
+  (function(){
+    const controls = document.getElementById('library-controls');
+    if (!controls) return;
+    const searchInput = document.getElementById('library-search');
+    const domainSelect = document.getElementById('library-filter-domain');
+    const directionSelect = document.getElementById('library-filter-direction');
+    const statusSelect = document.getElementById('library-filter-status');
+    const resetBtn = document.getElementById('library-filter-reset');
+    const resultCount = document.getElementById('library-result-count');
+    const emptyState = document.getElementById('library-empty-state');
+    const cards = Array.from(document.querySelectorAll('.domain-tree .card'));
+    const total = cards.length;
+
+    function normalized(text) {
+      return String(text || '').trim().toLowerCase();
+    }
+
+    function cardDomain(card) {
+      return (card.dataset.domain || '').trim();
+    }
+
+    function cardDirection(card) {
+      return (card.dataset.direction || '').trim();
+    }
+
+    function cardNeedsReview(card) {
+      const domain = cardDomain(card);
+      return !domain || domain === '其他' || !cardDirection(card);
+    }
+
+    function cardHaystack(card) {
+      const title = card.querySelector('h3');
+      const meta = card.querySelector('.card-meta');
+      return normalized([
+        card.dataset.bv || '',
+        cardDomain(card),
+        cardDirection(card),
+        card.dataset.tags || '',
+        title ? title.textContent : '',
+        meta ? meta.textContent : '',
+      ].join(' '));
+    }
+
+    function baseCardMatches(card, ignoreDirection) {
+      const query = normalized(searchInput.value);
+      const domain = domainSelect.value;
+      const direction = directionSelect.value;
+      const status = statusSelect.value;
+      const needsReview = cardNeedsReview(card);
+      if (query && !cardHaystack(card).includes(query)) return false;
+      if (domain && cardDomain(card) !== domain) return false;
+      if (!ignoreDirection && direction && cardDirection(card) !== direction) return false;
+      if (status === 'classified' && needsReview) return false;
+      if (status === 'pending' && !needsReview) return false;
+      return true;
+    }
+
+    function refreshDirectionOptions() {
+      const previous = directionSelect.value;
+      const directions = Array.from(new Set(
+        cards
+          .filter((card) => baseCardMatches(card, true))
+          .map(cardDirection)
+          .filter(Boolean)
+      )).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+      directionSelect.innerHTML = '<option value="">全部方向</option>';
+      directions.forEach((direction) => {
+        const opt = document.createElement('option');
+        opt.value = direction;
+        opt.textContent = direction;
+        directionSelect.appendChild(opt);
+      });
+      directionSelect.value = directions.includes(previous) ? previous : '';
+      directionSelect.disabled = directions.length === 0;
+    }
+
+    function applyFilters() {
+      const active = Boolean(
+        normalized(searchInput.value) ||
+        domainSelect.value ||
+        directionSelect.value ||
+        statusSelect.value
+      );
+      let visibleCount = 0;
+      cards.forEach((card) => {
+        const visible = baseCardMatches(card, false);
+        card.hidden = !visible;
+        if (visible) visibleCount += 1;
+      });
+      document.querySelectorAll('.direction-group').forEach((group) => {
+        const hasVisible = Array.from(group.querySelectorAll('.card')).some((card) => !card.hidden);
+        group.hidden = !hasVisible;
+        if (active && hasVisible) group.open = true;
+      });
+      document.querySelectorAll('.domain-group').forEach((group) => {
+        const hasVisible = Array.from(group.querySelectorAll('.direction-group')).some((d) => !d.hidden);
+        group.hidden = !hasVisible;
+        if (active && hasVisible) group.open = true;
+      });
+      resultCount.textContent = `${visibleCount} / ${total}`;
+      emptyState.hidden = visibleCount !== 0;
+      resetBtn.disabled = !active;
+    }
+
+    function onBroadFilterChange() {
+      refreshDirectionOptions();
+      applyFilters();
+    }
+
+    searchInput.addEventListener('input', onBroadFilterChange);
+    domainSelect.addEventListener('change', onBroadFilterChange);
+    statusSelect.addEventListener('change', onBroadFilterChange);
+    directionSelect.addEventListener('change', applyFilters);
+    resetBtn.addEventListener('click', () => {
+      searchInput.value = '';
+      domainSelect.value = '';
+      statusSelect.value = '';
+      directionSelect.value = '';
+      refreshDirectionOptions();
+      applyFilters();
+      searchInput.focus();
+    });
+    refreshDirectionOptions();
+    applyFilters();
+  })();
+
+  /* ----- Stage 8 · inline taxonomy editor ----- */
+  (function(){
+    const dlg = document.getElementById('tax-editor');
+    if (!dlg) return;
+    const inpBv = document.getElementById('tax-editor-bv');
+    const selDomain = document.getElementById('tax-domain');
+    const inpDirection = document.getElementById('tax-direction');
+    const directionList = document.getElementById('tax-direction-list');
+    const directionGovernance = document.getElementById('tax-direction-governance');
+    const directionHint = document.getElementById('tax-direction-hint');
+    const directionSuggestions = document.getElementById('tax-direction-suggestions');
+    const inpTags = document.getElementById('tax-tags');
+    const btnCancel = document.getElementById('tax-cancel');
+    const btnSave = document.getElementById('tax-save');
+    const statusEl = document.getElementById('tax-editor-status');
+    let currentBv = null;
+    const directionCountsByDomain = new Map();
+
+    document.querySelectorAll('.card').forEach((card) => {
+      const domain = (card.dataset.domain || '').trim();
+      const direction = (card.dataset.direction || '').trim();
+      if (!domain || domain === '其他' || !direction) return;
+      if (!directionCountsByDomain.has(domain)) directionCountsByDomain.set(domain, new Map());
+      const bucket = directionCountsByDomain.get(domain);
+      bucket.set(direction, (bucket.get(direction) || 0) + 1);
+    });
+
+    function directionsForDomain(domain) {
+      const bucket = directionCountsByDomain.get(domain);
+      if (!bucket) return [];
+      return Array.from(bucket.entries())
+        .map(([direction, count]) => ({ direction, count }))
+        .sort((a, b) => (b.count - a.count) || a.direction.localeCompare(b.direction, 'zh-CN'));
+    }
+
+    function updateDirectionSuggestions() {
+      const items = directionsForDomain(selDomain.value);
+      directionList.innerHTML = '';
+      directionSuggestions.innerHTML = '';
+      if (!items.length) {
+        directionGovernance.hidden = true;
+        directionHint.textContent = '';
+        return;
+      }
+      items.forEach((item) => {
+        const opt = document.createElement('option');
+        opt.value = item.direction;
+        directionList.appendChild(opt);
+      });
+      directionGovernance.hidden = false;
+      directionHint.textContent = items.length >= 5
+        ? '当前领域方向较多，优先复用已有中层方向；相近小方向建议合并。'
+        : '建议优先复用已有方向，避免把同类讲义拆散。';
+      items.slice(0, 10).forEach((item) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'tax-direction-chip';
+        chip.textContent = item.count > 1 ? `${item.direction} · ${item.count}` : item.direction;
+        chip.addEventListener('click', () => {
+          inpDirection.value = item.direction;
+          inpDirection.focus();
+        });
+        directionSuggestions.appendChild(chip);
+      });
+    }
+
+    document.querySelectorAll('.card-edit-btn').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const card = btn.closest('.card');
+        if (!card) return;
+        currentBv = card.dataset.bv || '';
+        inpBv.textContent = currentBv;
+        const d = card.dataset.domain || '';
+        // If the current domain is not in the whitelist, fall back to 其他.
+        const opt = Array.from(selDomain.options).find(o => o.value === d);
+        selDomain.value = opt ? d : '其他';
+        inpDirection.value = card.dataset.direction || '';
+        inpTags.value = card.dataset.tags || '';
+        updateDirectionSuggestions();
+        statusEl.hidden = true;
+        statusEl.textContent = '';
+        try {
+          if (typeof dlg.showModal === 'function') dlg.showModal();
+          else dlg.setAttribute('open', '');
+        } catch (_) { dlg.setAttribute('open', ''); }
+      });
+    });
+
+    selDomain.addEventListener('change', () => updateDirectionSuggestions());
+
+    function closeDialog() {
+      try { dlg.close(); } catch (_) { dlg.removeAttribute('open'); }
+    }
+
+    btnCancel.addEventListener('click', () => closeDialog());
+    dlg.addEventListener('cancel', () => closeDialog());
+
+    document.getElementById('tax-editor-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!currentBv) return;
+      const tags = inpTags.value
+        .split(',')
+        .map(t => t.trim())
+        .filter(Boolean)
+        .slice(0, 8);
+      const body = {
+        bv: currentBv,
+        domain: selDomain.value || null,
+        direction: inpDirection.value.trim() || null,
+        tags,
+      };
+      statusEl.hidden = false;
+      statusEl.textContent = '保存中…';
+      btnSave.disabled = true;
+      try {
+        const resp = await fetch('/api/copilot/taxonomy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          throw new Error('HTTP ' + resp.status + ' ' + txt.slice(0, 120));
+        }
+        statusEl.textContent = '已保存，正在刷新…';
+        setTimeout(() => location.reload(), 400);
+      } catch (err) {
+        statusEl.textContent = '保存失败：' + err.message;
+        btnSave.disabled = false;
+      }
+    });
+  })();
+
+  /* ----- submit + poll (unchanged) ----- */
+  (function(){
+    const form = document.getElementById('submit-form');
+    const status = document.getElementById('job-status');
+    if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const url = form.url.value.trim();
+      if (!url) return;
+      status.hidden = false;
+      status.textContent = '提交中…';
+      try {
+        const resp = await fetch('/api/summarize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, force_refresh: false })
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        if (data.cached && data.report_url) {
+          status.innerHTML = '已存在，<a href="' + data.report_url + '">直接打开 ↗</a>';
+          return;
+        }
+        if (!data.job_id) throw new Error('no job_id');
+        pollJob(data.job_id);
+      } catch (err) {
+        status.textContent = '提交失败：' + err.message;
+      }
+    });
+
+    async function pollJob(jobId) {
+      let tries = 0;
+      while (tries++ < 600) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const r = await fetch('/api/jobs/' + jobId);
+          if (!r.ok) { status.textContent = '查询失败（' + r.status + '）'; return; }
+          const j = await r.json();
+          if (j.status === 'done' && j.report_url) {
+            status.innerHTML = '完成！<a href="' + j.report_url + '">打开讲义 ↗</a>';
+            setTimeout(() => location.reload(), 800);
+            return;
+          }
+          if (j.status === 'failed') {
+            status.textContent = '失败：' + (j.error_msg || '未知错误');
+            return;
+          }
+          status.textContent = '生成中… ' + (j.progress || 0) + '%';
+        } catch (e) {
+          status.textContent = '轮询出错：' + e.message;
+        }
+      }
+    }
+  })();
+  </script>
+</body>
+</html>

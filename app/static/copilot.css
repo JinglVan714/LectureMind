@@ -1,0 +1,507 @@
+/*
+ * LectureMind Copilot — side panel, chips, anchors, selection pin.
+ *
+ * All rules live under the ``.cp-*`` prefix so they never collide with
+ * ``lecture.css``.  Dark-mode friendly (uses ``color-mix`` + system
+ * palette variables).  Mobile: <=768px the panel becomes a full-screen
+ * sheet; desktop: slides in as a 380px-wide right rail.
+ */
+
+:root {
+  --cp-fg: #111827;
+  --cp-fg-muted: #6b7280;
+  --cp-bg: #ffffff;
+  --cp-bg-raised: #f9fafb;
+  --cp-border: #e5e7eb;
+  --cp-accent: #5b4bdb;
+  --cp-accent-weak: #f0efff;
+  --cp-warn: #b45309;
+  --cp-warn-weak: #fef3c7;
+  --cp-anchor-flash: #fef08a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cp-fg: #e2e8f0;
+    --cp-fg-muted: #94a3b8;
+    --cp-bg: #0f172a;
+    --cp-bg-raised: #1e293b;
+    --cp-border: #334155;
+    --cp-accent: #818cf8;
+    --cp-accent-weak: #1e1b4b;
+    --cp-warn: #fbbf24;
+    --cp-warn-weak: #78350f;
+    --cp-anchor-flash: #713f12;
+  }
+}
+
+/* ---------------- FAB ---------------- */
+.cp-fab {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--cp-accent);
+  color: #ffffff;
+  border: none;
+  cursor: pointer;
+  font-size: 24px;
+  box-shadow: 0 10px 30px rgba(79, 70, 229, 0.28);
+  z-index: 9998;
+  transition: transform 0.15s ease;
+}
+.cp-fab:hover { transform: scale(1.08); }
+.cp-fab[aria-expanded="true"] { transform: rotate(45deg); }
+
+/* ---------------- Panel ---------------- */
+.cp-aside {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: min(380px, calc(100vw - 32px));
+  height: calc(100vh - 32px);
+  background: var(--cp-bg);
+  color: var(--cp-fg);
+  border: 1px solid var(--cp-border);
+  border-radius: 20px;
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.18);
+  display: flex;
+  flex-direction: column;
+  transform: translateX(calc(100% + 24px));
+  transition: transform 0.2s ease;
+  z-index: 9999;
+  font: 13px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  overflow: hidden;
+}
+.cp-aside.cp-open { transform: translateX(0); }
+
+@media (max-width: 520px) {
+  .cp-aside {
+    top: 0;
+    right: 0;
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+  }
+}
+
+.cp-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--cp-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(135deg, var(--cp-accent-weak), var(--cp-bg));
+}
+.cp-header-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--cp-fg);
+}
+.cp-header-sub {
+  font-size: 11px;
+  color: var(--cp-fg-muted);
+}
+.cp-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cp-clear,
+.cp-close {
+  background: var(--cp-bg);
+  border: 1px solid var(--cp-border);
+  border-radius: 999px;
+  color: var(--cp-fg-muted);
+  cursor: pointer;
+  padding: 0;
+}
+.cp-clear {
+  height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+.cp-close {
+  font-size: 18px;
+  width: 32px;
+  height: 32px;
+}
+.cp-clear:hover,
+.cp-close:hover {
+  color: var(--cp-accent);
+  border-color: var(--cp-accent);
+}
+
+/* ---------------- Message list ---------------- */
+.cp-messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 14px;
+  scrollbar-gutter: stable;
+  background: #f7f7f8;
+}
+.cp-message {
+  margin: 0 0 16px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  max-width: 100%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.cp-message-user {
+  background: #f1efff;
+  color: var(--cp-fg);
+  margin-left: 36px;
+  border: 1px solid #dedaff;
+}
+.cp-message-assistant {
+  background: var(--cp-bg);
+  color: var(--cp-fg);
+  border: 1px solid var(--cp-border);
+}
+.cp-message-error {
+  background: var(--cp-warn-weak);
+  color: var(--cp-warn);
+  border: 1px solid var(--cp-warn);
+}
+.cp-error-detail {
+  margin-top: 6px;
+}
+.cp-user-question {
+  font-weight: 600;
+}
+.cp-user-refs {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 11px;
+}
+.cp-user-refs-label {
+  color: var(--cp-fg-muted);
+}
+.cp-user-ref {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--cp-fg-muted);
+  border: 1px solid #e6e3ff;
+}
+.cp-user-ref-kicker {
+  color: var(--cp-accent);
+  font-size: 10px;
+  font-weight: 600;
+}
+.cp-user-ref-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.cp-user-ref-thumb {
+  width: 42px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 8px;
+}
+.cp-message p:first-child { margin-top: 0; }
+.cp-message p:last-child  { margin-bottom: 0; }
+
+.cp-section {
+  border: 1px solid var(--cp-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  background: color-mix(in srgb, var(--cp-bg-raised) 82%, transparent);
+}
+.cp-section h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--cp-accent);
+}
+.cp-section-evidence {
+  border-color: color-mix(in srgb, var(--cp-accent) 35%, var(--cp-border));
+}
+.cp-section-boundary,
+.cp-section-offtopic {
+  border-color: color-mix(in srgb, var(--cp-warn) 35%, var(--cp-border));
+}
+
+.cp-tool-trace {
+  font-size: 11px;
+  color: var(--cp-fg-muted);
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.cp-tool-trace-item { display: block; }
+
+.cp-warnings {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: var(--cp-warn-weak);
+  color: var(--cp-warn);
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+/* ---------------- Chips ---------------- */
+.cp-chips {
+  display: grid;
+  gap: 5px;
+  padding: 0 0 8px;
+  min-height: 0;
+  max-height: 112px;
+  overflow-y: auto;
+  background: transparent;
+}
+.cp-chips-empty {
+  display: none;
+}
+.cp-chip {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+  border-radius: 12px;
+  background: #f5f4ff;
+  color: var(--cp-fg-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  max-width: 100%;
+  border: 1px solid #e2dfff;
+}
+.cp-chip-kicker {
+  color: var(--cp-accent);
+  font-size: 10px;
+  font-weight: 700;
+}
+.cp-chip-body {
+  min-width: 0;
+}
+.cp-chip-thumb {
+  width: 40px;
+  height: 30px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+.cp-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-chip-close {
+  background: transparent;
+  border: none;
+  color: var(--cp-accent);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  align-self: start;
+}
+
+/* ---------------- Composer ---------------- */
+.cp-composer {
+  border-top: 1px solid var(--cp-border);
+  padding: 10px 12px 12px;
+  display: grid;
+  gap: 8px;
+  background: var(--cp-bg);
+}
+.cp-composer-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.cp-textarea {
+  flex: 1 1 auto;
+  resize: none;
+  min-height: 42px;
+  max-height: 140px;
+  padding: 9px 11px;
+  border: 1px solid var(--cp-border);
+  border-radius: 12px;
+  background: var(--cp-bg);
+  color: var(--cp-fg);
+  font: inherit;
+}
+.cp-textarea:focus {
+  outline: 2px solid var(--cp-accent);
+  outline-offset: -1px;
+}
+.cp-send {
+  padding: 9px 14px;
+  border: none;
+  border-radius: 12px;
+  background: var(--cp-accent);
+  color: white;
+  cursor: pointer;
+  font-weight: 600;
+}
+.cp-send:disabled {
+  background: var(--cp-fg-muted);
+  cursor: not-allowed;
+}
+.cp-web-toggle {
+  padding: 9px 10px;
+  border: 1px solid var(--cp-border);
+  border-radius: 12px;
+  background: var(--cp-bg-raised);
+  color: var(--cp-fg-muted);
+  cursor: pointer;
+}
+.cp-web-toggle.cp-web-on {
+  border-color: var(--cp-accent);
+  background: var(--cp-accent-weak);
+  color: var(--cp-accent);
+}
+
+/* ---------------- Pin button on cards ---------------- */
+.cp-pin {
+  background: #ffffff;
+  border: 1px solid var(--cp-border);
+  color: var(--cp-accent);
+  border-radius: 999px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 1;
+  transition: opacity 0.12s ease;
+  margin-left: 6px;
+  vertical-align: middle;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+.cp-pin:hover { color: var(--cp-accent); border-color: var(--cp-accent); }
+[data-ref-kind]:hover > .cp-pin,
+[data-ref-kind] header:hover > .cp-pin,
+.cp-pin:focus-visible {
+  opacity: 1;
+}
+/* Always visible on small screens. */
+@media (max-width: 768px) {
+  .cp-pin { opacity: 1; }
+}
+
+/* ---------------- Floating selection pin ---------------- */
+.cp-selection-pin {
+  position: absolute;
+  z-index: 9997;
+  background: var(--cp-accent);
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+.cp-selection-pin.cp-show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ---------------- Inline anchors inside answers ---------------- */
+.cp-anchor {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background: var(--cp-accent-weak);
+  color: var(--cp-accent);
+  text-decoration: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.cp-anchor:hover { background: var(--cp-accent); color: white; }
+.cp-anchor-invalid {
+  display: inline-block;
+  padding: 0 4px;
+  margin: 0 1px;
+  border-radius: 4px;
+  background: var(--cp-warn-weak);
+  color: var(--cp-warn);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  text-decoration: line-through dotted;
+}
+
+/* ---------------- Anchor jump flash ---------------- */
+.cp-anchor-flash {
+  animation: cp-flash 1.5s ease-out;
+}
+@keyframes cp-flash {
+  0%   { background-color: var(--cp-anchor-flash); }
+  100% { background-color: transparent; }
+}
+
+/* ---------------- Status pill ---------------- */
+.cp-status {
+  padding: 5px 14px;
+  font-size: 11px;
+  color: var(--cp-fg-muted);
+  border-bottom: 1px solid var(--cp-border);
+  min-height: 22px;
+}
+
+.cp-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(3, 7, 18, 0.82);
+}
+.cp-lightbox.cp-lightbox-open {
+  display: flex;
+}
+.cp-lightbox-img {
+  max-width: min(1100px, 92vw);
+  max-height: 82vh;
+  object-fit: contain;
+  border-radius: 16px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+.cp-lightbox-caption {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  max-width: min(900px, 88vw);
+  color: #e5e7eb;
+  font-size: 13px;
+  text-align: center;
+}
+.cp-lightbox-close {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  width: 38px;
+  height: 38px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+  font-size: 26px;
+  cursor: pointer;
+}
+main img,
+.cover-img {
+  cursor: zoom-in;
+}
+.frame-id {
+  cursor: copy;
+}
