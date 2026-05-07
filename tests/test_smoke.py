@@ -29,6 +29,7 @@ from app.understand.schema import (  # noqa: E402
     LectureJSON,
     Point,
 )
+from app.understand._latex_repair import repair_obj, repair_string  # noqa: E402
 from app.understand.vlm import FrameDescription  # noqa: E402
 
 
@@ -439,3 +440,57 @@ class TestRenderer:
         html = renderer.render_index([], css)
         assert "LectureMind" in html
         assert "粘贴 B 站链接" in html
+
+
+# ---------------- LaTeX escape repair ----------------
+
+class TestLatexRepair:
+    """Reverses ``json.loads`` silently eating LaTeX backslashes inside
+    LLM-emitted JSON.  See ``app/understand/_latex_repair.py``."""
+
+    def test_repairs_beta_tau_rightarrow_frac(self):
+        # Each leading control char is the JSON escape for one of:
+        #   \b → \beta  · \t → \tau / \text  · \r → \rightarrow / \rho
+        #   \f → \frac  · etc.
+        sample = (
+            "$Total = \x08eta_1 A + \x08eta_2 E + \x08eta_3 P$"
+            " · $r_{base}\x0dightarrow \x09ext{Correct}$"
+            " · $\x0crac{a}{b}$"
+        )
+        out = repair_string(sample)
+        assert "\\beta_1" in out
+        assert "\\beta_2" in out
+        assert "\\rightarrow" in out
+        assert "\\text{Correct}" in out
+        assert "\\frac{a}{b}" in out
+        # Control chars must be gone
+        for ch in ("\x08", "\x09", "\x0c", "\x0d"):
+            assert ch not in out
+
+    def test_keeps_real_newlines_intact(self):
+        # Real ``\n`` paragraph separators must survive — over-correcting
+        # would inject ``\nu`` into normal Chinese / English prose.
+        sample = "第一段。\n第二段：beta vs eta\n第三段。"
+        assert repair_string(sample) == sample
+
+    def test_idempotent_on_clean_latex(self):
+        clean = "$\\beta_1 + \\tau \\rightarrow \\text{Correct}$"
+        assert repair_string(clean) == clean
+
+    def test_walks_nested_dict_and_list(self):
+        data = {
+            "title": "Reward Modeling",
+            "chapters": [
+                {"summary": "$Total = \x08eta_1 A$"},
+                {"points": [{"text": "门槛 $r_{base}\x0dightarrow 1$"}]},
+            ],
+        }
+        out = repair_obj(data)
+        assert out["chapters"][0]["summary"] == "$Total = \\beta_1 A$"
+        assert out["chapters"][1]["points"][0]["text"] == "门槛 $r_{base}\\rightarrow 1$"
+
+    def test_passes_through_non_strings(self):
+        assert repair_obj(42) == 42
+        assert repair_obj(None) is None
+        assert repair_obj(True) is True
+        assert repair_obj([1, 2.5, None]) == [1, 2.5, None]

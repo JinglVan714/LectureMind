@@ -88,6 +88,22 @@ _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
+# Report-side assets (KaTeX, mhchem, future per-report static files).  The
+# renderer copies the KaTeX vendor bundle into ``data/reports/assets/katex/``
+# so that opening a report directly via ``file://`` keeps formulas rendering
+# offline.  The HTML uses relative paths like ``assets/katex/katex.min.css``;
+# when served through FastAPI, those resolve to ``/reports/assets/...`` and
+# need their own static mount — otherwise we silently 404 and KaTeX never
+# loads.  Mounted without auth: the contents are public CDN files, identical
+# to ``app/static/vendor/katex/``.
+_REPORTS_ASSETS_DIR = get_settings().reports_dir / "assets"
+_REPORTS_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/reports/assets",
+    StaticFiles(directory=str(_REPORTS_ASSETS_DIR)),
+    name="reports-assets",
+)
+
 
 # Static-ish file routes (kept under auth) -----------------------------------
 

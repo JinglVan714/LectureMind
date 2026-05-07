@@ -159,8 +159,39 @@ curl -fsS -u admin:<password> http://localhost:8000/healthz
 | `BOCHA_API_KEY` | — | 可选，启用后 Copilot `🌐` 联网开关会调用 [博查 Web Search](https://bochaai.com) |
 | `MCP_SERVER_TOKEN` | — | MCP SSE 模式必填的 Bearer Token；stdio 模式忽略 |
 | `MCP_EXPOSE_SUMMARIZE` | `false` | 是否在 MCP 暴露 `summarize_video`，默认隐藏 |
+| `BILIBILI_COOKIE_FILE` | `./data/cookies/bilibili.txt` | Netscape 格式的 cookie 文件路径；详见下文 |
 
 > **生产建议：** 反向代理终止 TLS 后再加 IP 白名单；`COPILOT_MAX_CONCURRENT` 按 DashScope 配额调；`MAX_CONCURRENT_JOBS` 受机器内存与磁盘 I/O 限制。
+
+### B 站 Cookie 配置（强烈建议）
+
+未登录态访问 B 站会被严重削弱：
+
+- `/x/web-interface/view` 返回精简元数据，**没有** `pages` / `cid`，导致后续抓不到字幕也抽不到关键帧。
+- `/x/player/wbi/v2` 直接拒发 CC 字幕 URL，只能落到 Whisper 转写（慢且耗显存）。
+- 大密度访问会触发 412 / 403 风控。
+
+LectureMind 兼容 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 的 **Netscape 格式 `cookies.txt`**，把它放在 `data/cookies/bilibili.txt`（路径可由 `BILIBILI_COOKIE_FILE` 改）即可。该目录被 `.gitignore` 整体挡住，不会进 commit。
+
+**方法 A：浏览器插件（最省事）**
+
+1. 装 Chrome / Edge 插件 [Cookie-Editor](https://cookie-editor.com/)（Chrome Web Store / Edge Add-ons 都有）。
+2. 登录 `https://www.bilibili.com`，点插件图标 → 右下角 `Export` → 选 **Netscape**。
+3. 把剪贴板里的内容粘贴到 `data/cookies/bilibili.txt`（首行应是 `# Netscape HTTP Cookie File`）。
+
+**方法 B：yt-dlp 直接从浏览器导出**
+
+```powershell
+# Edge / Chrome / Firefox 任选一个；要求该浏览器已登录 b 站
+yt-dlp --cookies-from-browser edge --cookies data/cookies/bilibili.txt `
+       --skip-download "https://www.bilibili.com/video/BV1xx411c7mD"
+```
+
+**关键字段：** `SESSDATA`（必需）、`bili_jct`（CSRF）、`buvid3`、`DedeUserID` 这四个就够 LectureMind 用了；只少 `SESSDATA` 都会回退到匿名态。
+
+**有效期：** B 站 `SESSDATA` 通常给一年左右；过期或换电脑后重新导一次即可，无需重启服务（每次 ingest 会重读文件）。
+
+> **隐私提醒：** Cookie 等价于你的登录凭证。本仓库的 `.gitignore` 已把 `data/`、`.env`、`*.log` 全部排除；commit 前可以跑 `./scripts/preflight.ps1` 体检，确保不会误传敏感文件。
 
 ---
 
@@ -206,9 +237,10 @@ B 站链接
   3. **划词追问**：在讲义正文任意段落划词，页面浮出「📌 发给助手」。
 - **图片放大**：点击讲义图片、关键帧或封面打开 lightbox；`Esc` 或点击遮罩关闭。
 - **锚点交互**
-  - 点击 `[t=05:21]` / `[F7]` / `[Ch3]`：滚动到对应位置 + 1.6 秒高亮。
-  - **Shift + 点 `[t=05:21]`**：若页面内嵌 `<video>` 则跳到对应时间，否则退回页面定位。
-  - 越界锚点会被服务端标成 `[⚠ t=…]`，不删原文。
+  - 点击 `[t=05:21]`：在新标签页打开 B 站原片对应时间（`?t=321`）；这是回看「原视频此刻在讲什么」最直接的方式。
+  - 点击 `[F7]` / `[Ch3]`：滚动到讲义内对应关键帧或章节 + 1.6 秒高亮。
+  - **Shift / Alt + 点 `[t=05:21]`**：留在当前讲义页面，滚动到该时间所属章节（无对应章节时定位到最近的章节）。
+  - 越界锚点会被服务端标成 `[⚠ t=…]`，不删原文，也不响应点击。
 - **学习向分层回答** —— 默认 1 段 `[[evidence]]`；当问题需要前置知识、原理、应用、跨视频或边界说明时，按需追加 `[[background]]` / `[[extension]]` / `[[deep_dive]]` / `[[application]]` / `[[boundary]]`，硬上限 4 段。明显跑题的问题会用 `[[offtopic]]` 礼貌引导。
 - **联网开关** —— 前端 `🌐` 切换打开后请求带 `use_web=true`，后端才注册 `web_search` 工具（需要配 `BOCHA_API_KEY`）。
 - **成本护栏** —— 单次对话默认 ≤ 6 次工具调用（`COPILOT_MAX_TOOL_CALLS`），全局并发由 `COPILOT_MAX_CONCURRENT` + 每 BV 单深度锁兜住。

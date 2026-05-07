@@ -15,6 +15,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import get_settings
 from ..ingest.subtitle import SubtitleSegment
+from ._latex_repair import repair_obj as _repair_latex_escapes
 from .prompts import LECTURIZER_SYSTEM, LECTURIZER_USER_TEMPLATE
 from .schema import LectureJSON
 from .vlm import FrameDescription
@@ -199,13 +200,16 @@ def _extract_json(raw: str) -> dict[str, Any]:
     # Strip code fences if any
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
     try:
-        return json.loads(raw)
+        obj = json.loads(raw)
     except json.JSONDecodeError:
-        pass
-    m = _JSON_OBJ_RE.search(raw)
-    if not m:
-        raise ValueError("no JSON object found in response")
-    return json.loads(m.group(0))
+        m = _JSON_OBJ_RE.search(raw)
+        if not m:
+            raise ValueError("no JSON object found in response")
+        obj = json.loads(m.group(0))
+    # LLM-emitted LaTeX inside JSON strings is rarely backslash-escaped;
+    # ``json.loads`` then silently turns ``\b`` / ``\t`` / ``\f`` / ``\r``
+    # into control characters and corrupts math (see ``_latex_repair``).
+    return _repair_latex_escapes(obj)
 
 
 def _hydrate_lecture_data(data: dict[str, Any], ctx: LecturizeContext) -> None:

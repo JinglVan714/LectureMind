@@ -13,6 +13,20 @@
 
 set -euo pipefail
 
+# Reject native Windows shells (PowerShell / cmd) where this bash script
+# either silently no-ops or partially executes through Git Bash with
+# unexpected pathing.  Send the user to the PowerShell launcher instead.
+case "${OS:-}${MSYSTEM:-}${WT_SESSION:-}" in
+    Windows_NT*|MINGW*|MSYS*)
+        if [[ -z "${BASH_VERSION:-}" || "${TERM_PROGRAM:-}" == "PowerShell" ]]; then
+            echo "[dev_up.sh] Windows / PowerShell detected — please run scripts/dev_up.ps1 instead." >&2
+            echo "    pwsh> ./scripts/dev_up.ps1               # uses conda env 'myagent' by default" >&2
+            echo "    pwsh> ./scripts/dev_up.ps1 -NoConda      # uses python on PATH" >&2
+            exit 2
+        fi
+        ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 

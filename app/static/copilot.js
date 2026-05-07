@@ -200,18 +200,68 @@
     });
   }
 
+  // KaTeX delimiter regex.  Order matters: longer / display-mode forms
+  // first so an inline ``$...$`` never grabs the inner of ``$$...$$``.
+  // Single-newline and same-line constraints keep us from greedily
+  // matching across paragraphs of prose with stray dollar signs.
+  const MATH_RE = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|\$([^\$\n]+?)\$/g;
+
+  function protectMath(text) {
+    // Replace every math span with a non-Markdown placeholder token, then
+    // re-insert the raw delimiter+body after Markdown rendering.  Without
+    // this step ``marked.parse`` happily eats backslash-paren / -bracket
+    // delimiters (CommonMark escapes ``\(`` → ``(``) and any ``\X`` LaTeX
+    // command embedded in the math, leaving KaTeX nothing to render.
+    const stash = [];
+    const protectedText = String(text).replace(MATH_RE, (m) => {
+      const idx = stash.length;
+      stash.push(m);
+      return `\u0001CPMATH${idx}\u0001`;
+    });
+    return [protectedText, stash];
+  }
+
+  function restoreMath(html, stash) {
+    if (!stash.length) return html;
+    return html.replace(/\u0001CPMATH(\d+)\u0001/g, (_, idx) => stash[parseInt(idx, 10)] || "");
+  }
+
+  function renderKatexIn(el) {
+    // Lazily call KaTeX auto-render on the freshly-painted DOM subtree so
+    // streamed assistant tokens get the same treatment as the static
+    // lecture body.  The lecture template already loaded auto-render.min.js
+    // at page boot (see ``lecture.html.j2``); if it's absent (e.g. KaTeX
+    // assets missing) we silently no-op.
+    if (!el || !window.renderMathInElement) return;
+    try {
+      window.renderMathInElement(el, {
+        delimiters: [
+          { left: "$$", right: "$$", display: true },
+          { left: "\\[", right: "\\]", display: true },
+          { left: "\\(", right: "\\)", display: false },
+          { left: "$",  right: "$",  display: false },
+        ],
+        throwOnError: false,
+      });
+    } catch (_) {
+      // never let KaTeX errors break the chat panel
+    }
+  }
+
   function renderMarkdown(text) {
     text = transformSections(text);
+    const [protectedText, stash] = protectMath(text);
     if (window.marked && typeof window.marked.parse === "function") {
       try {
-        const html = window.marked.parse(text, { breaks: true, gfm: true });
-        return replaceAnchors(html);
+        const html = window.marked.parse(protectedText, { breaks: true, gfm: true });
+        return replaceAnchors(restoreMath(html, stash));
       } catch (err) {
         // fall through to plaintext
       }
     }
-    // Very small plaintext fallback: newlines → <br>.
-    return replaceAnchors(escapeHtml(text).replace(/\n/g, "<br>"));
+    // Very small plaintext fallback: newlines → <br>.  Restore math AFTER
+    // HTML escape so the dollar signs keep their delimiter meaning.
+    return replaceAnchors(restoreMath(escapeHtml(protectedText).replace(/\n/g, "<br>"), stash));
   }
 
   const SECTION_LABELS = {
@@ -269,17 +319,31 @@
     if (kind === "t") {
       const secs = timestampToSeconds(id);
       if (secs == null) return null;
-      // Find the chapter whose [start, end] contains this ts.
+      // Prefer the chapter whose [start, end] contains this timestamp;
+      // when the LLM emits a ts that falls between two chapters or after
+      // the last one, fall back to the chapter with the nearest boundary
+      // so the user always lands somewhere useful instead of a no-op.
       const chapters = document.querySelectorAll("[data-ref-kind='chapter']");
-      let best = null;
+      let exact = null;
+      let nearest = null;
+      let nearestDist = Infinity;
       for (const el of chapters) {
         const start = parseInt(el.dataset.chStart || "0", 10);
         const end   = parseInt(el.dataset.chEnd   || "0", 10);
-        if (secs >= start && secs <= end) { best = el; break; }
+        if (secs >= start && secs <= end) { exact = el; break; }
+        const dist = Math.min(Math.abs(secs - start), Math.abs(secs - end));
+        if (dist < nearestDist) { nearestDist = dist; nearest = el; }
       }
-      return best;
+      return exact || nearest;
     }
     return null;
+  }
+
+  function bilibiliVideoUrl(bv, secs) {
+    if (!bv) return null;
+    const base = `https://www.bilibili.com/video/${bv}/`;
+    if (secs == null || Number.isNaN(secs)) return base;
+    return `${base}?t=${secs}`;
   }
 
   function onAnchorClick(evt) {
@@ -291,16 +355,33 @@
     const bv = document.body.dataset.bv ||
                (document.getElementById("cp-panel") &&
                 document.getElementById("cp-panel").dataset.bv) || "";
-    if (kind === "t" && evt.shiftKey) {
+
+    // Time anchors semantically point at a moment in the original video,
+    // so default click → open Bilibili at that timestamp in a new tab.
+    // Shift-click (or Alt-click) keeps the in-page scroll behaviour for
+    // users who want to stay in the lecture and inspect the chapter.
+    if (kind === "t") {
       const secs = timestampToSeconds(id);
-      const video = document.querySelector("video");
-      if (secs != null && video) {
-        video.currentTime = secs;
-        video.play().catch(() => {});
-        flashElement(video);
-        return;
+      if (!evt.shiftKey && !evt.altKey) {
+        // Local seek wins over the external jump when an inline <video>
+        // is present (e.g. future feature where the lecture embeds the
+        // BV stream directly).
+        const video = document.querySelector("video");
+        if (secs != null && video) {
+          video.currentTime = secs;
+          video.play().catch(() => {});
+          flashElement(video);
+          return;
+        }
+        const url = bilibiliVideoUrl(bv, secs);
+        if (url) {
+          window.open(url, "_blank", "noopener");
+          return;
+        }
       }
+      // Fall through to in-page scroll on Shift/Alt or when bv is missing.
     }
+
     const target = findAnchorTarget(kind, id, bv);
     if (target) {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -680,14 +761,17 @@
       const el = document.createElement("div");
       el.className = "cp-message cp-message-assistant";
       el.innerHTML = `<div class="cp-answer"></div>`;
-      el.querySelector(".cp-answer").innerHTML = renderMarkdown(text);
+      const answerEl = el.querySelector(".cp-answer");
+      answerEl.innerHTML = renderMarkdown(text);
       this.elMessages.appendChild(el);
+      renderKatexIn(answerEl);
       this.elMessages.scrollTop = this.elMessages.scrollHeight;
     }
     _appendToken(delta) {
       if (!this.currentAssistantEl) this._startAssistantMessage();
       this.currentAssistantRaw += delta;
       this.currentAssistantEl.innerHTML = renderMarkdown(this.currentAssistantRaw);
+      renderKatexIn(this.currentAssistantEl);
       this.elMessages.scrollTop = this.elMessages.scrollHeight;
     }
     _appendToolCall(name, args) {
@@ -717,6 +801,7 @@
       if (payload && payload.patched_answer) {
         this.currentAssistantRaw = payload.patched_answer;
         this.currentAssistantEl.innerHTML = renderMarkdown(this.currentAssistantRaw);
+        renderKatexIn(this.currentAssistantEl);
       }
       if (payload && payload.warnings && payload.warnings.length) {
         const warnBox = document.createElement("div");

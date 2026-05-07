@@ -17,6 +17,7 @@ from pathlib import Path
 
 from app.config import get_settings
 from app.render.renderer import Renderer
+from app.understand._latex_repair import repair_obj as _repair_latex_escapes
 from app.understand.ir import LectureIR
 from app.understand.ir_builder import lecture_ir_to_lecture_json
 from app.understand.schema import LectureJSON
@@ -81,13 +82,18 @@ def _discover_targets(
 
 
 def _lecture_from_source(bv_id: str, ir_files: dict[str, Path], db_summaries: dict[str, dict]) -> tuple[LectureJSON, str]:
+    # ``_repair_latex_escapes`` fixes historical reports whose IR JSON or
+    # SQLite ``summary_json`` was written before the LaTeX-escape repair
+    # landed in ``ir_builder._extract_json``: the old data contains
+    # JSON-eaten control characters in place of LaTeX backslashes.
     if bv_id in ir_files:
         path = ir_files[bv_id]
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = _repair_latex_escapes(json.loads(path.read_text(encoding="utf-8")))
         lecture_ir = LectureIR.model_validate(data)
         return lecture_ir_to_lecture_json(lecture_ir), str(path)
     if bv_id in db_summaries:
-        return LectureJSON.model_validate(db_summaries[bv_id]), "sqlite:summary_json"
+        data = _repair_latex_escapes(db_summaries[bv_id])
+        return LectureJSON.model_validate(data), "sqlite:summary_json"
     raise ValueError("No LectureIR debug JSON or SQLite summary_json available for HTML-only rerender")
 
 

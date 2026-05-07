@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import get_settings
+from ._latex_repair import repair_obj as _repair_latex_escapes
 from .ir import LectureIR, hydrate_lecture_ir_data
 from .lecturize import LecturizeContext, _format_frames, _format_segments
 from .prompts import LECTURE_IR_SYSTEM, LECTURE_IR_USER_TEMPLATE
@@ -133,7 +134,12 @@ def _extract_json(raw: str) -> dict[str, Any]:
         obj = json.loads(m.group(0))
     if not isinstance(obj, dict):
         raise ValueError("top-level JSON is not an object")
-    return obj
+    # LLMs frequently emit unescaped LaTeX backslashes inside JSON strings
+    # (e.g. ``"$\beta_1$"``).  ``json.loads`` honours JSON escape rules,
+    # turning ``\b`` / ``\t`` / ``\f`` / ``\r`` into control characters and
+    # silently corrupting math.  Repair the parsed tree so KaTeX sees real
+    # LaTeX commands again.  See ``_latex_repair`` for the rationale.
+    return _repair_latex_escapes(obj)
 
 
 def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
