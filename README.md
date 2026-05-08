@@ -85,6 +85,14 @@ copy .env.example .env       # 然后填入 DASHSCOPE_API_KEY
 ./scripts/dev_up.ps1         # 默认使用 conda env 'myagent'，可加 -NoConda
 ```
 
+Windows 双击启动：
+
+```text
+双击项目根目录的 Start-LectureMind.bat
+```
+
+`Start-LectureMind.bat` 会优先查找 `.venv` 或常见 Anaconda / Miniconda 路径下的 `myagent` 环境，例如 `D:\anaconda\envs\myagent\python.exe`；找到后会调用 `scripts/dev_up.ps1 -NoConda -PythonExe <python>`，避免双击时系统 `PATH python` 缺少依赖。
+
 Linux / macOS / WSL：
 
 ```bash
@@ -99,6 +107,8 @@ cp .env.example .env         # 然后填入 DASHSCOPE_API_KEY
 1. 不存在 `.env` 时从 `.env.example` 复制并提示填写 `DASHSCOPE_API_KEY`。
 2. 创建 `data/` 目录并执行 `python -m scripts.init_db` 初始化 SQLite。
 3. 启动 `uvicorn app.main:app`，端口与 Host 由 `.env` 决定。
+
+如端口已被占用，Windows 会看到 `Errno 10048`；这通常说明已有一个 `uvicorn` 实例正在运行，直接访问 `http://127.0.0.1:8000` 或先关闭旧进程再启动即可。
 
 启动后访问 `http://127.0.0.1:8000`，使用 `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` 登录。
 
@@ -444,7 +454,7 @@ python -m scripts.run_qa_matrix --force                  # 强制重跑全部
 
 完整部署细节见 [`docs/deploy.md`](./docs/deploy.md)。三种典型路径：
 
-1. **本地 Python** — `./scripts/dev_up.ps1` / `dev_up.sh`，最快启动。
+1. **本地 Python** — Windows 双击 `Start-LectureMind.bat`，或命令行运行 `./scripts/dev_up.ps1` / `dev_up.sh`，最快启动。
 2. **Docker Compose** — `docker compose up -d --build`，挂载 `./data` 持久化。
 3. **MCP Server** — `python -m scripts.run_mcp_server`（stdio）或 `--sse`（远程，必填 `MCP_SERVER_TOKEN`）。
 

@@ -16,6 +16,7 @@
 [CmdletBinding()]
 param(
     [string]$CondaEnv = 'myagent',
+    [string]$PythonExe = 'python',
     [switch]$NoConda,
     [switch]$Reload
 )
@@ -39,11 +40,11 @@ if (-not (Test-Path '.env')) {
 New-Item -ItemType Directory -Force -Path 'data' | Out-Null
 
 function Invoke-Python {
-    param([string[]]$Args)
+    param([string[]]$PythonArgs)
     if ($NoConda) {
-        & python @Args
+        & $PythonExe @PythonArgs
     } else {
-        & conda run --no-capture-output -n $CondaEnv python @Args
+        & conda run --no-capture-output -n $CondaEnv python @PythonArgs
     }
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
