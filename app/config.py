@@ -18,8 +18,12 @@ class Settings(BaseSettings):
 
     # ---- Models (Qwen / DashScope) ----
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
-    qwen_text_model: str = Field(default="qwen3-max", alias="QWEN_TEXT_MODEL")
-    qwen_vl_model: str = Field(default="qwen-vl-max-latest", alias="QWEN_VL_MODEL")
+    # NOTE: alias kept as QWEN_TEXT_MODEL for backward compatibility, but the
+    # recommended default is deepseek-v4-flash on DashScope. It produces denser
+    # chapters / code blocks / learning paths at ~+6% latency vs qwen3.6-max
+    # (see handoff_mutiagent.md 2026-05-09 N=3 baseline).
+    qwen_text_model: str = Field(default="deepseek-v4-flash", alias="QWEN_TEXT_MODEL")
+    qwen_vl_model: str = Field(default="qwen3.6-plus", alias="QWEN_VL_MODEL")
     dashscope_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         alias="DASHSCOPE_BASE_URL",
@@ -27,6 +31,13 @@ class Settings(BaseSettings):
     dashscope_request_timeout: float = Field(default=180.0, alias="DASHSCOPE_REQUEST_TIMEOUT")
     dashscope_trust_env: bool = Field(default=False, alias="DASHSCOPE_TRUST_ENV")
     qwen_text_enable_thinking: bool = Field(default=False, alias="QWEN_TEXT_ENABLE_THINKING")
+    qwen_vl_concurrency: int = Field(
+        default=4,
+        alias="QWEN_VL_CONCURRENCY",
+        ge=1,
+        le=16,
+        description="Concurrency for VLM frame description calls.",
+    )
 
     # ---- Whisper fallback ----
     whisper_model: str = Field(default="base", alias="WHISPER_MODEL")
@@ -47,8 +58,52 @@ class Settings(BaseSettings):
     keyframe_min: int = Field(default=8, alias="KEYFRAME_MIN")
     keyframe_max: int = Field(default=20, alias="KEYFRAME_MAX")
     keyframe_threshold: float = Field(default=27.0, alias="KEYFRAME_THRESHOLD")
+    keyframe_length_adapt: bool = Field(
+        default=True,
+        alias="KEYFRAME_LENGTH_ADAPT",
+        description="Scale keyframe min/max with video duration (recommended).",
+    )
     bilibili_cookie_file: Path | None = Field(
         default=Path("./data/cookies/bilibili.txt"), alias="BILIBILI_COOKIE_FILE"
+    )
+
+    # ---- Lecture generation v2 (multi-agent + question-driven) ----
+    lecture_question_driven: bool = Field(
+        default=True,
+        alias="LECTURE_QUESTION_DRIVEN",
+        description="Pre-generate study questions to drive structured extraction.",
+    )
+    lecture_critic_enabled: bool = Field(
+        default=True,
+        alias="LECTURE_CRITIC_ENABLED",
+        description="Run a Critic-Reviser pass after the initial IR build.",
+    )
+    lecture_critic_max_rounds: int = Field(
+        default=1,
+        alias="LECTURE_CRITIC_MAX_ROUNDS",
+        ge=0,
+        le=3,
+    )
+    lecture_reviser_timeout: float = Field(default=600.0, alias="LECTURE_REVISER_TIMEOUT")
+    lecture_strict_agents: bool = Field(default=False, alias="LECTURE_STRICT_AGENTS")
+    lecture_code_highlighter: str = Field(
+        default="highlight.js",
+        alias="LECTURE_CODE_HIGHLIGHTER",
+        description="'highlight.js', 'prism' or '' to disable JS highlighting.",
+    )
+    lecture_map_reduce_threshold_sec: int = Field(
+        default=1200,
+        alias="LECTURE_MAP_REDUCE_THRESHOLD_SEC",
+        description="Above this duration, future map-reduce stages activate.",
+    )
+    pipeline_wait_rag: bool = Field(
+        default=True,
+        alias="PIPELINE_WAIT_RAG",
+        description=(
+            "When true (default), pipeline.run() awaits RAG indexing before "
+            "returning. Set false to make RAG indexing a fire-and-forget "
+            "background task so the report path returns sooner."
+        ),
     )
 
     # ---- Logging ----

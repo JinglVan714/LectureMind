@@ -25,6 +25,7 @@ data/
 /README_develop.md
 /handoff.md
 /handoff_copilot.md
+/handoff_mutiagent.md
 /scripts/_debug_*.py
 /scripts/debug_*.py
 /scripts/_verify_*.py

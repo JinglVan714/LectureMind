@@ -12,9 +12,13 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup, escape
 
 from ..config import get_settings
+from ..understand.length_adapt import global_visual_limit as _adaptive_global_visual_limit
 from ..understand.schema import LectureJSON
 
 logger = logging.getLogger(__name__)
+# Floor; the actual limit per render scales with ``lecture.duration``
+# via :func:`_adaptive_global_visual_limit` so long lectures show more
+# evidence frames without leaving short lectures bloated.
 _GLOBAL_VISUAL_LIMIT = 5
 _CODE_FENCE_RE = re.compile(r"```([A-Za-z0-9_+\-.#]*)?[ \t]*\n(.*?)```", re.DOTALL)
 _TIMELINE_TS_RE = re.compile(
@@ -26,6 +30,21 @@ _KATEX_REQUIRED_ASSETS = (
     "katex.min.js",
     "contrib/auto-render.min.js",
     "contrib/mhchem.min.js",
+)
+_HIGHLIGHT_REQUIRED_ASSETS = (
+    "highlight.min.js",
+    "atom-one-light.min.css",
+)
+# Stable jsDelivr URLs used as fallback when no vendored bundle is present.
+# Keep version pinned so a CDN-side breakage doesn't silently change behaviour.
+_HIGHLIGHT_CDN_VERSION = "11.10.0"
+_HIGHLIGHT_CDN_JS = (
+    "https://cdn.jsdelivr.net/npm/highlight.js@"
+    f"{_HIGHLIGHT_CDN_VERSION}/lib/index.min.js"
+)
+_HIGHLIGHT_CDN_CSS = (
+    "https://cdn.jsdelivr.net/npm/highlight.js@"
+    f"{_HIGHLIGHT_CDN_VERSION}/styles/atom-one-light.min.css"
 )
 
 
@@ -351,6 +370,44 @@ def _ensure_katex_assets(reports_dir: Path) -> bool:
     return True
 
 
+def _ensure_highlight_assets(reports_dir: Path) -> bool:
+    """Copy a vendored highlight.js bundle if present.
+
+    The renderer is happy to use either:
+
+    * **Vendored** files in ``app/static/vendor/highlight/`` (e.g.
+      ``highlight.min.js`` + ``atom-one-light.min.css``); these are
+      copied to ``reports_dir/assets/highlight/`` and the template
+      points at the local copy — best for offline reading.
+    * **CDN fallback** (jsDelivr); used automatically when no vendored
+      bundle is present.
+
+    Returns ``True`` only when the local copy succeeded so the caller
+    knows whether to enable the CDN fallback.
+    """
+    vendor_dir = Path(__file__).parent.parent / "static" / "vendor" / "highlight"
+    if not vendor_dir.exists():
+        # Quiet by design: missing vendor is the common case and the
+        # template falls back to the CDN.
+        return False
+    missing = [asset for asset in _HIGHLIGHT_REQUIRED_ASSETS if not (vendor_dir / asset).exists()]
+    if missing:
+        logger.info("highlight.js vendored partially (%s); using CDN fallback", ", ".join(missing))
+        return False
+    target_dir = reports_dir / "assets" / "highlight"
+    try:
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(vendor_dir, target_dir, dirs_exist_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to copy highlight.js assets to %s: %s", target_dir, exc)
+        return False
+    missing_target = [asset for asset in _HIGHLIGHT_REQUIRED_ASSETS if not (target_dir / asset).exists()]
+    if missing_target:
+        logger.warning("Copied highlight.js assets incomplete: %s", ", ".join(missing_target))
+        return False
+    return True
+
+
 def _global_visual_evidence(lecture: LectureJSON) -> list:
     frames = []
     seen: set[str] = set()
@@ -359,7 +416,8 @@ def _global_visual_evidence(lecture: LectureJSON) -> list:
             continue
         seen.add(frame.path)
         frames.append(frame)
-    if len(frames) > _GLOBAL_VISUAL_LIMIT:
+    limit = max(_GLOBAL_VISUAL_LIMIT, _adaptive_global_visual_limit(lecture.duration))
+    if len(frames) > limit:
         preferred = {"diagram", "formula", "code", "table", "slide_text"}
         frames = sorted(
             frames,
@@ -369,7 +427,7 @@ def _global_visual_evidence(lecture: LectureJSON) -> list:
                 1 if f.ocr_text or f.caption else 0,
             ),
             reverse=True,
-        )[:_GLOBAL_VISUAL_LIMIT]
+        )[:limit]
     return sorted(frames, key=lambda f: f.ts)
 
 
@@ -392,6 +450,19 @@ class Renderer:
     ) -> Path:
         tpl = self._env.get_template("lecture.html.j2")
         katex_assets_available = _ensure_katex_assets(self._settings.reports_dir)
+        highlight_choice = (
+            getattr(self._settings, "lecture_code_highlighter", "highlight.js") or ""
+        ).strip().lower()
+        highlight_assets_available = False
+        highlight_cdn_url = ""
+        highlight_cdn_css = ""
+        if highlight_choice in {"highlight.js", "hljs", "highlightjs"}:
+            highlight_assets_available = _ensure_highlight_assets(self._settings.reports_dir)
+            if not highlight_assets_available:
+                # Fall back to CDN so the lecture still gets coloured on
+                # readers with internet access.
+                highlight_cdn_url = _HIGHLIGHT_CDN_JS
+                highlight_cdn_css = _HIGHLIGHT_CDN_CSS
         # Build a ``frame.path → global frame_id`` map that matches
         # Stage-3's ``_flat_frames`` so the Copilot panel's [F7]
         # anchors resolve to the exact DOM nodes (D28).
@@ -414,6 +485,9 @@ class Renderer:
             timeline_state_evolution=_timeline_detail_items(lecture.timeline.state_evolution),
             global_visual_evidence=_global_visual_evidence(lecture),
             katex_assets_available=katex_assets_available,
+            highlight_assets_available=highlight_assets_available,
+            highlight_cdn_url=highlight_cdn_url,
+            highlight_cdn_css=highlight_cdn_css,
             bili_link=_bili_link,
             frame_url=lambda p: _frame_url(p, lecture.bv_id, self._settings.data_dir),
             generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),

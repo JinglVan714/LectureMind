@@ -6,7 +6,11 @@ VLM_FRAME_DESCRIBE_SYSTEM = """\
 
 1. 用一句中文（≤50 字）描述本帧的视觉要点（板书内容、图表、关键词等）。
 2. 如果画面是 PPT/白板/代码截屏，逐字提取其中的中英文文本（OCR）。
+   - 如果画面是**代码**：必须**完整保留缩进、换行和符号**；输出时把代码包在 Markdown 围栏 ```lang\n...\n```（lang 用 python/rust/cpp/sql/yaml/shell 等已知短名）；不要为了"美观"重排空白。
+   - 如果画面是**公式**：以 LaTeX 表达，行内公式包 $...$，独立公式包 $$...$$；化学式优先 mhchem，例如 \\ce{H2O}、\\ce{Na+ + Cl- -> NaCl}。
+   - 如果画面是**关键词页 / 板书**：逐行复制，使用 `\\n` 保留换行，便于后续渲染。
 3. 判断画面类型和教学价值，优先识别流程图、公式、代码、表格、UI、关键词页。
+4. 对含代码、公式、流程图、维度变化、明显结构信息的画面给较高 importance_score（≥0.75）；纯人物或空镜给低分（<0.3）。
 
 输出 JSON：
 {
@@ -22,6 +26,146 @@ VLM_FRAME_DESCRIBE_SYSTEM = """\
 """
 
 VLM_FRAME_DESCRIBE_USER = "请描述这一帧。"
+
+
+# ---------------------------------------------------------------------------
+# Question-Driven extraction
+# ---------------------------------------------------------------------------
+
+STUDY_QUESTIONS_SYSTEM = """\
+你是一位中文教学策划。给定视频标题、UP 主、时长以及前若干分钟的字幕节选，
+请输出能驱动后续讲义抽取的"学习问题列表"。这些问题不是面向观众的复习题，
+而是阅读者在看完视频后**应当能精确回答**的具体问题，覆盖：
+
+- 视频要解决的真实问题（不是"介绍 X"这种空话）
+- 关键定义、机制、推导、参数、对比、边界
+- 技术内容必须包含：API/函数签名、输入输出、复杂度、典型错误、依赖/版本、可运行示例
+- 操作教程必须包含：前置条件、关键步骤顺序、检查点、常见失败
+- 概念讲座必须包含：动机、核心论点、反例/边界、与已知方法的差异
+
+要求：
+
+1. 问题必须**具体且可证伪**——避免"它有什么意义"这种宽泛问句。
+2. 按用户消息中提供的 q_min / q_max 决定问题数量；问题越具体越好。
+3. 每个问题用一行中文短句，末尾加问号。
+4. 不要重复，不要堆砌"是什么/为什么/怎么做"机械三连。
+
+只输出 JSON 对象：{"study_questions": ["问题1？", "问题2？"]}
+"""
+
+STUDY_QUESTIONS_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- UP 主: {author}
+- 时长: {duration} 秒（约 {minutes} 分钟）
+- 推断领域提示: {domain_hint}
+
+期望问题数量：{q_min} - {q_max} 个。
+
+字幕节选（前 {head_minutes} 分钟，时间戳·文本）：
+{subtitle_head}
+
+关键帧视觉描述（前若干帧，时间戳·caption [· OCR]）：
+{frames_head}
+
+请输出问题清单 JSON。
+"""
+
+
+# ---------------------------------------------------------------------------
+# Critic-Reviser loop (M1)
+# ---------------------------------------------------------------------------
+
+LECTURE_CRITIC_SYSTEM = """\
+你是一位严苛的中文讲义审稿人。给定一个 LectureIR JSON 草稿，以及该视频的字幕全文与关键帧描述，
+请**严格基于字幕证据**找出讲义中"缺失/可疑/冗余"的内容，绝不允许凭空想象"应有"的内容。
+
+具体审查维度：
+
+1. **覆盖率**：长视频（≥20 分钟）是否每 5-7 分钟都有章节支撑？
+2. **学习问题闭环**：study_questions（如有）是否每条都被章节内容回答？没有则列出未答问题。
+3. **代码/公式落地**：当字幕或视觉证据出现代码/公式时，是否被 chapters[].code_blocks / chapters[].formula_blocks 抽取？
+4. **引用真实性**：points[].quote 是否忠实于字幕原意？字幕由 ASR 自动识别，对技术术语常有同音/形近误识；讲义可以只修术语级错误（保持口语化措辞）。判断标准：剔除被修复的术语后，quote 与字幕的 4-gram 重叠 ≥ 0.6 即可。**只有当 quote 出现字幕里完全没有的事实（人物/数字/关键命题）时，才标 dubious_quote。**
+5. **冗余**：是否多个章节讲同一件事？mainline 是否有空泛重复？
+6. **边界与误区**：技术/概念视频是否漏写了 pitfalls？
+
+输出 JSON：
+{
+  "issues": [
+    {
+      "kind": "missing_coverage|missing_code|missing_formula|dubious_quote|redundant|missing_pitfall|missing_boundary|other",
+      "severity": "high|medium|low",
+      "location": "章节索引或字段路径，例如 chapters[2].code_blocks",
+      "evidence": "字幕原话或帧 OCR 摘要（≤80 字），用于反驳/支持",
+      "suggestion": "具体修补动作（可包含可加入的字段值）"
+    }
+  ],
+  "verdict": "ok|needs_revision",
+  "summary": "一句话总结质量"
+}
+
+硬性规则：
+- evidence 必须来自 input transcript 或 frame OCR 之一。
+- 如果讲义已合格，issues 列空数组，verdict 写 "ok"。
+- 不要重复抱怨"缺少 final_synthesis"等已经存在的字段——只针对实际缺失。
+- 不要建议"补背景"等无证据的扩写。
+"""
+
+LECTURE_CRITIC_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- 时长: {duration} 秒
+
+学习问题（若有）：
+{study_questions}
+
+讲义草稿（LectureIR JSON）：
+```json
+{lecture_ir_json}
+```
+
+字幕全文（时间戳·文本）：
+{subtitle_block}
+
+关键帧视觉描述：
+{frames_block}
+
+请输出审稿 JSON。
+"""
+
+LECTURE_REVISER_SYSTEM = """\
+你是一位 LectureIR 修订器。给定原 LectureIR JSON 与审稿人列出的 issues，
+请直接产出修订后的完整 LectureIR JSON——保持原有结构，只针对 issues 做最小必要修改。
+
+硬性规则：
+1. 输出**完整** LectureIR JSON，不要只输出 diff。
+2. 只对 issues 中提到的字段做修补；其它字段一字不改。
+3. 不允许凭空补充内容；新增的字段必须基于字幕或帧证据，并填好 quote / related_frame_paths。
+4. 如果某条 issue 实在无证据可补，可以保留原样并不修改。
+5. JSON 必须严格合法，可以被 json.loads 解析。
+"""
+
+LECTURE_REVISER_USER_TEMPLATE = """\
+原 LectureIR JSON：
+```json
+{lecture_ir_json}
+```
+
+审稿人 issues：
+```json
+{issues_json}
+```
+
+字幕全文：
+{subtitle_block}
+
+关键帧视觉描述：
+{frames_block}
+
+请输出修订后的完整 LectureIR JSON。
+"""
 
 
 LECTURIZER_SYSTEM = """\
@@ -52,7 +196,7 @@ LECTURIZER_SYSTEM = """\
       "points": [
         {"text": "精炼论点（一句话，必填）",
          "ts": 42,
-         "quote": "原字幕中支撑该论点的原话片段（必填，≤80 字，逐字摘录）"}
+         "quote": "原字幕中支撑该论点的原话片段（必填，≤80 字，逐字摘录；遇到明显的 ASR 术语误识，例如 'co-tax'→'Codex'、'plug months'→'Plan Mode'，可只把术语换成正确写法，其余措辞保持原样）"}
       ],
       "frames": [
         {"ts": 55,
@@ -76,6 +220,7 @@ LECTURIZER_SYSTEM = """\
 2. **teaching_notes**：每章 2-4 段，每段必须是有解释力的中文教学段落，不要只复述字幕。
 3. **points**：每章 2-5 条；每条必须同时包含 text（精炼论点）+ ts + quote（逐字摘录 ≤80 字）。
    - 绝对不要省略 text 字段；text 与 quote 不可相同（text 是论点、quote 是原话证据）。
+   - 字幕由 Whisper/ASR 自动识别，常把技术术语识别错（例如 "Codex"→"co-tax"、"Plan Mode"→"plug months"、"快照"→"快兆"、"replan"→"repland"、"斜杠"→"鞋槓"、"Claude Code"→"cardi code"）。当视频标题、其他字幕或画面 OCR 足以唯一判定原意时，**只把 quote 中明显错误的术语替换为正确术语**，其余口语化措辞、语气词、句子结构必须保持原样；不要重写整句、不要扩写、不要补充字幕里没说的内容；无法判断的术语保持原样或将整条 quote 写空字符串。
 4. **frames**：只从输入的「关键帧视觉描述」里挑有信息量的帧归属到章节；path 必须**原样复制**输入里给出的 path 字符串，不要改写。
    - 如果画面含 PPT、代码、公式、流程图、UI、板书、字幕关键词，必须写入 ocr_text 和 insight。
    - 如果画面只是人物、空镜或无信息量画面，可以不选。
@@ -167,12 +312,30 @@ LECTURE_IR_SYSTEM = """\
       "summary": "一段完整中文概览",
       "learning_goal": "本章要解决的学习问题",
       "teaching_notes": ["解释段落1", "解释段落2"],
-      "process_steps": [],
+      "process_steps": ["如有连续可执行操作或机制阶段，按顺序写出；没有则留空"],
       "points": [{"text": "论点", "ts": 0, "quote": "字幕原话"}],
       "frames": [],
       "pitfalls": [],
       "key_takeaways": [],
-      "knowledge_unit_ids": []
+      "knowledge_unit_ids": [],
+      "code_blocks": [
+        {
+          "language": "python",
+          "code": "def f(x):\n    return x + 1",
+          "ts": 0,
+          "source": "ocr",
+          "explanation": "这段代码做了什么；只在确有 OCR/字幕证据时填写",
+          "related_frame_paths": []
+        }
+      ],
+      "formula_blocks": [
+        {
+          "latex": "Q(s,a) = r + \\gamma \\max_{a'} Q(s', a')",
+          "ts": 0,
+          "explanation": "公式作用",
+          "related_frame_paths": []
+        }
+      ]
     }
   ],
   "completeness": {
@@ -202,6 +365,7 @@ LECTURE_IR_SYSTEM = """\
   },
   "final_synthesis": "把全片串成完整闭环，并说明适用场景与边界",
   "review_questions": [],
+  "study_questions": ["阅读者应当能精确回答的问题1？", "问题2？"],
   "taxonomy": {
     "domain": "AI 技术",
     "direction": "注意力机制",
@@ -216,17 +380,20 @@ LECTURE_IR_SYSTEM = """\
 3. 操作/教程类只有在视频确有连续操作链路时才抽取 procedure；概念类只有在确有观点、例子、边界或误区时才抽取对应知识单元。
 4. visual_evidence 只选择结构价值高的帧，公式、流程图、代码、维度变化、结构图优先；人物空镜默认不选。
 5. path 必须逐字复制输入关键帧描述里的 path，不要改写。
-6. points.quote 和 knowledge_units.quote 必须来自字幕原话；不确定时写空字符串。
-7. mainline 要写成读者理解本视频的认知/操作路径，通常 3-6 条，长视频最多 8 条；相邻条目必须递进，不能只是章节标题，也不能用不同措辞重复同一含义。
+6. points.quote 和 knowledge_units.quote 必须忠实于字幕原意；不确定时写空字符串。字幕由 ASR 自动识别，对技术术语常有同音/形近误识（如把 "Codex" 写成 "co-tax"、"Plan Mode" 写成 "plug months"、"快照" 写成 "快兆"、"replan" 写成 "repland"）。**当视频标题、其他字幕或画面 OCR 足以唯一判定原意时，请把 quote 中明显错误的术语换成正确术语，其余口语化措辞保持原样；不要重写整句、不要补充字幕里没有的内容、无法判断的写空字符串。**
+7. mainline 要写成读者理解本视频的认知/操作路径，按用户消息中的 mainline_max 决定上限；相邻条目必须递进，不能只是章节标题，也不能用不同措辞重复同一含义。
 8. mainline 禁止空泛条目，例如“介绍相关背景”“讲解核心知识”“总结全文内容”；每一条都要说明为什么下一步需要它。
-9. chapters 要按视频时长和密度自适应：10 分钟以内通常 3-4 章，10-30 分钟通常 4-6 章，30 分钟以上通常 5-8 章；高密度视频优先增厚章节讲解，而不是机械增加章节数。
+9. chapters 数量必须按用户消息中的 chapters_min / chapters_max 选择；高密度视频优先增厚章节讲解，而不是机械增加章节数。**长视频（>30 分钟）必须在最后几分钟之前都有章节支撑，不能在前 1/3 堆章节而后面留空白。**
 10. chapters[].teaching_notes 是连续讲义段落，不是短 bullet。每章尽量包含：承接前文的问题、核心解释、因果/流程/对比/例子/推导展开、1-2 个重点、必要边界，以及如何收束到下一步。
 11. 每条 teaching_notes 都应是完整中文段落；每章通常 3-5 段，高密度章节可更多；避免“本章介绍了相关内容”这类无信息句。
-12. 公式若有字幕或画面证据，使用 LaTeX 分隔符表达，例如 $Q(s,a)$、$\\nabla_\\theta J(\\theta)$、$$E=mc^2$$；化学式或反应式若有证据，优先使用 mhchem 形式如 \\ce{H2O}、\\ce{CO2}、\\ce{Na+ + Cl- -> NaCl}；代码若有证据，尽量保持原结构并使用 Markdown fenced code；没有完整证据时不要补写。
-13. 操作教程如果确有连续操作链路，应抽取多个 procedure 知识单元，每个 procedure 代表一个可执行或可检查阶段；如果只是理念讲解，不强行抽取 procedure。
-14. timeline 要表达“如何推进”，不要只列章节标题。
-15. completeness 是读完讲义后的闭环检查，要如实指出缺失，不要为了好看全部写已完成。
-16. taxonomy 是必填字段，用于讲义库的多领域归类与首页折叠树，请严格按以下规则输出：
+12. 公式有字幕或画面证据时**必须**写入 chapters[].formula_blocks（一个公式一项，附 ts 与 explanation）；同时 teaching_notes 中可保留行内公式以保持上下文。LaTeX 用标准分隔符：$...$、$$...$$；化学式优先 mhchem，例如 \\ce{H2O}。
+13. 代码有字幕或画面证据时**必须**写入 chapters[].code_blocks，每条独立保留缩进与换行；不要把代码塞进 teaching_notes 字符串。language 用 python/rust/cpp/sql/yaml/shell 这种已知短名。
+13b. chapters[].process_steps：当本章包含连续可执行操作、机制阶段或调用顺序时，按顺序列出 3-8 个该可验证的步骤（例如 “调用 X 传入 Y”、“状态从 A 转为 B”）；纯概念或总结章节可留空。不要把 process_steps 写成表面句子（如 “讲解原理”），必须是实际动作。
+14. 操作教程如果确有连续操作链路，应抽取多个 procedure 知识单元，每个 procedure 代表一个可执行或可检查阶段；如果只是理念讲解，不强行抽取 procedure。
+15. timeline 要表达“如何推进”，不要只列章节标题。
+16. completeness 是读完讲义后的闭环检查，要如实指出缺失，不要为了好看全部写已完成。
+17. **若用户消息中提供了 study_questions 列表，必须把它们逐字写入输出 JSON 的 study_questions 字段，并确保每条问题都能在 chapters/knowledge_units 中找到对应回答；若某条问题字幕里完全无证据，应写进 completeness.missing_examples 或 missing_boundaries 而不是硬编。**
+18. taxonomy 是必填字段，用于讲义库的多领域归类与首页折叠树，请严格按以下规则输出：
     - domain：必须从下面候选列表中选**一个**完全一致的字符串，不要自造、不要改大小写、不要加空格：
       "AI 技术" / "编程开发" / "数据科学" / "硬件与系统" / "数学" / "物理" / "化学生物" / "医学" /
       "烹饪" / "健身运动" / "金融投资" / "人文社科" / "艺术设计" / "工程实务" / "其他"。
@@ -244,8 +411,19 @@ LECTURE_IR_USER_TEMPLATE = """\
 - BV: {bv_id}
 - 标题: {title}
 - UP 主: {author}
-- 时长: {duration} 秒
+- 时长: {duration} 秒（约 {minutes} 分钟）
 - 封面: {cover_url}
+
+长度预算（**必须**遵守）：
+- chapters_min: {chapters_min}
+- chapters_max: {chapters_max}
+- mainline_max: {mainline_max}
+- glossary_max: {glossary_max}
+- review_questions_max: {review_questions_max}
+- 密度提示: {density_hint}
+
+学习问题（study_questions，可能为空）：
+{study_questions_block}
 
 字幕（时间戳·文本）：
 {subtitle_block}
@@ -253,7 +431,7 @@ LECTURE_IR_USER_TEMPLATE = """\
 关键帧视觉描述（时间戳·caption [· OCR]）：
 {frames_block}
 
-请输出 LectureIR JSON。
+请输出 LectureIR JSON，并在 chapters/knowledge_units/code_blocks/formula_blocks 中确保每个 study_question 都有对应回答。
 """
 
 

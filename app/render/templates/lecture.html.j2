@@ -7,6 +7,11 @@
   {% if katex_assets_available %}
   <link rel="stylesheet" href="assets/katex/katex.min.css" />
   {% endif %}
+  {% if highlight_assets_available %}
+  <link rel="stylesheet" href="assets/highlight/atom-one-light.min.css" />
+  {% elif highlight_cdn_url %}
+  <link rel="stylesheet" href="{{ highlight_cdn_css }}" crossorigin="anonymous" />
+  {% endif %}
   <style>
 {{ css_inline }}
   </style>
@@ -100,6 +105,17 @@
         {% endif %}
       </details>
       {% endif %}
+    </section>
+    {% endif %}
+
+    {% if lecture.study_questions %}
+    <section class="study-questions">
+      <h2>读完后你应当能回答</h2>
+      <ol>
+        {% for q in lecture.study_questions %}
+        <li>{{ q | rich_text }}</li>
+        {% endfor %}
+      </ol>
     </section>
     {% endif %}
 
@@ -235,6 +251,40 @@
           <li>{{ item | rich_text }}</li>
           {% endfor %}
         </ul>
+      </div>
+      {% endif %}
+
+      {% if ch.code_blocks and lecture.render_plan.code_section %}
+      <div class="code-blocks">
+        <h3>代码片段</h3>
+        {% for cb in ch.code_blocks %}
+        <figure class="code-card">
+          <header class="code-card-head">
+            <span class="code-lang">{{ cb.language or 'text' }}</span>
+            <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, cb.ts) }}" target="_blank" rel="noopener">⚓ {{ cb.ts | fmt_ts }}</a>
+            {% if cb.source %}<span class="code-source">{{ cb.source }}</span>{% endif %}
+          </header>
+          <pre class="code-block"><code class="language-{{ cb.language or 'text' }}">{{ cb.code }}</code></pre>
+          {% if cb.explanation %}
+          <figcaption>{{ cb.explanation | rich_text }}</figcaption>
+          {% endif %}
+        </figure>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if ch.formula_blocks and lecture.render_plan.formula_section %}
+      <div class="formula-blocks">
+        <h3>公式</h3>
+        {% for fb in ch.formula_blocks %}
+        <figure class="formula-card">
+          <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, fb.ts) }}" target="_blank" rel="noopener">⚓ {{ fb.ts | fmt_ts }}</a>
+          <div class="formula-latex">$${{ fb.latex }}$$</div>
+          {% if fb.explanation %}
+          <figcaption>{{ fb.explanation | rich_text }}</figcaption>
+          {% endif %}
+        </figure>
+        {% endfor %}
       </div>
       {% endif %}
     </section>
@@ -407,6 +457,22 @@
         ],
         throwOnError: false
       });
+    });
+  </script>
+  {% endif %}
+
+  {% if highlight_assets_available %}
+  <script defer src="assets/highlight/highlight.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.hljs) { window.hljs.highlightAll(); }
+    });
+  </script>
+  {% elif highlight_cdn_url %}
+  <script defer src="{{ highlight_cdn_url }}" crossorigin="anonymous"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.hljs) { window.hljs.highlightAll(); }
     });
   </script>
   {% endif %}

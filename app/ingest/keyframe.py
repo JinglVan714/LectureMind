@@ -133,12 +133,35 @@ class KeyframeExtractor:
     # ---------------- scene detection ----------------
 
     def _detect_scene_timestamps(self, video_path: Path, duration: int) -> list[float]:
-        """Return a list of timestamps (seconds) within [keyframe_min, keyframe_max]."""
+        """Return a list of timestamps (seconds) within the adaptive window.
+
+        ``KEYFRAME_MIN`` / ``KEYFRAME_MAX`` env vars now act as **lower
+        bounds**: when ``KEYFRAME_LENGTH_ADAPT`` is enabled (default),
+        we widen them with :func:`keyframe_window` so a 44-minute
+        lecture gets ~50-60 frames rather than the legacy hard cap of
+        20.  This restores per-minute visual evidence density on long
+        videos without affecting short ones (the floor stays the same).
+        """
         try:
             from scenedetect import open_video, SceneManager
             from scenedetect.detectors import ContentDetector
         except ImportError as exc:
             raise RuntimeError("PySceneDetect is required for keyframe extraction") from exc
+
+        if getattr(self._settings, "keyframe_length_adapt", True):
+            # Lazy import: ``app.understand.length_adapt`` lives in the
+            # ``understand`` package, which would otherwise cycle back
+            # into ``ingest.keyframe`` via ``understand.vlm`` during
+            # package init.
+            from ..understand.length_adapt import keyframe_window
+
+            kf_min, kf_max = keyframe_window(
+                duration,
+                base_min=self._settings.keyframe_min,
+                base_max=self._settings.keyframe_max,
+            )
+        else:
+            kf_min, kf_max = self._settings.keyframe_min, self._settings.keyframe_max
 
         timestamps: list[float] = []
         try:
@@ -153,14 +176,14 @@ class KeyframeExtractor:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Scene detection failed (%s); falling back to uniform sampling", exc)
 
-        # Cap to keyframe_max
-        if len(timestamps) > self._settings.keyframe_max:
-            step = len(timestamps) / self._settings.keyframe_max
-            timestamps = [timestamps[int(i * step)] for i in range(self._settings.keyframe_max)]
+        # Cap to the adaptive max
+        if len(timestamps) > kf_max:
+            step = len(timestamps) / kf_max
+            timestamps = [timestamps[int(i * step)] for i in range(kf_max)]
 
-        # Pad to keyframe_min via uniform sampling
-        if len(timestamps) < self._settings.keyframe_min and duration > 0:
-            need = self._settings.keyframe_min - len(timestamps)
+        # Pad to the adaptive min via uniform sampling
+        if len(timestamps) < kf_min and duration > 0:
+            need = kf_min - len(timestamps)
             extra = [
                 duration * (i + 1) / (need + 1)
                 for i in range(need)
@@ -170,6 +193,10 @@ class KeyframeExtractor:
         # Edge guard: at least one frame
         if not timestamps and duration > 0:
             timestamps = [duration / 2.0]
+        logger.info(
+            "keyframe window: duration=%ss, target=[%d,%d], detected=%d",
+            duration, kf_min, kf_max, len(timestamps),
+        )
         return sorted(timestamps)
 
     # ---------------- frame extraction ----------------

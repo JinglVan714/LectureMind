@@ -47,7 +47,18 @@ logger = logging.getLogger(__name__)
 # Types
 # ---------------------------------------------------------------------------
 
-ChunkKind = Literal["teaching_note", "quote", "pitfall", "knowledge_unit", "frame_ocr"]
+ChunkKind = Literal[
+    "teaching_note",
+    "quote",
+    "pitfall",
+    "knowledge_unit",
+    "frame_ocr",
+    # v2 — code/formula first-class, plus study questions for "explain
+    # how this lecture answers question X" RAG queries.
+    "code_block",
+    "formula_block",
+    "study_question",
+]
 
 
 @dataclass
@@ -159,6 +170,59 @@ def chunk_lecture(
                 )
             )
 
+        # 3b. code_blocks — chapter-attached code excerpts
+        for cb in getattr(ch, "code_blocks", []) or []:
+            code = (getattr(cb, "code", "") or "").strip()
+            if not code:
+                continue
+            language = (getattr(cb, "language", "") or "text").strip() or "text"
+            explanation = (getattr(cb, "explanation", "") or "").strip()
+            ts = int(getattr(cb, "ts", ch_start) or ch_start)
+            # Embed the explanation alongside the code so vector search
+            # on natural-language queries (e.g. "show me the loss code")
+            # has something to match in addition to identifiers.
+            text = f"[code:{language}]\n{code}"
+            if explanation:
+                text = f"{text}\n说明：{explanation}"
+            out.append(
+                Chunk(
+                    bv_id=bv_id,
+                    kind="code_block",
+                    text=text,
+                    chapter_idx=ch.index,
+                    t_start=ts,
+                    t_end=ts,
+                    meta={
+                        "language": language,
+                        "code": code,
+                        "source": getattr(cb, "source", "") or "",
+                        "explanation": explanation,
+                    },
+                )
+            )
+
+        # 3c. formula_blocks — chapter-attached LaTeX formulas
+        for fb in getattr(ch, "formula_blocks", []) or []:
+            latex = (getattr(fb, "latex", "") or "").strip()
+            if not latex:
+                continue
+            explanation = (getattr(fb, "explanation", "") or "").strip()
+            ts = int(getattr(fb, "ts", ch_start) or ch_start)
+            text = f"$$ {latex} $$"
+            if explanation:
+                text = f"{text}\n说明：{explanation}"
+            out.append(
+                Chunk(
+                    bv_id=bv_id,
+                    kind="formula_block",
+                    text=text,
+                    chapter_idx=ch.index,
+                    t_start=ts,
+                    t_end=ts,
+                    meta={"latex": latex, "explanation": explanation},
+                )
+            )
+
         # 4. frame_ocr — chapter-attached frames
         for f in ch.frames:
             if not f.path or f.path in seen_frame_paths:
@@ -235,6 +299,24 @@ def chunk_lecture(
                     "insight": v.insight,
                     "visual_type": v.visual_type,
                 },
+            )
+        )
+
+    # 7. study_questions — one chunk per question; chapter_idx is left
+    #    unset because they apply to the whole lecture.  These give the
+    #    Copilot a precise hook for "did the lecture answer X?" queries.
+    for q in getattr(lecture, "study_questions", []) or []:
+        text = (q or "").strip()
+        if not text:
+            continue
+        out.append(
+            Chunk(
+                bv_id=bv_id,
+                kind="study_question",
+                text=text,
+                chapter_idx=None,
+                t_start=None,
+                t_end=None,
             )
         )
 

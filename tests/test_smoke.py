@@ -494,3 +494,258 @@ class TestLatexRepair:
         assert repair_obj(None) is None
         assert repair_obj(True) is True
         assert repair_obj([1, 2.5, None]) == [1, 2.5, None]
+
+
+# ---------------- v2: length-adaptive ceilings ----------------
+
+
+class TestLengthAdapt:
+    """Verify the duration-aware caps that replace the legacy
+    fixed-everywhere ceilings (chapters: 3-8, mainline: 6-8, …)."""
+
+    def test_keyframe_window_widens_for_long_videos(self):
+        from app.understand.length_adapt import keyframe_window
+
+        # 11 min: stays at the legacy floor
+        kf_min_short, kf_max_short = keyframe_window(660, base_min=8, base_max=20)
+        assert kf_min_short >= 8
+        assert kf_max_short >= 20
+
+        # 44 min: widens significantly so the long-video info-loss bug
+        # described in the design doc no longer compresses 44 min into
+        # the same envelope as 11 min.
+        kf_min_long, kf_max_long = keyframe_window(2640, base_min=8, base_max=20)
+        assert kf_max_long >= kf_max_short * 2
+        assert kf_max_long <= 80  # hard ceiling to bound HTML size
+
+    def test_chapters_target_grows_with_duration(self):
+        from app.understand.length_adapt import chapters_target
+
+        assert chapters_target(300) == (3, 4)        # 5 min
+        assert chapters_target(1200) == (4, 6)       # 20 min
+        ch_min, ch_max = chapters_target(2640)       # 44 min
+        assert ch_min >= 5 and ch_max >= 7
+        # Multi-hour videos still cap below an unreadable level.
+        assert chapters_target(10800)[1] <= 12       # 3 h
+
+    def test_mainline_max_is_continuous(self):
+        from app.understand.length_adapt import mainline_max
+
+        # No more 6→8 step at exactly 30 min; should grow smoothly.
+        assert mainline_max(600) <= mainline_max(1800) <= mainline_max(3600)
+        assert mainline_max(60) >= 4
+        assert mainline_max(7200) <= 14
+
+    def test_global_visual_limit_holds_at_5_for_short_videos(self):
+        from app.understand.length_adapt import global_visual_limit
+
+        # The renderer test suite assumes 5 frames for the 10 min fixture.
+        assert global_visual_limit(600) == 5
+        assert global_visual_limit(60) == 5
+        # And expands for long videos.
+        assert global_visual_limit(2640) > 5
+
+    def test_length_budget_packs_all_caps(self):
+        from app.understand.length_adapt import LengthBudget
+
+        budget = LengthBudget.for_duration(2640, keyframe_base_min=8, keyframe_base_max=20)
+        assert budget.duration_sec == 2640
+        assert budget.chapters_min >= 5
+        assert budget.mainline_max >= 8
+        assert budget.keyframe_max >= 40
+        assert budget.density_hint  # non-empty
+
+
+# ---------------- v2: code/formula schema + render ----------------
+
+
+class TestCodeFormulaSchema:
+    """The schema must round-trip code_blocks / formula_blocks through
+    Pydantic and the IR → LectureJSON conversion."""
+
+    def test_chapter_carries_code_blocks(self):
+        from app.understand.schema import Chapter, CodeBlock
+
+        cb = CodeBlock(
+            language="python",
+            code="def f(x):\n    return x + 1",
+            ts=10,
+            chapter_index=1,
+            source="ocr",
+            explanation="The smallest possible function.",
+        )
+        ch = Chapter(
+            index=1,
+            title="第一章",
+            start=0,
+            end=120,
+            summary="测试代码块",
+            code_blocks=[cb],
+        )
+        assert ch.code_blocks[0].code.startswith("def f")
+        assert "\n" in ch.code_blocks[0].code  # newlines survived
+
+    def test_ir_to_lecture_passes_code_blocks(self):
+        from app.understand.ir import IRCodeBlock, IRFormulaBlock
+
+        ir = _sample_ir()
+        ir.chapters[0].code_blocks = [
+            IRCodeBlock(
+                language="python",
+                code="x = 1\ny = 2",
+                ts=10,
+                chapter_index=1,
+                explanation="两行代码",
+            )
+        ]
+        ir.chapters[0].formula_blocks = [
+            IRFormulaBlock(
+                latex="E = mc^2",
+                ts=10,
+                chapter_index=1,
+                explanation="质能等价",
+            )
+        ]
+        lecture = lecture_ir_to_lecture_json(ir)
+        assert lecture.chapters[0].code_blocks
+        assert lecture.chapters[0].code_blocks[0].language == "python"
+        assert "\n" in lecture.chapters[0].code_blocks[0].code
+        # Render-plan flags auto-flipped when content is present.
+        assert lecture.render_plan.code_section is True
+        assert lecture.render_plan.formula_section is True
+
+    def test_renderer_emits_code_card_for_chapter_code_blocks(self):
+        from app.understand.schema import CodeBlock
+
+        lec = _sample_lecture()
+        lec.chapters[0].code_blocks = [
+            CodeBlock(
+                language="python",
+                code="def hello():\n    print('hi')",
+                ts=10,
+                chapter_index=1,
+                explanation="hello world",
+            )
+        ]
+        lec.render_plan.code_section = True
+        frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / "00050.jpg"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(b"fake-jpeg")
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+        assert "代码片段" in html
+        assert "code-card" in html
+        assert "def hello()" in html
+        assert 'class="language-python"' in html
+        # Either a vendored bundle or the CDN fallback should be wired in.
+        assert "highlight" in html.lower()
+
+
+# ---------------- v2: study questions block ----------------
+
+
+class TestStudyQuestionsRender:
+    def test_template_renders_study_questions(self):
+        lec = _sample_lecture()
+        lec.study_questions = [
+            "测试问题一？",
+            "测试问题二？",
+        ]
+        frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / "00050.jpg"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(b"fake-jpeg")
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+        assert "读完后你应当能回答" in html
+        assert "测试问题一？" in html
+        assert "测试问题二？" in html
+
+
+# ---------------- v2: fuzzy n-gram quote verification ----------------
+
+
+class TestFuzzyQuoteVerification:
+    """The legacy exact-substring matcher flagged any LLM paraphrase as
+    ⚠️.  The new fuzzy matcher only flags actual hallucinations."""
+
+    def _build(self, quote: str):
+        from app.understand.schema import Chapter, LectureJSON, Point
+
+        return LectureJSON(
+            bv_id="BVfuzz",
+            title="t",
+            duration=600,
+            one_liner="x",
+            chapters=[
+                Chapter(
+                    index=1,
+                    title="c",
+                    start=0,
+                    end=600,
+                    summary="s",
+                    points=[Point(text="P", ts=10, quote=quote)],
+                )
+            ],
+        )
+
+    def test_fuzzy_accepts_minor_paraphrase(self):
+        # Transcript contains the canonical phrase; the LLM dropped one
+        # filler particle ("我们") but kept enough characters that the
+        # 4-gram overlap is well above 0.6.
+        transcript = "我们今天来讲注意力机制的核心思想"
+        lec = self._build("今天来讲注意力机制的核心思想")
+        marked = lec.mark_unverified_points(transcript)
+        assert marked == 0
+
+    def test_fuzzy_rejects_unrelated_quote(self):
+        transcript = "我们今天来讲注意力机制的核心思想"
+        lec = self._build("猫吃了昨天剩下的鱼")
+        marked = lec.mark_unverified_points(transcript)
+        assert marked == 1
+        assert lec.chapters[0].points[0].text.startswith("⚠️")
+
+    def test_fuzzy_short_quote_still_uses_exact_match(self):
+        # Quotes shorter than 6 normalised chars must match exactly so
+        # we don't accept random substring noise.
+        transcript = "abcdef"
+        lec = self._build("xyz")
+        assert lec.mark_unverified_points(transcript) == 1
+
+
+# ---------------- v2: RAG chunk_lecture new kinds ----------------
+
+
+class TestRagChunkV2:
+    def test_chunk_lecture_emits_code_formula_and_study_question(self):
+        from app.copilot.rag import chunk_lecture
+        from app.understand.schema import CodeBlock, FormulaBlock
+
+        lec = _sample_lecture()
+        lec.chapters[0].code_blocks = [
+            CodeBlock(
+                language="python",
+                code="x = 1\ny = 2",
+                ts=10,
+                chapter_index=1,
+                explanation="两行代码",
+            )
+        ]
+        lec.chapters[0].formula_blocks = [
+            FormulaBlock(latex="E = mc^2", ts=10, chapter_index=1, explanation="经典公式")
+        ]
+        lec.study_questions = ["问题1？", "问题2？"]
+
+        chunks = chunk_lecture(lec)
+        kinds = {c.kind for c in chunks}
+        assert "code_block" in kinds
+        assert "formula_block" in kinds
+        assert "study_question" in kinds
+        # The code chunk preserves indentation/newlines for downstream RAG.
+        code_chunks = [c for c in chunks if c.kind == "code_block"]
+        assert len(code_chunks) == 1
+        assert "x = 1\ny = 2" in code_chunks[0].text
+        assert code_chunks[0].meta["language"] == "python"

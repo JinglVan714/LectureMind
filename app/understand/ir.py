@@ -5,6 +5,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .length_adapt import (
+    chapter_frame_max,
+    points_per_chapter_max,
+)
 from .schema import Taxonomy
 
 PrimaryType = Literal["technical_formula", "conceptual_talk", "procedural_tutorial", "generic_lecture"]
@@ -48,6 +52,28 @@ class IRFrame(BaseModel):
     importance_score: float = Field(default=0.0, ge=0, le=1)
 
 
+class IRCodeBlock(BaseModel):
+    """First-class code excerpt (mirrors :class:`schema.CodeBlock`)."""
+
+    language: str = ""
+    code: str = ""
+    ts: float = Field(default=0.0, ge=0)
+    chapter_index: int = Field(default=1, ge=1)
+    source: str = "ocr"
+    explanation: str = ""
+    related_frame_paths: list[str] = Field(default_factory=list)
+
+
+class IRFormulaBlock(BaseModel):
+    """First-class LaTeX formula (mirrors :class:`schema.FormulaBlock`)."""
+
+    latex: str = ""
+    ts: float = Field(default=0.0, ge=0)
+    chapter_index: int = Field(default=1, ge=1)
+    explanation: str = ""
+    related_frame_paths: list[str] = Field(default_factory=list)
+
+
 class IRChapter(BaseModel):
     index: int = Field(default=1, ge=1)
     title: str = ""
@@ -62,6 +88,8 @@ class IRChapter(BaseModel):
     pitfalls: list[str] = Field(default_factory=list)
     key_takeaways: list[str] = Field(default_factory=list)
     knowledge_unit_ids: list[str] = Field(default_factory=list)
+    code_blocks: list[IRCodeBlock] = Field(default_factory=list)
+    formula_blocks: list[IRFormulaBlock] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_range(self) -> "IRChapter":
@@ -150,6 +178,10 @@ class LectureIR(BaseModel):
     render_plan: RenderPlan = Field(default_factory=RenderPlan)
     final_synthesis: str = ""
     review_questions: list[str] = Field(default_factory=list)
+    study_questions: list[str] = Field(
+        default_factory=list,
+        description="Question-Driven 抽取阶段产出的核心学习问题",
+    )
     taxonomy: Taxonomy | None = None
 
     @model_validator(mode="after")
@@ -189,6 +221,7 @@ def hydrate_lecture_ir_data(data: dict[str, Any], ctx: Any) -> None:
         f"为什么「{ch.get('title', '本章')}」是主线中的必要环节？"
         for ch in data["chapters"][:5]
     ]
+    data["study_questions"] = _normalise_string_list(data.get("study_questions"))
 
 
 def infer_primary_type(title: str, transcript: str = "", frame_text: str = "") -> PrimaryType:
@@ -250,6 +283,7 @@ def _hydrate_profile(raw: Any, title: str, transcript: str, frame_text: str) -> 
 
 def _normalise_chapters(raw: Any, ctx: Any) -> list[dict[str, Any]]:
     chapters = raw if isinstance(raw, list) and raw else [_fallback_chapter(ctx)]
+    duration = int(getattr(ctx, "duration", 0) or 0)
     out: list[dict[str, Any]] = []
     for idx, item in enumerate(chapters, start=1):
         ch = item if isinstance(item, dict) else {"summary": str(item)}
@@ -266,8 +300,23 @@ def _normalise_chapters(raw: Any, ctx: Any) -> list[dict[str, Any]]:
         ch["pitfalls"] = _normalise_string_list(ch.get("pitfalls") or ch.get("warnings"))
         ch["key_takeaways"] = _normalise_string_list(ch.get("key_takeaways") or ch.get("takeaways")) or [p["text"] for p in ch["points"][:2] if p.get("text")]
         ch["knowledge_unit_ids"] = _normalise_string_list(ch.get("knowledge_unit_ids"))
+        ch["code_blocks"] = _normalise_code_blocks(
+            ch.get("code_blocks") or ch.get("code") or ch.get("snippets"),
+            ch,
+            duration,
+        )
+        ch["formula_blocks"] = _normalise_formula_blocks(
+            ch.get("formula_blocks") or ch.get("formulas"),
+            ch,
+            duration,
+        )
+        # Length-adaptive cap on points: prevents long chapters from
+        # being truncated to the legacy hidden ceiling of 5 while still
+        # bounding the total HTML size.
+        ch_seconds = max(0.0, _coerce_float(ch.get("end"), 0.0) - _coerce_float(ch.get("start"), 0.0))
+        ch["points"] = ch["points"][: points_per_chapter_max(ch_seconds)]
         out.append(ch)
-    _fill_chapter_ranges(out, int(getattr(ctx, "duration", 0) or 0))
+    _fill_chapter_ranges(out, duration)
     return out
 
 
@@ -314,6 +363,8 @@ def _attach_visuals_to_chapters(chapters: list[dict[str, Any]], visuals: list[di
     for ch in chapters:
         start = _coerce_float(ch.get("start"), 0.0)
         end = _coerce_float(ch.get("end"), start)
+        ch_seconds = max(0.0, end - start)
+        cap = chapter_frame_max(ch_seconds)
         local = [v for v in selected if start <= _coerce_float(v.get("ts"), 0.0) <= end]
         ch["frames"] = [
             {
@@ -326,7 +377,7 @@ def _attach_visuals_to_chapters(chapters: list[dict[str, Any]], visuals: list[di
                 "selected_reason": v.get("selected_reason", ""),
                 "importance_score": v.get("importance_score", 0),
             }
-            for v in sorted(local, key=lambda x: x.get("importance_score", 0), reverse=True)[:2]
+            for v in sorted(local, key=lambda x: x.get("importance_score", 0), reverse=True)[:cap]
         ]
 
 
@@ -379,6 +430,133 @@ def _normalise_points(raw: Any, chapter: dict[str, Any], ctx: Any) -> list[dict[
     ts = _coerce_float(chapter.get("start"), 0.0)
     quote = _nearest_quote(getattr(ctx, "segments", []), ts)
     return [{"text": quote or chapter.get("title", ""), "ts": ts, "quote": quote or chapter.get("title", "")}]
+
+
+_FENCED_CODE_RE = re.compile(r"```([A-Za-z0-9_+\-.#]*)?[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> tuple[str, str]:
+    """Return ``(language, body)`` if ``text`` is a fenced block, else ('', text).
+
+    LLMs often output ``code`` already wrapped in ``` ```python\n…\n``` ```.
+    We unwrap so the renderer can apply its own ``<pre><code>`` wrapper
+    consistently and ``<pre>`` doesn't end up nested inside a ``<pre>``.
+    """
+    text = text or ""
+    match = _FENCED_CODE_RE.search(text)
+    if not match:
+        return "", text
+    return (match.group(1) or "").strip().lower(), match.group(2).strip("\n")
+
+
+def _normalise_code_blocks(raw: Any, chapter: dict[str, Any], duration: int) -> list[dict[str, Any]]:
+    """Hydrate ``code_blocks`` from any reasonable LLM payload.
+
+    Tolerates:
+    * ``[{"language": "python", "code": "...", "ts": 12, "explanation": "..."}]``
+    * ``[{"lang": "...", "code": "..."}]`` (alternate key names)
+    * Plain strings (treated as ``code``; language probed from a fence)
+    * ``None`` / non-list (returns ``[]``)
+    """
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    chapter_index = _coerce_int(chapter.get("index"), 1)
+    default_ts = _coerce_float(chapter.get("start"), 0.0)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            language, body = _strip_code_fence(item)
+            code = body
+        elif isinstance(item, dict):
+            raw_code = item.get("code") or item.get("snippet") or item.get("text") or ""
+            fence_lang, body = _strip_code_fence(str(raw_code))
+            language = str(item.get("language") or item.get("lang") or fence_lang or "").strip().lower()
+            code = body if body else str(raw_code)
+        else:
+            continue
+        # Tolerate single-line code that arrived as JSON-escaped \n; the
+        # ``_latex_repair`` pass usually fixes this, but a belt-and-braces
+        # decode never hurts.
+        code = (code or "").replace("\r\n", "\n").rstrip("\n")
+        if not code.strip():
+            continue
+        ts = _clamp(
+            _coerce_float(_first_present(item if isinstance(item, dict) else {}, ["ts", "timestamp", "time"]), default_ts),
+            0.0,
+            float(duration or 0),
+        )
+        explanation = (
+            str(item.get("explanation") or item.get("note") or "")
+            if isinstance(item, dict)
+            else ""
+        ).strip()
+        source = (
+            str(item.get("source") or "ocr")
+            if isinstance(item, dict)
+            else "ocr"
+        ).strip().lower()
+        if source not in {"ocr", "narrated", "reconstructed"}:
+            source = "ocr"
+        related = (
+            _normalise_string_list(item.get("related_frame_paths") or item.get("frames"))
+            if isinstance(item, dict)
+            else []
+        )
+        out.append(
+            {
+                "language": _sanitize_language(language),
+                "code": code,
+                "ts": ts,
+                "chapter_index": _coerce_int(item.get("chapter_index") if isinstance(item, dict) else None, chapter_index),
+                "source": source,
+                "explanation": explanation,
+                "related_frame_paths": related,
+            }
+        )
+    return out
+
+
+def _normalise_formula_blocks(raw: Any, chapter: dict[str, Any], duration: int) -> list[dict[str, Any]]:
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    chapter_index = _coerce_int(chapter.get("index"), 1)
+    default_ts = _coerce_float(chapter.get("start"), 0.0)
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, str):
+            latex = item
+            payload = {}
+        elif isinstance(item, dict):
+            payload = item
+            latex = str(item.get("latex") or item.get("formula") or item.get("text") or "").strip()
+        else:
+            continue
+        if not latex:
+            continue
+        ts = _clamp(
+            _coerce_float(_first_present(payload, ["ts", "timestamp", "time"]), default_ts),
+            0.0,
+            float(duration or 0),
+        )
+        explanation = str(payload.get("explanation") or payload.get("note") or "").strip()
+        related = _normalise_string_list(payload.get("related_frame_paths") or payload.get("frames"))
+        out.append(
+            {
+                "latex": latex,
+                "ts": ts,
+                "chapter_index": _coerce_int(payload.get("chapter_index"), chapter_index),
+                "explanation": explanation,
+                "related_frame_paths": related,
+            }
+        )
+    return out
+
+
+def _sanitize_language(language: str) -> str:
+    """Restrict to a safe charset for use as a CSS class / hljs language."""
+    return re.sub(r"[^A-Za-z0-9_+\-.#]", "", str(language or "")).lower()[:32]
 
 
 def _normalise_chapter_frames(raw: Any, ctx: Any) -> list[dict[str, Any]]:

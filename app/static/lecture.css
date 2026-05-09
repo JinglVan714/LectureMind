@@ -1088,10 +1088,144 @@ a:hover { text-decoration: underline; }
   font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   font-size: 13.5px;
   line-height: 1.6;
+  white-space: pre;
+  tab-size: 4;
 }
 
 .code-block code {
   font-family: inherit;
+  white-space: pre;
+}
+
+/* highlight.js (atom-one-light theme) overrides for our dark .code-block.
+   When the bundled or CDN theme stylesheet loads it sets background:#fafafa
+   on .hljs which is great for light pages but fights our dark code-block.
+   We override only the surface; the token colours from the theme remain. */
+.code-block code.hljs {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+/* ---- v2: per-chapter code/formula cards ---- */
+.code-blocks,
+.formula-blocks {
+  margin-top: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.code-blocks h3,
+.formula-blocks h3 {
+  font-size: 16px;
+  margin-bottom: 4px;
+}
+
+.code-card {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--surface, #ffffff);
+  overflow: hidden;
+}
+
+.code-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #f1f3f7;
+  border-bottom: 1px solid var(--rule);
+  font-size: 12.5px;
+}
+
+.code-card-head .code-lang {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #4b5563;
+}
+
+.code-card-head .code-source {
+  margin-left: auto;
+  font-size: 11px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.code-card .code-block {
+  margin: 0;
+  border-radius: 0;
+}
+
+.code-card figcaption {
+  padding: 8px 14px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #4b5563;
+  background: #fbfbfd;
+  border-top: 1px solid var(--rule);
+}
+
+.formula-card {
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: #fbfbfd;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.formula-card .ts-anchor {
+  align-self: flex-start;
+  font-size: 12.5px;
+}
+
+.formula-card .formula-latex {
+  text-align: center;
+  margin: 4px 0;
+  overflow-x: auto;
+}
+
+.formula-card figcaption {
+  font-size: 13px;
+  color: #4b5563;
+  line-height: 1.7;
+}
+
+/* ---- v2: cover-level study questions ---- */
+.study-questions {
+  margin: 24px auto 28px;
+  padding: 20px 24px;
+  border: 1px dashed var(--rule);
+  border-radius: 12px;
+  background: #fffbf2;
+}
+
+.study-questions h2 {
+  font-size: 18px;
+  margin-bottom: 12px;
+  text-align: center;
+  color: #715212;
+}
+
+.study-questions ol {
+  margin: 0 auto;
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+  line-height: 1.7;
+  max-width: 760px;
+  text-align: left;
 }
 
 blockquote {

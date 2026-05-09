@@ -44,7 +44,7 @@ class FrameDescriber:
             base_url=s.dashscope_base_url,
         )
         self._model = s.qwen_vl_model
-        self._concurrency = 4
+        self._concurrency = max(1, int(getattr(s, "qwen_vl_concurrency", 4) or 4))
 
     async def describe_all(self, frames: list[Keyframe]) -> list[FrameDescription]:
         if not frames:
@@ -69,7 +69,8 @@ class FrameDescriber:
             bv_id = frames[0].path.parent.name
         except IndexError:
             return None
-        return self._settings.data_dir / "vlm_cache" / f"{bv_id}.json"
+        safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", self._model)
+        return self._settings.data_dir / "vlm_cache" / safe_model / f"{bv_id}.json"
 
     def _load_cache(self, frames: list[Keyframe]) -> list[FrameDescription] | None:
         cache_path = self._cache_path(frames)
@@ -113,9 +114,11 @@ class FrameDescriber:
     def _write_cache(self, descriptions: list[FrameDescription]) -> None:
         if not descriptions:
             return
+        safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", self._model)
         cache_path = (
             self._settings.data_dir
             / "vlm_cache"
+            / safe_model
             / f"{descriptions[0].path.parent.name}.json"
         )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
