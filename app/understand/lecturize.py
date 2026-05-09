@@ -165,8 +165,11 @@ class Lecturizer:
 
 
 def _format_segments(segments: list[SubtitleSegment]) -> str:
+    # Include the explicit second value alongside the human-readable mm:ss
+    # tag. Earlier prompt formatting only showed ``[MM:SS]`` and the LLM
+    # frequently mistook the minute portion for the ts seconds in points.
     return "\n".join(
-        f"[{int(s.start // 60):02d}:{int(s.start % 60):02d}] {s.text}"
+        f"[ts={float(s.start):.1f}s | {int(s.start // 60):02d}:{int(s.start % 60):02d}] {s.text}"
         for s in segments
     )
 
@@ -174,8 +177,11 @@ def _format_segments(segments: list[SubtitleSegment]) -> str:
 def _format_frames(frames: list[FrameDescription]) -> str:
     out: list[str] = []
     for f in frames:
+        ts = float(getattr(f, "timestamp", 0.0) or 0.0)
+        # Same rationale as _format_segments: the explicit ``ts=NN.N s`` lets
+        # the LLM copy seconds verbatim instead of guessing from ``[MM:SS]``.
         line = (
-            f"[{int(f.timestamp // 60):02d}:{int(f.timestamp % 60):02d}] "
+            f"[ts={ts:.1f}s | {int(ts // 60):02d}:{int(ts % 60):02d}] "
             f"path={f.path} · {f.caption}"
         )
         if f.ocr_text:

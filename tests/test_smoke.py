@@ -749,3 +749,342 @@ class TestRagChunkV2:
         assert len(code_chunks) == 1
         assert "x = 1\ny = 2" in code_chunks[0].text
         assert code_chunks[0].meta["language"] == "python"
+
+
+# ---------------- v2: ts integrity regression (P2) ----------------
+
+
+class TestTsIntegrity:
+    """Regression coverage for the May-2026 ts hallucination bug class.
+
+    The IR builder used to trust LLM-supplied ``ts`` values verbatim. In
+    practice the LLM frequently:
+
+      * extracted only the minute portion of the prompt's ``[MM:SS]`` prefix
+        (so a frame at 12:51.0 became ``ts=12``),
+      * left points/knowledge_units at ``ts=0`` even for chapters that started
+        deep inside the video,
+      * truncated chapter coverage to a round number well below ``duration``,
+      * forgot to attach frames to chapters whenever any sibling chapter had
+        even one LLM-provided frame.
+
+    The tests below pin the post-processing fixes that turn those failures
+    into deterministic, user-correct anchors.
+    """
+
+    def _ctx(self, *, duration: int = 800) -> LecturizeContext:
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD"
+        return LecturizeContext(
+            bv_id="BV1xx411c7mD",
+            url="https://www.bilibili.com/video/BV1xx411c7mD",
+            title="ts integrity smoke",
+            author="up",
+            duration=duration,
+            cover_url="",
+            segments=[
+                SubtitleSegment(start=10, end=15, text="开篇问题：什么是注意力机制"),
+                SubtitleSegment(start=180, end=185, text="Plan Mode 是一种强制的协作模式"),
+                SubtitleSegment(start=540, end=545, text="update_plan 通过提交完整快照实现 replan"),
+                SubtitleSegment(start=720, end=725, text="收尾：和 Default Mode 的边界"),
+            ],
+            frame_descs=[
+                FrameDescription(
+                    timestamp=120.133,
+                    path=str(kf_dir / "00120133.jpg"),
+                    caption="Plan Mode 切换提示",
+                    ocr_text="Plan Mode",
+                    visual_type="slide_text",
+                    importance_score=0.9,
+                ),
+                FrameDescription(
+                    timestamp=540.5,
+                    path=str(kf_dir / "00540500.jpg"),
+                    caption="update_plan 参数表",
+                    ocr_text="explanation, plan",
+                    visual_type="slide_text",
+                    importance_score=0.85,
+                ),
+                FrameDescription(
+                    timestamp=771.033,
+                    path=str(kf_dir / "00771033.jpg"),
+                    caption="结尾对比表",
+                    ocr_text="Plan Mode vs update_plan",
+                    visual_type="diagram",
+                    importance_score=0.92,
+                ),
+            ],
+        )
+
+    def test_visual_evidence_ts_uses_cache_truth_not_llm_ts(self):
+        """LLM hallucinates ``ts=12`` for a frame at 771.033s; cache wins."""
+        ctx = self._ctx()
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD"
+        data = {
+            "chapters": [
+                {"title": "ch1", "start": 0, "end": 200, "points": [], "frames": []},
+                {"title": "ch2", "start": 200, "end": 800, "points": [], "frames": []},
+            ],
+            # The LLM "wrote" ts=12 for what is really a 771.033s frame.
+            "visual_evidence": [
+                {"ts": 12, "path": str(kf_dir / "00771033.jpg"), "selected": True},
+                {"ts": 0, "path": str(kf_dir / "00120133.jpg"), "selected": True},
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        ts_by_path = {v["path"]: v["ts"] for v in data["visual_evidence"]}
+        assert ts_by_path[str(kf_dir / "00771033.jpg")] == 771.033
+        assert ts_by_path[str(kf_dir / "00120133.jpg")] == 120.133
+
+    def test_attach_visuals_distributes_to_empty_chapters(self):
+        """ch1 gets a LLM frame, ch2 is empty: ch2 must still receive frames."""
+        ctx = self._ctx()
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD"
+        data = {
+            "chapters": [
+                {
+                    "title": "ch1",
+                    "start": 0,
+                    "end": 200,
+                    "points": [],
+                    # LLM only attached one frame, to ch1.
+                    "frames": [
+                        {
+                            "path": str(kf_dir / "00120133.jpg"),
+                            "caption": "explicit",
+                        }
+                    ],
+                },
+                # ch2 is empty -- the bug used to leave it empty forever.
+                {"title": "ch2", "start": 500, "end": 800, "points": [], "frames": []},
+            ],
+            "visual_evidence": [
+                {
+                    "ts": 0,
+                    "path": str(kf_dir / "00540500.jpg"),
+                    "selected": True,
+                    "importance_score": 0.85,
+                },
+                {
+                    "ts": 0,
+                    "path": str(kf_dir / "00771033.jpg"),
+                    "selected": True,
+                    "importance_score": 0.92,
+                },
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        ch1_frames = data["chapters"][0]["frames"]
+        ch2_frames = data["chapters"][1]["frames"]
+        # ch1's LLM-attached frame is preserved (1 entry, original path).
+        assert len(ch1_frames) == 1
+        assert ch1_frames[0]["path"].endswith("00120133.jpg")
+        # ch2 must now contain at least one auto-distributed frame in its range.
+        assert ch2_frames, "empty chapter should have been auto-populated"
+        for fr in ch2_frames:
+            assert 500 <= fr["ts"] <= 800
+
+    def test_chapter_frame_ts_overridden_from_cache(self):
+        """LLM gives a chapter frame ``ts=2`` for a real 120.133s frame."""
+        ctx = self._ctx()
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD"
+        data = {
+            "chapters": [
+                {
+                    "title": "ch1",
+                    "start": 100,
+                    "end": 200,
+                    "points": [],
+                    "frames": [
+                        {"ts": 2, "path": str(kf_dir / "00120133.jpg"), "caption": "frame"}
+                    ],
+                }
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        frame = data["chapters"][0]["frames"][0]
+        assert frame["ts"] == 120.133, "cache ts must override LLM-provided ts"
+
+    def test_point_ts_zero_in_nonzero_chapter_recovers(self):
+        """Point with ``ts=0`` in chapter [120, 240] should snap to a real subtitle."""
+        ctx = self._ctx()
+        data = {
+            "chapters": [
+                {
+                    "title": "Plan Mode",
+                    "start": 120,
+                    "end": 240,
+                    "points": [
+                        {
+                            "text": "Plan Mode 是协作模式",
+                            "ts": 0,
+                            "quote": "Plan Mode 是一种强制的协作模式",
+                        }
+                    ],
+                }
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        pt = data["chapters"][0]["points"][0]
+        assert 120 <= pt["ts"] <= 240, f"ts={pt['ts']} fell outside chapter range"
+        # The subtitle at 180s carries the canonical phrase, so we should land there.
+        assert pt["ts"] == 180
+
+    def test_chapter_range_stretched_to_duration(self):
+        """LLM stops at ts=600 for an 800s video; last chapter is stretched out."""
+        ctx = self._ctx(duration=800)
+        data = {
+            "chapters": [
+                {"title": "ch1", "start": 0, "end": 200, "points": []},
+                {"title": "ch2", "start": 200, "end": 400, "points": []},
+                {"title": "ch3", "start": 400, "end": 600, "points": []},
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        last = data["chapters"][-1]
+        # Coverage was 600/800 = 75% (< 90%), so the last chapter stretches to duration.
+        assert last["end"] == 800, f"last chapter end={last['end']}, expected 800"
+
+    def test_point_ts_match_outside_chapter_falls_back_to_midpoint(self):
+        """When the only matching subtitle is in a different chapter, prefer the
+        chapter's own midpoint over an out-of-range jump."""
+        ctx = self._ctx()
+        # Subtitles place "update_plan" at 540s but we file the point under
+        # ch2 [120, 240]. The LLM mis-classified the chapter; we must keep
+        # the user inside the declared chapter rather than jumping to ch3.
+        data = {
+            "chapters": [
+                {
+                    "title": "Plan Mode",
+                    "start": 120,
+                    "end": 240,
+                    "points": [
+                        {
+                            "text": "update_plan 工具",
+                            "ts": 0,
+                            "quote": "update_plan 通过提交完整快照实现 replan",
+                        }
+                    ],
+                }
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        pt = data["chapters"][0]["points"][0]
+        assert 120 <= pt["ts"] <= 240, (
+            f"ts={pt['ts']} jumped outside chapter; should fall back to midpoint"
+        )
+        # The fallback is the chapter midpoint: (120 + 240) / 2 = 180.
+        assert pt["ts"] == 180
+
+
+# ---------------- v2: Reviser preservation safety net (P3b) ----------------
+
+
+class TestReviserPreservation:
+    """The Reviser system prompt forbids dropping high-value arrays, but
+    deepseek-flash occasionally regresses anyway. The post-validation
+    safety net :func:`_restore_dropped_content` backfills lost items
+    from the previous IR so the user never sees a worse lecture after
+    a critic round.
+    """
+
+    def _ir_with_code(self, *, code_blocks: list[dict] | None = None) -> LectureIR:
+        from app.understand.ir import IRCodeBlock
+
+        ir = _sample_ir()
+        if code_blocks is None:
+            code_blocks = [
+                {
+                    "language": "python",
+                    "code": "def foo():\n    return 1",
+                    "ts": 50,
+                    "chapter_index": 1,
+                    "source": "ocr",
+                    "explanation": "demo",
+                    "related_frame_paths": [],
+                },
+                {
+                    "language": "python",
+                    "code": "x = 2\nprint(x)",
+                    "ts": 60,
+                    "chapter_index": 1,
+                    "source": "ocr",
+                    "explanation": "demo2",
+                    "related_frame_paths": [],
+                },
+            ]
+        typed_blocks = [IRCodeBlock.model_validate(b) for b in code_blocks]
+        chapters = list(ir.chapters)
+        chapters[0] = chapters[0].model_copy(update={"code_blocks": typed_blocks})
+        return ir.model_copy(update={"chapters": chapters})
+
+    def test_restore_chapter_code_blocks_when_reviser_drops_them(self):
+        from app.understand.ir_builder import _restore_dropped_content
+
+        prev = self._ir_with_code()
+        # Reviser returned the same IR but with chapter 1's code_blocks
+        # silently emptied (a real failure mode observed in production).
+        revised_chapters = list(prev.chapters)
+        revised_chapters[0] = revised_chapters[0].model_copy(update={"code_blocks": []})
+        revised = prev.model_copy(update={"chapters": revised_chapters})
+
+        merged = _restore_dropped_content(prev, revised)
+        assert len(merged.chapters[0].code_blocks) == 2
+        # Verbatim restore: codes are byte-for-byte identical to prev.
+        assert {b.code for b in merged.chapters[0].code_blocks} == {
+            "def foo():\n    return 1",
+            "x = 2\nprint(x)",
+        }
+
+    def test_restore_top_level_knowledge_units_when_reviser_drops_them(self):
+        from app.understand.ir_builder import _restore_dropped_content
+
+        prev = _sample_ir()
+        # Force prev to have at least one knowledge unit if _sample_ir's
+        # default produced none -- robust to factory changes.
+        if not prev.knowledge_units:
+            from app.understand.schema import KnowledgeUnit
+
+            prev = prev.model_copy(
+                update={
+                    "knowledge_units": [
+                        KnowledgeUnit(
+                            id="ku-1",
+                            type="concept",
+                            title="测试",
+                            explanation="x",
+                            ts=10,
+                            chapter_index=1,
+                        )
+                    ]
+                }
+            )
+        revised = prev.model_copy(update={"knowledge_units": []})
+        merged = _restore_dropped_content(prev, revised)
+        assert len(merged.knowledge_units) == len(prev.knowledge_units)
+
+    def test_restore_does_not_inflate_when_reviser_legitimately_grows(self):
+        """If the reviser added entries, do not "restore" old (smaller) state."""
+        from app.understand.ir_builder import _restore_dropped_content
+
+        prev = self._ir_with_code(code_blocks=[
+            {
+                "language": "python",
+                "code": "first()",
+                "ts": 50,
+                "chapter_index": 1,
+                "source": "ocr",
+                "explanation": "demo",
+                "related_frame_paths": [],
+            }
+        ])
+        # Reviser ADDED one block as instructed by the critic.
+        revised_chapters = list(prev.chapters)
+        new_blocks = list(revised_chapters[0].code_blocks) + [
+            revised_chapters[0].code_blocks[0].model_copy(update={"code": "second()"})
+        ]
+        revised_chapters[0] = revised_chapters[0].model_copy(update={"code_blocks": new_blocks})
+        revised = prev.model_copy(update={"chapters": revised_chapters})
+
+        merged = _restore_dropped_content(prev, revised)
+        # The growth is preserved; we did NOT downgrade to prev's single block.
+        assert len(merged.chapters[0].code_blocks) == 2

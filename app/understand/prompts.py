@@ -145,6 +145,13 @@ LECTURE_REVISER_SYSTEM = """\
 3. 不允许凭空补充内容；新增的字段必须基于字幕或帧证据，并填好 quote / related_frame_paths。
 4. 如果某条 issue 实在无证据可补，可以保留原样并不修改。
 5. JSON 必须严格合法，可以被 json.loads 解析。
+6. **逐字保留**以下高价值数组中所有未被 issues 明确点名的条目：
+   - `chapters[*].code_blocks` 与 `chapters[*].formula_blocks`（代码与公式块在原 JSON 里出现过几条，
+     就必须出现几条，不能因为"修订其他字段"顺手删掉）
+   - `chapters[*].process_steps`、`chapters[*].pitfalls`、`chapters[*].key_takeaways`
+   - 顶层 `knowledge_units`、`visual_evidence`、`study_questions`、`review_questions`、`glossary`、
+     `timeline.argument_path`
+   只能在某 issue 明确要求"删除/合并/重写某条"时才动这些数组的现有条目。
 """
 
 LECTURE_REVISER_USER_TEMPLATE = """\

@@ -314,10 +314,15 @@ class LectureIRBuilder:
                 break
             try:
                 hydrate_lecture_ir_data(revised, ctx)
-                latest_ir = LectureIR.model_validate(revised)
+                revised_ir = LectureIR.model_validate(revised)
             except (ValidationError, RuntimeError, ValueError) as exc:
                 logger.warning("Reviser produced invalid IR; keeping previous: %s", exc)
                 break
+            # Safety net: deepseek-flash sometimes silently drops high-value
+            # arrays (code_blocks, formula_blocks, knowledge_units, …) when
+            # revising unrelated fields. The Reviser system prompt forbids
+            # this, but enforcing it post-hoc guarantees no regression.
+            latest_ir = _restore_dropped_content(latest_ir, revised_ir)
             rounds += 1
         timing = {"critic_sec": critic_sec, "reviser_sec": reviser_sec}
         return (
@@ -378,6 +383,87 @@ def _critique_to_dict(c: CritiqueResult) -> dict[str, Any]:
             for i in c.issues
         ],
     }
+
+
+# Top-level arrays that the Reviser must never silently shrink. If a round
+# of revision removes items from these, we treat it as a model slip and
+# restore the previous version. ``points`` and chapter ``frames`` are
+# intentionally excluded because the Critic legitimately asks the Reviser
+# to refine, merge or split those.
+_RESTORE_TOP_LEVEL_ARRAYS = (
+    "knowledge_units",
+    "visual_evidence",
+    "study_questions",
+    "review_questions",
+    "glossary",
+)
+_RESTORE_CHAPTER_ARRAYS = (
+    "code_blocks",
+    "formula_blocks",
+    "process_steps",
+    "pitfalls",
+    "key_takeaways",
+)
+
+
+def _restore_dropped_content(prev_ir: LectureIR, revised_ir: LectureIR) -> LectureIR:
+    """Backfill arrays the Reviser dropped, returning a merged ``LectureIR``.
+
+    For each protected array the previous IR is the safety baseline. If the
+    revised IR has *fewer* items than the previous one we conclude the
+    Reviser silently dropped content (the system prompt forbids this) and
+    restore the previous list verbatim. The revised IR keeps every other
+    field, so legitimate modifications still flow through.
+    """
+    revised_data = revised_ir.model_dump(mode="json")
+    prev_data = prev_ir.model_dump(mode="json")
+
+    # Top-level arrays.
+    for field in _RESTORE_TOP_LEVEL_ARRAYS:
+        prev_arr = prev_data.get(field) or []
+        rev_arr = revised_data.get(field) or []
+        if len(prev_arr) > len(rev_arr):
+            logger.warning(
+                "Reviser dropped %d %s items (had %d, kept %d); restoring from previous IR",
+                len(prev_arr) - len(rev_arr),
+                field,
+                len(prev_arr),
+                len(rev_arr),
+            )
+            revised_data[field] = prev_arr
+
+    # Chapter-level arrays, matched by chapter index when possible.
+    prev_chapters = prev_data.get("chapters") or []
+    rev_chapters = revised_data.get("chapters") or []
+    prev_by_idx = {ch.get("index"): ch for ch in prev_chapters if isinstance(ch, dict)}
+    for ch in rev_chapters:
+        if not isinstance(ch, dict):
+            continue
+        prev_ch = prev_by_idx.get(ch.get("index"))
+        if not prev_ch:
+            continue
+        for field in _RESTORE_CHAPTER_ARRAYS:
+            prev_arr = prev_ch.get(field) or []
+            rev_arr = ch.get(field) or []
+            if len(prev_arr) > len(rev_arr):
+                logger.warning(
+                    "Reviser dropped %d ch%s.%s items (had %d, kept %d); restoring",
+                    len(prev_arr) - len(rev_arr),
+                    ch.get("index"),
+                    field,
+                    len(prev_arr),
+                    len(rev_arr),
+                )
+                ch[field] = prev_arr
+
+    try:
+        return LectureIR.model_validate(revised_data)
+    except ValidationError as exc:
+        logger.warning(
+            "Restored IR failed schema validation (%s); keeping the revised IR",
+            exc,
+        )
+        return revised_ir
 
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import get_settings
@@ -243,6 +243,7 @@ class CriticReviserAgent:
         )
         self._model = s.qwen_text_model
         self._timeout = s.dashscope_request_timeout
+        self._critic_timeout = s.lecture_critic_timeout
         self._reviser_timeout = s.lecture_reviser_timeout
         self._strict = bool(s.lecture_strict_agents)
         self._enable_thinking = s.qwen_text_enable_thinking
@@ -259,8 +260,8 @@ class CriticReviserAgent:
             subtitle_block=_format_segments(ctx.segments) or "(无)",
             frames_block=_format_frames(ctx.frame_descs) or "(无)",
         )
-        try:
-            resp = await self._client.chat.completions.create(
+        async def _do_call() -> Any:
+            return await self._client.chat.completions.create(
                 model=self._model,
                 messages=[
                     {"role": "system", "content": LECTURE_CRITIC_SYSTEM},
@@ -268,9 +269,24 @@ class CriticReviserAgent:
                 ],
                 temperature=0.1,
                 response_format={"type": "json_object"},
-                timeout=self._timeout,
+                timeout=self._critic_timeout,
                 extra_body={"enable_thinking": self._enable_thinking},
             )
+
+        try:
+            resp = await _do_call()
+        except APITimeoutError as exc:
+            # The Critic request is the heaviest in the pipeline (full draft
+            # IR + subtitle + frames). Dashscope occasionally hangs on a
+            # large prompt; one retry resolves the bulk of these in practice.
+            logger.warning("Critic LLM call timed out (%s); retrying once", exc)
+            try:
+                resp = await _do_call()
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("Critic LLM retry also failed: %s", exc2)
+                if self._strict:
+                    raise
+                return CritiqueResult(verdict="ok", summary="(critic skipped)", issues=[], usage={})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Critic LLM call failed: %s", exc)
             if self._strict:

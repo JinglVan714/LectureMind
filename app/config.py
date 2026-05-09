@@ -84,6 +84,16 @@ class Settings(BaseSettings):
         ge=0,
         le=3,
     )
+    lecture_critic_timeout: float = Field(
+        default=300.0,
+        alias="LECTURE_CRITIC_TIMEOUT",
+        description=(
+            "Timeout for the Critic LLM call. The full subtitle + frames + "
+            "draft IR can be large for long videos, so this defaults to a "
+            "generous 5 minutes (vs the global 180s default). Override "
+            "with LECTURE_CRITIC_TIMEOUT."
+        ),
+    )
     lecture_reviser_timeout: float = Field(default=600.0, alias="LECTURE_REVISER_TIMEOUT")
     lecture_strict_agents: bool = Field(default=False, alias="LECTURE_STRICT_AGENTS")
     lecture_code_highlighter: str = Field(

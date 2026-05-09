@@ -210,7 +210,7 @@ def hydrate_lecture_ir_data(data: dict[str, Any], ctx: Any) -> None:
     data["mainline"] = _normalise_string_list(data.get("mainline")) or _fallback_mainline(data["chapters"])
     data["visual_evidence"] = _normalise_visuals(data.get("visual_evidence"), ctx)
     _attach_visuals_to_chapters(data["chapters"], data["visual_evidence"])
-    data["knowledge_units"] = _normalise_units(data.get("knowledge_units"), data["chapters"], data["profile"])
+    data["knowledge_units"] = _normalise_units(data.get("knowledge_units"), data["chapters"], data["profile"], ctx)
     data["timeline"] = _hydrate_timeline(data.get("timeline"), data["chapters"], data["mainline"])
     data["completeness"] = _hydrate_completeness(data.get("completeness"), data)
     data["render_plan"] = _hydrate_render_plan(data.get("render_plan"), data["profile"])
@@ -339,7 +339,9 @@ def _normalise_visuals(raw: Any, ctx: Any) -> list[dict[str, Any]]:
         selected = bool(item.get("selected", score >= 0.55 and visual_type != "person"))
         reason = str(item.get("selected_reason") or item.get("why_useful") or getattr(fd, "why_useful", "") or "这张图补充了字幕中难以完整表达的结构信息。").strip()
         visuals.append({
-            "ts": _coerce_float(item.get("ts") or item.get("timestamp") or getattr(fd, "timestamp", 0.0), 0.0),
+            # Trust the path-joined VLM cache timestamp; LLM is unreliable for ts
+            # (commonly extracts only the minute part from "[MM:SS]" prompt formatting).
+            "ts": _coerce_float(getattr(fd, "timestamp", 0.0), 0.0),
             "path": path,
             "caption": caption,
             "ocr_text": ocr,
@@ -357,10 +359,14 @@ def _normalise_visuals(raw: Any, ctx: Any) -> list[dict[str, Any]]:
 
 
 def _attach_visuals_to_chapters(chapters: list[dict[str, Any]], visuals: list[dict[str, Any]]) -> None:
-    if any(ch.get("frames") for ch in chapters):
-        return
     selected = [v for v in visuals if v.get("selected") and v.get("path")]
     for ch in chapters:
+        # Respect frames the LLM already attached to THIS chapter, but still
+        # auto-distribute for chapters that came back empty. The previous early
+        # `return` left every empty chapter without visual support whenever any
+        # other chapter had even one LLM-attached frame.
+        if ch.get("frames"):
+            continue
         start = _coerce_float(ch.get("start"), 0.0)
         end = _coerce_float(ch.get("end"), start)
         ch_seconds = max(0.0, end - start)
@@ -381,7 +387,7 @@ def _attach_visuals_to_chapters(chapters: list[dict[str, Any]], visuals: list[di
         ]
 
 
-def _normalise_units(raw: Any, chapters: list[dict[str, Any]], profile: dict[str, Any]) -> list[dict[str, Any]]:
+def _normalise_units(raw: Any, chapters: list[dict[str, Any]], profile: dict[str, Any], ctx: Any | None = None) -> list[dict[str, Any]]:
     units = [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
     if not units:
         for ch in chapters:
@@ -396,18 +402,23 @@ def _normalise_units(raw: Any, chapters: list[dict[str, Any]], profile: dict[str
                     "chapter_index": ch.get("index", 1),
                     "domain_tags": profile.get("domain_tags", []),
                 })
+    chapters_by_index = {int(ch.get("index") or 0): ch for ch in chapters}
+    fallback_chapter = chapters[0] if chapters else {"start": 0.0, "end": 0.0, "title": "", "index": 1}
     out: list[dict[str, Any]] = []
     allowed = KnowledgeType.__args__
     for idx, unit in enumerate(units, start=1):
         kind = str(unit.get("type") or "concept")
+        ch_idx = _coerce_int(unit.get("chapter_index"), 1)
+        owning_chapter = chapters_by_index.get(int(ch_idx) or 0, fallback_chapter)
+        ts_value = _locate_anchor_ts(unit, owning_chapter, ctx) if ctx is not None else _coerce_float(unit.get("ts") or unit.get("timestamp"), 0.0)
         out.append({
             "id": str(unit.get("id") or f"ku-{idx}"),
             "type": kind if kind in allowed else "concept",
             "title": str(unit.get("title") or unit.get("term") or f"知识点 {idx}").strip(),
             "explanation": str(unit.get("explanation") or unit.get("summary") or "").strip(),
-            "ts": _coerce_float(unit.get("ts") or unit.get("timestamp"), 0.0),
+            "ts": ts_value,
             "quote": str(unit.get("quote") or unit.get("evidence") or "").strip(),
-            "chapter_index": _coerce_int(unit.get("chapter_index"), 1),
+            "chapter_index": ch_idx,
             "related_frames": _normalise_string_list(unit.get("related_frames")),
             "prerequisites": _normalise_string_list(unit.get("prerequisites")),
             "depends_on": _normalise_string_list(unit.get("depends_on")),
@@ -420,7 +431,7 @@ def _normalise_points(raw: Any, chapter: dict[str, Any], ctx: Any) -> list[dict[
     points = [x if isinstance(x, dict) else {"text": str(x)} for x in raw] if isinstance(raw, list) else []
     out: list[dict[str, Any]] = []
     for p in points:
-        ts = _clamp(_coerce_float(_first_present(p, ["ts", "timestamp", "time"]), chapter.get("start") or 0.0), 0.0, float(getattr(ctx, "duration", 0) or 0))
+        ts = _locate_anchor_ts(p, chapter, ctx)
         quote = str(p.get("quote") or p.get("evidence") or _nearest_quote(getattr(ctx, "segments", []), ts)).strip()
         text = str(p.get("text") or p.get("point") or p.get("claim") or quote or chapter.get("title") or "").strip()
         if text:
@@ -430,6 +441,64 @@ def _normalise_points(raw: Any, chapter: dict[str, Any], ctx: Any) -> list[dict[
     ts = _coerce_float(chapter.get("start"), 0.0)
     quote = _nearest_quote(getattr(ctx, "segments", []), ts)
     return [{"text": quote or chapter.get("title", ""), "ts": ts, "quote": quote or chapter.get("title", "")}]
+
+
+def _locate_anchor_ts(item: dict[str, Any], chapter: dict[str, Any], ctx: Any) -> float:
+    """Pick a plausible anchor ts for a point/knowledge-unit.
+
+    The LLM frequently writes ``ts=0`` even when the chapter starts deep into
+    the video, or echoes back the minute portion of ``[MM:SS]`` prompt
+    formatting. We trust an LLM ts only when it lands inside the chapter
+    range; otherwise we look up the matching subtitle by quote/text and fall
+    back to the chapter midpoint.
+    """
+    duration = float(getattr(ctx, "duration", 0) or 0)
+    ch_start = _coerce_float(chapter.get("start"), 0.0) or 0.0
+    ch_end = _coerce_float(chapter.get("end"), ch_start) or ch_start
+    raw_ts = _first_present(item, ["ts", "timestamp", "time"])
+    ts = _coerce_float(raw_ts, None)
+    plausible = (
+        ts is not None
+        and ch_start - 5 <= ts <= ch_end + 5
+        and not (ts == 0.0 and ch_start > 5.0)
+    )
+    if plausible:
+        return _clamp(float(ts), 0.0, duration)
+    needle = str(item.get("quote") or item.get("text") or item.get("title") or "").strip()
+    found = _find_subtitle_ts(getattr(ctx, "segments", []), needle, ch_start, ch_end)
+    if found is not None:
+        return _clamp(found, 0.0, duration)
+    midpoint = (ch_start + ch_end) / 2 if ch_end > ch_start else ch_start
+    return _clamp(midpoint, 0.0, duration)
+
+
+def _find_subtitle_ts(
+    segments: list[Any], needle: str, ch_start: float, ch_end: float
+) -> float | None:
+    """Find a subtitle segment ts within ``[ch_start-5, ch_end+5]`` whose
+    text matches ``needle``.
+
+    Out-of-range matches are intentionally rejected: when the LLM mis-files
+    a point under the wrong chapter, jumping the user to a video moment in
+    a *different* chapter is more confusing than landing inside the
+    declared chapter (caller falls back to the chapter midpoint). Returns
+    ``None`` when no in-range fragment of the needle is found.
+    """
+    if not needle or not segments:
+        return None
+    head = needle[:24].strip()
+    if not head:
+        return None
+    for s in segments:
+        s_start = float(getattr(s, "start", 0) or 0)
+        if not (ch_start - 5 <= s_start <= ch_end + 5):
+            continue
+        text = str(getattr(s, "text", "") or "")
+        if not text:
+            continue
+        if head in text or text[:24] in needle:
+            return s_start
+    return None
 
 
 _FENCED_CODE_RE = re.compile(r"```([A-Za-z0-9_+\-.#]*)?[ \t]*\n(.*?)```", re.DOTALL)
@@ -562,17 +631,29 @@ def _sanitize_language(language: str) -> str:
 def _normalise_chapter_frames(raw: Any, ctx: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
+    # Map keyframe path -> authoritative ts (from VLM cache via ctx.frame_descs).
+    cache_ts: dict[str, float] = {}
+    for fd in getattr(ctx, "frame_descs", []) or []:
+        p = str(getattr(fd, "path", ""))
+        if p:
+            cache_ts[p] = float(getattr(fd, "timestamp", 0.0) or 0.0)
     frames: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
-        ts = _coerce_float(_first_present(item, ["ts", "timestamp", "time"]), 0.0)
+        path = str(item.get("path") or item.get("image_path") or "")
+        # Path-joined cache ts is the source of truth; only fall back to the
+        # LLM-supplied ts if the path is unknown to the cache.
+        if path in cache_ts:
+            ts = cache_ts[path]
+        else:
+            ts = _coerce_float(_first_present(item, ["ts", "timestamp", "time"]), 0.0)
         caption = str(item.get("caption") or item.get("description") or "").strip()
         ocr = str(item.get("ocr_text") or item.get("ocr") or "").strip()
         visual_type = str(item.get("visual_type") or infer_visual_type(caption, ocr))
         frames.append({
             "ts": _clamp(ts, 0.0, float(getattr(ctx, "duration", 0) or 0)),
-            "path": str(item.get("path") or item.get("image_path") or ""),
+            "path": path,
             "caption": caption,
             "ocr_text": ocr,
             "insight": str(item.get("insight") or item.get("selected_reason") or "").strip(),
@@ -645,6 +726,14 @@ def _fill_chapter_ranges(chapters: list[dict[str, Any]], duration: int) -> None:
             next_start = chapters[idx + 1]["start"] if idx + 1 < len(chapters) else None
             ch["end"] = next_start if next_start and next_start > ch["start"] else duration * (idx + 1) / n
         ch["end"] = _clamp(_coerce_float(ch.get("end"), ch["start"]), ch["start"], float(duration))
+    # LLMs sometimes truncate chapter coverage to round numbers (e.g. 600s
+    # for an 889s video). If the last chapter falls more than ~10% short,
+    # stretch it to the full duration so trailing content stays attributable.
+    if chapters and duration > 0:
+        last = chapters[-1]
+        last_end = _coerce_float(last.get("end"), 0.0) or 0.0
+        if last_end < float(duration) * 0.9:
+            last["end"] = float(duration)
 
 
 def _nearest_quote(segments: list[Any], ts: float) -> str:
