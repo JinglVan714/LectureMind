@@ -317,6 +317,7 @@ def _normalise_chapters(raw: Any, ctx: Any) -> list[dict[str, Any]]:
         ch["points"] = ch["points"][: points_per_chapter_max(ch_seconds)]
         out.append(ch)
     _fill_chapter_ranges(out, duration)
+    _repair_point_timestamps(out, ctx, duration)
     return out
 
 
@@ -470,6 +471,23 @@ def _locate_anchor_ts(item: dict[str, Any], chapter: dict[str, Any], ctx: Any) -
         return _clamp(found, 0.0, duration)
     midpoint = (ch_start + ch_end) / 2 if ch_end > ch_start else ch_start
     return _clamp(midpoint, 0.0, duration)
+
+
+def _repair_point_timestamps(chapters: list[dict[str, Any]], ctx: Any, duration: int) -> None:
+    for chapter in chapters:
+        ch_start = _coerce_float(chapter.get("start"), 0.0) or 0.0
+        ch_end = _coerce_float(chapter.get("end"), ch_start) or ch_start
+        if ch_end < ch_start:
+            ch_end = ch_start
+        for point in chapter.get("points", []):
+            if not isinstance(point, dict):
+                continue
+            ts = _coerce_float(point.get("ts"), ch_start)
+            if ch_start <= ts <= ch_end:
+                point["ts"] = round(_clamp(ts, 0.0, float(duration or 0)), 3)
+                continue
+            repaired = _locate_anchor_ts(point, chapter, ctx)
+            point["ts"] = round(_clamp(repaired, ch_start, ch_end), 3)
 
 
 def _find_subtitle_ts(

@@ -272,6 +272,7 @@ def _hydrate_lecture_data(data: dict[str, Any], ctx: LecturizeContext) -> None:
         normalised.append(chapter)
 
     _fill_chapter_ranges(normalised, ctx.duration)
+    _repair_point_timestamps(normalised, ctx)
     data["chapters"] = normalised
     data["learning_path"] = (
         _normalise_string_list(data.get("learning_path"))
@@ -451,6 +452,43 @@ def _fill_chapter_ranges(chapters: list[dict[str, Any]], duration: int) -> None:
             chapter["start"],
             float(duration),
         )
+
+
+def _repair_point_timestamps(chapters: list[dict[str, Any]], ctx: LecturizeContext) -> None:
+    duration = float(ctx.duration or 0)
+    for chapter in chapters:
+        ch_start = _coerce_float(chapter.get("start"), 0.0)
+        ch_end = _coerce_float(chapter.get("end"), ch_start)
+        if ch_end < ch_start:
+            ch_end = ch_start
+        for point in chapter.get("points", []):
+            if not isinstance(point, dict):
+                continue
+            ts = _coerce_float(point.get("ts"), ch_start)
+            if ch_start <= ts <= ch_end:
+                point["ts"] = round(_clamp(ts, 0.0, duration), 3)
+                continue
+            needle = str(point.get("quote") or point.get("text") or "").strip()
+            found = _find_subtitle_ts(ctx.segments, needle, ch_start, ch_end)
+            fallback = found if found is not None else ((ch_start + ch_end) / 2 if ch_end > ch_start else ch_start)
+            point["ts"] = round(_clamp(fallback, ch_start, ch_end), 3)
+
+
+def _find_subtitle_ts(
+    segments: list[SubtitleSegment], needle: str, ch_start: float, ch_end: float
+) -> float | None:
+    if not needle or not segments:
+        return None
+    head = needle[:24].strip()
+    if not head:
+        return None
+    for segment in segments:
+        if not (ch_start - 5 <= segment.start <= ch_end + 5):
+            continue
+        text = segment.text or ""
+        if head in text or text[:24] in needle:
+            return float(segment.start)
+    return None
 
 
 def _chapter_timestamps(chapter: dict[str, Any]) -> list[float]:

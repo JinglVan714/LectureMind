@@ -975,6 +975,52 @@ class TestTsIntegrity:
         # The fallback is the chapter midpoint: (120 + 240) / 2 = 180.
         assert pt["ts"] == 180
 
+    def test_point_ts_near_boundary_is_repaired_into_chapter(self):
+        ctx = self._ctx()
+        data = {
+            "chapters": [
+                {
+                    "title": "Plan Mode",
+                    "start": 120,
+                    "end": 240,
+                    "points": [
+                        {
+                            "text": "边界漂移",
+                            "ts": 116.5,
+                            "quote": "开篇问题",
+                        }
+                    ],
+                }
+            ],
+        }
+        hydrate_lecture_ir_data(data, ctx)
+        pt = data["chapters"][0]["points"][0]
+        assert pt["ts"] == 120
+
+    def test_v1_point_ts_near_boundary_is_repaired_into_chapter(self):
+        from app.understand.lecturize import _hydrate_lecture_data
+
+        ctx = self._ctx()
+        data = {
+            "chapters": [
+                {
+                    "title": "Plan Mode",
+                    "start": 120,
+                    "end": 240,
+                    "points": [
+                        {
+                            "text": "边界漂移",
+                            "ts": 244.5,
+                            "quote": "收尾",
+                        }
+                    ],
+                }
+            ],
+        }
+        _hydrate_lecture_data(data, ctx)
+        pt = data["chapters"][0]["points"][0]
+        assert pt["ts"] == 180
+
 
 # ---------------- v2: Reviser preservation safety net (P3b) ----------------
 
