@@ -213,6 +213,24 @@ def test_all_junk_still_keeps_floor(tmp_path: Path) -> None:
     assert high_count == 2  # ceil(4 * 0.5)
 
 
+def test_all_junk_invariant_junk_subset_of_low(tmp_path: Path) -> None:
+    """Spec §组件1 invariant: junk_filtered ⊆ low_tier.
+
+    Frames promoted to HIGH by the all-junk floor fallback must have
+    ``is_junk=False`` so downstream telemetry (FrameDescriber)
+    cannot report ``junk_filtered > low_tier``.
+    """
+    frames = [_black(tmp_path / f"b{i}.jpg") for i in range(6)]
+    result = KeyframeRanker().classify(frames)
+    junk_count = sum(1 for j in result.is_junk if j)
+    low_count = sum(1 for t in result.tiers if t == Tier.LOW)
+    assert junk_count <= low_count
+    # And every HIGH-tier frame must have is_junk=False.
+    for tier, junk in zip(result.tiers, result.is_junk):
+        if tier == Tier.HIGH:
+            assert junk is False
+
+
 def test_validation(tmp_path: Path) -> None:
     import pytest
 

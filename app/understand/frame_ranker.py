@@ -192,11 +192,15 @@ class KeyframeRanker:
             # Edge case: every frame flagged junk. Still respect the
             # floor — give the highest-scoring frames HIGH so we don't
             # silently emit a LectureIR with zero captioned frames.
+            # Frames promoted to HIGH lose their junk flag; that
+            # preserves the spec invariant ``junk_filtered ⊆ low_tier``
+            # which downstream telemetry relies on.
             scored = sorted(range(len(sigs)), key=lambda i: _score(sigs[i]), reverse=True)
             k = max(1, math.ceil(len(frames) * self._floor))
             high = set(scored[:k])
             tiers = [Tier.HIGH if i in high else Tier.LOW for i in range(len(frames))]
-            return RankResult(tiers=tiers, signals=sigs, is_junk=is_junk)
+            adjusted_junk = [j and (i not in high) for i, j in enumerate(is_junk)]
+            return RankResult(tiers=tiers, signals=sigs, is_junk=adjusted_junk)
 
         scores = {i: _score(sigs[i]) for i in survivors}
         # Floor is computed against the survivor set, per spec §2.1.
