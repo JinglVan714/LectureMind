@@ -18,11 +18,13 @@ class Settings(BaseSettings):
 
     # ---- Models (Qwen / DashScope) ----
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
-    # NOTE: alias kept as QWEN_TEXT_MODEL for backward compatibility, but the
-    # recommended default is deepseek-v4-flash on DashScope. It produces denser
-    # chapters / code blocks / learning paths at ~+6% latency vs qwen3.6-max
-    # (see handoff_mutiagent.md 2026-05-09 N=3 baseline).
-    qwen_text_model: str = Field(default="deepseek-v4-flash", alias="QWEN_TEXT_MODEL")
+    # NOTE: alias kept as QWEN_TEXT_MODEL for backward compatibility. The
+    # recommended default is deepseek-v4-pro on DashScope: it produces the
+    # most stable LectureIR (denser chapters / code blocks / learning paths)
+    # and is the only model we currently rely on for cross-duration
+    # validation. deepseek-v4-flash is acceptable as a fallback when pro
+    # quota is exhausted but tends to drop high-value arrays.
+    qwen_text_model: str = Field(default="deepseek-v4-pro", alias="QWEN_TEXT_MODEL")
     qwen_vl_model: str = Field(default="qwen3.6-plus", alias="QWEN_VL_MODEL")
     dashscope_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -76,7 +78,25 @@ class Settings(BaseSettings):
     lecture_critic_enabled: bool = Field(
         default=True,
         alias="LECTURE_CRITIC_ENABLED",
-        description="Run a Critic-Reviser pass after the initial IR build.",
+        description=(
+            "Run the Critic stage after the initial IR build. The Critic "
+            "audits coverage, missing code/formula and dubious quotes and "
+            "writes its findings into pipeline_stats.critique. It does NOT "
+            "rewrite the IR by itself — see lecture_reviser_enabled."
+        ),
+    )
+    lecture_reviser_enabled: bool = Field(
+        default=False,
+        alias="LECTURE_REVISER_ENABLED",
+        description=(
+            "When true, allow the Critic-Reviser loop to actually call the "
+            "Reviser to rewrite the IR based on critic issues. Defaults to "
+            "false because the full-IR rewrite is the slowest stage and is "
+            "the primary cause of long-video timeouts. With this off the "
+            "Critic still runs and its issues are recorded for later use; "
+            "turn it on for short / medium / code videos when latency is "
+            "acceptable in exchange for higher coverage."
+        ),
     )
     lecture_critic_max_rounds: int = Field(
         default=1,

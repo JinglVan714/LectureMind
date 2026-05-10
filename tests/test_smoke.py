@@ -1134,3 +1134,101 @@ class TestReviserPreservation:
         merged = _restore_dropped_content(prev, revised)
         # The growth is preserved; we did NOT downgrade to prev's single block.
         assert len(merged.chapters[0].code_blocks) == 2
+
+
+# ---------------- v2: Reviser gate (LECTURE_REVISER_ENABLED) ----------------
+
+
+class TestReviserGate:
+    """``LECTURE_REVISER_ENABLED=false`` keeps the Critic but never invokes
+    the Reviser. This is the recommended default because the full-IR
+    rewrite is the slowest stage and is the primary cause of long-video
+    timeouts. Short / medium / code videos can still opt in.
+    """
+
+    def _stub_critic(self, *, with_issues: bool):
+        from app.understand.agents import CritiqueIssue, CritiqueResult
+
+        if with_issues:
+            issues = [
+                CritiqueIssue(
+                    kind="missing_code",
+                    severity="medium",
+                    location="chapters[0]",
+                    evidence="代码片段未被抽取到 code_blocks",
+                    suggestion="补 code_blocks",
+                )
+            ]
+            verdict = "needs_revision"
+        else:
+            issues = []
+            verdict = "ok"
+        critique = CritiqueResult(verdict=verdict, summary="stub", issues=issues, usage={})
+        revise_calls = {"count": 0}
+
+        class _StubAgent:
+            async def critique(self, ctx, ir_json, study_questions):
+                return critique
+
+            async def revise(self, ctx, ir_json, issues_list):
+                revise_calls["count"] += 1
+                # Pretend reviser added nothing actionable so the loop
+                # exits cleanly even when reviser_enabled=True.
+                return None, {}
+
+        return _StubAgent(), revise_calls
+
+    def _builder_with_stub(self, agent):
+        from app.understand.ir_builder import LectureIRBuilder
+
+        builder = LectureIRBuilder()
+        builder._critic_agent = agent
+        return builder
+
+    def test_reviser_disabled_skips_revise_call(self):
+        import asyncio
+
+        agent, calls = self._stub_critic(with_issues=True)
+        builder = self._builder_with_stub(agent)
+        ir = _sample_ir()
+
+        async def _run():
+            return await builder._run_critic_loop(
+                ctx=None, ir=ir, study_questions=["q?"], reviser_enabled=False
+            )
+
+        critique, latest_ir, rounds, usages, timing = asyncio.run(_run())
+
+        assert calls["count"] == 0, "revise() must not be called when reviser_enabled=False"
+        assert rounds == 0
+        assert latest_ir is ir
+        assert timing["reviser_sec"] == 0.0
+        # Critic still ran exactly once and its verdict survived.
+        assert critique.verdict == "needs_revision"
+        assert len(critique.issues) == 1
+
+    def test_reviser_enabled_calls_revise(self):
+        import asyncio
+
+        agent, calls = self._stub_critic(with_issues=True)
+        builder = self._builder_with_stub(agent)
+        ir = _sample_ir()
+
+        async def _run():
+            return await builder._run_critic_loop(
+                ctx=None, ir=ir, study_questions=["q?"], reviser_enabled=True
+            )
+
+        asyncio.run(_run())
+        assert calls["count"] == 1, "revise() should be called when reviser_enabled=True"
+
+    def test_reviser_disabled_default_in_settings_schema(self):
+        """``LECTURE_REVISER_ENABLED`` field default must be False.
+
+        Tested at the model-field level (not by instantiating Settings)
+        so the assertion is independent of any local .env override.
+        """
+        from app.config import Settings
+
+        field = Settings.model_fields["lecture_reviser_enabled"]
+        assert field.default is False

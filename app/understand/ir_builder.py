@@ -109,6 +109,7 @@ class LectureIRBuilder:
         *,
         question_driven: bool | None = None,
         critic_enabled: bool | None = None,
+        reviser_enabled: bool | None = None,
     ) -> tuple[LectureIR, dict[str, Any]]:
         """Production path: question-driven extraction + critic-reviser loop.
 
@@ -118,15 +119,19 @@ class LectureIRBuilder:
         2. ``LectureIRBuilder`` (this class) — same single-pass call as
            :meth:`build` but with both the length budget and the study
            questions injected into the user message.
-        3. (optional) ``CriticReviserAgent`` — runs ≤ N rounds of
-           critique-and-revise; if any round leaves the schema invalid
-           we silently keep the previous valid IR.
+        3. (optional) ``CriticReviserAgent`` — runs the Critic to audit
+           coverage / missing code / dubious quotes, then optionally
+           runs the Reviser (gated by ``reviser_enabled``) for ≤ N
+           rounds of critique-and-revise. If any round leaves the
+           schema invalid we silently keep the previous valid IR.
         """
         s = self._settings
         if question_driven is None:
             question_driven = bool(getattr(s, "lecture_question_driven", True))
         if critic_enabled is None:
             critic_enabled = bool(getattr(s, "lecture_critic_enabled", True))
+        if reviser_enabled is None:
+            reviser_enabled = bool(getattr(s, "lecture_reviser_enabled", False))
 
         budget = LengthBudget.for_duration(
             ctx.duration,
@@ -177,7 +182,7 @@ class LectureIRBuilder:
         reviser_sec = 0.0
         if critic_enabled and questions:  # only run when we have a goal
             critique, ir, revise_rounds, critic_usage, critic_timing = await self._run_critic_loop(
-                ctx, ir, questions
+                ctx, ir, questions, reviser_enabled=reviser_enabled
             )
             for u in critic_usage:
                 _accumulate_usage(usage_aggregate, u)
@@ -284,7 +289,18 @@ class LectureIRBuilder:
         ctx: LecturizeContext,
         ir: LectureIR,
         study_questions: list[str],
+        *,
+        reviser_enabled: bool = True,
     ) -> tuple[CritiqueResult, LectureIR, int, list[dict[str, Any]], dict[str, float]]:
+        """Run the Critic and (optionally) the Reviser.
+
+        When ``reviser_enabled`` is False the Critic still runs once as a
+        quality audit (its issues end up in pipeline stats and the timing
+        report) but the Reviser is never invoked, so the IR is returned
+        unchanged. This is the recommended default for long videos where
+        full-IR rewrite frequently times out; short / medium / code
+        videos can opt in by setting ``LECTURE_REVISER_ENABLED=true``.
+        """
         if self._critic_agent is None:
             self._critic_agent = CriticReviserAgent()
         max_rounds = int(getattr(self._settings, "lecture_critic_max_rounds", 1) or 0)
@@ -302,7 +318,12 @@ class LectureIRBuilder:
             critic_sec += time.perf_counter() - t_c
             usages.append(critique.usage)
             latest_critique = critique
-            if critique.verdict != "needs_revision" or not critique.issues or rounds >= max_rounds:
+            if (
+                not reviser_enabled
+                or critique.verdict != "needs_revision"
+                or not critique.issues
+                or rounds >= max_rounds
+            ):
                 break
             t_r = time.perf_counter()
             revised, rev_usage = await self._critic_agent.revise(
