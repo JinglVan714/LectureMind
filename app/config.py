@@ -114,6 +114,21 @@ class Settings(BaseSettings):
             "with LECTURE_CRITIC_TIMEOUT."
         ),
     )
+    lecture_critic_max_prompt_chars: int = Field(
+        default=24000,
+        alias="LECTURE_CRITIC_MAX_PROMPT_CHARS",
+        ge=0,
+        description=(
+            "Soft cap on the total Critic user prompt size in characters. "
+            "When > 0 the Critic projects subtitles/frames against the IR "
+            "structure (chapter windows + point/code/formula/visual anchor "
+            "neighborhoods) and uniformly downsamples subtitles when the "
+            "total would still exceed this budget. Frames are capped to "
+            "16 (short/medium) or 24 (long) and prioritise high-value "
+            "visual types. Set to 0 to disable both projection and "
+            "trimming and recover the legacy full-prompt behaviour."
+        ),
+    )
     lecture_reviser_timeout: float = Field(default=600.0, alias="LECTURE_REVISER_TIMEOUT")
     lecture_strict_agents: bool = Field(default=False, alias="LECTURE_STRICT_AGENTS")
     lecture_code_highlighter: str = Field(

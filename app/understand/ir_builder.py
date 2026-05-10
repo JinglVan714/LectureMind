@@ -403,6 +403,11 @@ def _critique_to_dict(c: CritiqueResult) -> dict[str, Any]:
             }
             for i in c.issues
         ],
+        # Diagnostic counters from CriticReviserAgent.critique describing
+        # how aggressively the Critic prompt was pruned. Always a dict
+        # (possibly empty) so matrix readers don't need to special-case
+        # missing keys.
+        "metrics": dict(getattr(c, "metrics", {}) or {}),
     }
 
 

@@ -1232,3 +1232,232 @@ class TestReviserGate:
 
         field = Settings.model_fields["lecture_reviser_enabled"]
         assert field.default is False
+
+
+# ---------------- v2: Critic input projection (cost reduction) ----------------
+
+
+class TestCriticInputProjection:
+    """``CriticReviserAgent.critique`` projects subtitles/frames against
+    the IR draft so long videos don't blow up the Critic prompt. The
+    projection is purely deterministic so we can unit-test it without
+    spinning up an LLM call.
+    """
+
+    def _ctx_long(self):
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.vlm import FrameDescription
+
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1critic"
+        # 60 evenly spaced 30s subtitle lines covering a 30-min video.
+        segments = [
+            Seg(start=i * 30.0, end=i * 30.0 + 28.0, text=f"字幕段 {i}：示例文本。" * 4)
+            for i in range(60)
+        ]
+        # Mix of frame visual types so we can verify high-value bias.
+        frames = []
+        for i, vt in enumerate(
+            [
+                "code", "formula", "diagram",
+                "slide_text", "slide_text", "slide_text",
+                "table", "table",
+                "ui", "ui",
+                "person", "person", "person",
+                "other", "other", "other",
+                "other", "other", "other",
+                "slide_text",
+            ]
+        ):
+            frames.append(
+                FrameDescription(
+                    timestamp=float(i) * 90.0 + 5.0,
+                    path=kf_dir / f"{i:05d}.jpg",
+                    caption=f"frame-{i}",
+                    ocr_text="",
+                    visual_type=vt,
+                    importance_score=0.4 + (i % 5) * 0.1,
+                )
+            )
+        return LecturizeContext(
+            bv_id="BV1critic000",
+            url="https://www.bilibili.com/video/BV1critic000",
+            title="critic projection long video",
+            author="测试",
+            duration=1800,  # 30 min
+            cover_url="",
+            segments=segments,
+            frame_descs=frames,
+        )
+
+    def _ctx_short(self):
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.vlm import FrameDescription
+
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1short"
+        segments = [
+            Seg(start=i * 10.0, end=i * 10.0 + 9.5, text=f"短字幕 {i}")
+            for i in range(20)
+        ]
+        frames = [
+            FrameDescription(
+                timestamp=i * 30.0 + 5.0,
+                path=kf_dir / f"{i:05d}.jpg",
+                caption=f"frame-{i}",
+                ocr_text="",
+                visual_type="formula" if i % 3 == 0 else "other",
+                importance_score=0.5,
+            )
+            for i in range(7)
+        ]
+        return LecturizeContext(
+            bv_id="BV1short0000",
+            url="https://www.bilibili.com/video/BV1short0000",
+            title="critic projection short video",
+            author="测试",
+            duration=200,  # 3:20 min
+            cover_url="",
+            segments=segments,
+            frame_descs=frames,
+        )
+
+    def _ir_with_chapter_window(self, *, start: float, end: float, ts: float) -> dict:
+        return {
+            "chapters": [
+                {
+                    "start": start,
+                    "end": end,
+                    "points": [{"ts": ts, "quote": ""}],
+                    "code_blocks": [],
+                    "formula_blocks": [],
+                }
+            ],
+            "knowledge_units": [],
+            "visual_evidence": [],
+        }
+
+    # ---- segments ----
+
+    def test_critic_segments_keep_chapter_windows(self):
+        from app.understand.agents import _critic_segments
+
+        ctx = self._ctx_long()
+        # One chapter covering 0-300s only — anything past 300s + margin
+        # should be projected away.
+        ir = self._ir_with_chapter_window(start=0.0, end=300.0, ts=120.0)
+        kept = _critic_segments(ctx, ir, max_chars=0)
+        assert kept, "projection must not return empty when chapter window exists"
+        # First chapter window with 5% margin = ±15s, so segments up to
+        # ~315s end. With a point ts=120s we also get ±30s anchor (90-150).
+        # Anything that starts after 320s should be dropped.
+        max_start = max(s.start for s in kept)
+        assert max_start <= 320.0
+        # And the chapter-window segments are present.
+        assert any(0 <= s.start <= 30 for s in kept)
+        assert any(280 <= s.start <= 300 for s in kept)
+
+    def test_critic_segments_respect_max_chars(self):
+        from app.understand.agents import _critic_segments
+
+        ctx = self._ctx_long()
+        # Single huge chapter window that would keep all 60 segments.
+        ir = self._ir_with_chapter_window(start=0.0, end=1800.0, ts=900.0)
+        unbounded = _critic_segments(ctx, ir, max_chars=0)
+        assert len(unbounded) == 60
+        # Tight budget forces uniform downsampling.
+        capped = _critic_segments(ctx, ir, max_chars=400)
+        assert 1 <= len(capped) < len(unbounded)
+        # Result must remain time-sorted.
+        starts = [s.start for s in capped]
+        assert starts == sorted(starts)
+
+    def test_critic_segments_unchanged_for_short_video(self):
+        """Short videos already fit; projection should keep ~all lines."""
+        from app.understand.agents import _critic_segments
+
+        ctx = self._ctx_short()
+        ir = self._ir_with_chapter_window(start=0.0, end=200.0, ts=80.0)
+        kept = _critic_segments(ctx, ir, max_chars=24000)
+        # 20 segments / single chapter window + small budget overhead =
+        # everything stays.
+        assert len(kept) == len(ctx.segments)
+
+    # ---- frames ----
+
+    def test_critic_frames_prefer_high_importance_and_code_formula(self):
+        from app.understand.agents import _critic_frames
+
+        ctx = self._ctx_long()
+        # IR with only one anchor far from any specific frame; high-value
+        # visual types should still be included regardless.
+        ir = {
+            "chapters": [{"points": [{"ts": 600.0}]}],
+            "knowledge_units": [],
+            "visual_evidence": [],
+        }
+        kept = _critic_frames(ctx, ir)
+        kept_types = {f.visual_type for f in kept}
+        # Long video target = 24, but we only have 20 frames so all will
+        # be returned. Verify the high-value types are present.
+        assert "code" in kept_types
+        assert "formula" in kept_types
+        assert "diagram" in kept_types
+        # Result is time-sorted.
+        ts_list = [f.timestamp for f in kept]
+        assert ts_list == sorted(ts_list)
+
+    def test_critic_frames_short_video_caps_at_16(self):
+        """Short video cap is 16 even when more frames are available."""
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.vlm import FrameDescription
+        from app.understand.agents import _critic_frames
+
+        kf_dir = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1short16"
+        frames = [
+            FrameDescription(
+                timestamp=float(i) * 5.0,
+                path=kf_dir / f"{i:05d}.jpg",
+                caption=f"f{i}",
+                ocr_text="",
+                visual_type="other",
+                importance_score=0.5,
+            )
+            for i in range(30)
+        ]
+        ctx = LecturizeContext(
+            bv_id="BV1short1600",
+            url="x",
+            title="t",
+            author="a",
+            duration=200,
+            cover_url="",
+            segments=[Seg(start=0, end=1, text="x")],
+            frame_descs=frames,
+        )
+        ir = {"chapters": [{"start": 0, "end": 200}], "knowledge_units": [], "visual_evidence": []}
+        kept = _critic_frames(ctx, ir)
+        assert len(kept) == 16
+
+    # ---- metrics surfacing ----
+
+    def test_critique_to_dict_includes_metrics(self):
+        from app.understand.ir_builder import _critique_to_dict
+        from app.understand.agents import CritiqueResult
+
+        c = CritiqueResult(
+            verdict="ok",
+            summary="x",
+            issues=[],
+            usage={"total_tokens": 1},
+            metrics={"critic_prompt_chars": 1234, "critic_segments_kept": 5},
+        )
+        d = _critique_to_dict(c)
+        assert d["metrics"] == {"critic_prompt_chars": 1234, "critic_segments_kept": 5}
+
+    def test_critic_max_prompt_chars_default_is_24000(self):
+        from app.config import Settings
+
+        f = Settings.model_fields["lecture_critic_max_prompt_chars"]
+        assert f.default == 24000
