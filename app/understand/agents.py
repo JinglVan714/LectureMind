@@ -557,15 +557,18 @@ class CriticReviserAgent:
 
         max_chars = self._critic_max_prompt_chars
         if max_chars > 0:
-            # Reserve room for the IR JSON, study questions block and the
-            # template's own boilerplate before computing how much budget
-            # we can give the subtitle block. ``+800`` is a deliberately
-            # generous estimate of the LECTURE_CRITIC_USER_TEMPLATE
-            # header / labels.
-            overhead = len(ir_json_str) + len(sq_block) + 800
-            seg_budget = max(1000, max_chars - overhead)
+            # ``max_chars`` is a soft cap on the **subtitle excerpt**
+            # chars, not the total Critic prompt. The IR JSON is the
+            # artefact being audited and is irreducible; trying to
+            # subtract it from the budget collapses ``seg_budget`` to
+            # the floor for code-rich short/medium videos (whose IR
+            # easily exceeds 30k chars) and that in turn starves the
+            # Critic of the surrounding subtitle context it needs to
+            # validate quotes — empirically that produced a 5x latency
+            # regression and a flood of false ``dubious_quote`` issues
+            # in the BV1NM1tY3Eu5 (14 min code video) regression.
             crit_segments = _critic_segments(
-                ctx, ir_json, max_chars=seg_budget
+                ctx, ir_json, max_chars=max_chars
             )
             crit_frames = _critic_frames(ctx, ir_json)
         else:

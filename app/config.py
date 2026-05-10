@@ -130,14 +130,17 @@ class Settings(BaseSettings):
         alias="LECTURE_CRITIC_MAX_PROMPT_CHARS",
         ge=0,
         description=(
-            "Soft cap on the total Critic user prompt size in characters. "
-            "When > 0 the Critic projects subtitles/frames against the IR "
-            "structure (chapter windows + point/code/formula/visual anchor "
-            "neighborhoods) and uniformly downsamples subtitles when the "
-            "total would still exceed this budget. Frames are capped to "
-            "16 (short/medium) or 24 (long) and prioritise high-value "
-            "visual types. Set to 0 to disable both projection and "
-            "trimming and recover the legacy full-prompt behaviour."
+            "Soft cap on the Critic **subtitle excerpt** size in "
+            "characters (NOT the total prompt — the IR JSON is the "
+            "artefact under audit and is irreducible). When > 0 the "
+            "Critic projects subtitles against the IR structure "
+            "(chapter windows + point/code/formula/visual anchor "
+            "neighborhoods) and uniformly downsamples segments only "
+            "when the formatted subtitle block would still exceed this "
+            "budget. Frames are independently capped at 16 (short / "
+            "medium) or 24 (long) and prioritise high-value visual "
+            "types. Set to 0 to disable both projection and trimming "
+            "and recover the legacy full-subtitle behaviour."
         ),
     )
     lecture_reviser_timeout: float = Field(default=600.0, alias="LECTURE_REVISER_TIMEOUT")

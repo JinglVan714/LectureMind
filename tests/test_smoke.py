@@ -1462,6 +1462,47 @@ class TestCriticInputProjection:
         f = Settings.model_fields["lecture_critic_max_prompt_chars"]
         assert f.default == 24000
 
+    def test_critic_segments_not_over_pruned_when_ir_is_large(self):
+        """Regression: a code-rich short/medium video has a huge IR
+        (>20k chars) but a moderate subtitle (<24k chars). Earlier the
+        agent computed ``seg_budget = max_chars - len(ir_json) - ...``
+        which collapsed to the floor and over-pruned subtitles, causing
+        the Critic to invent ``dubious_quote`` issues for nearly every
+        point. ``_critic_segments`` must treat ``max_chars`` as the
+        subtitle excerpt cap, not a total-prompt cap.
+        """
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.agents import _critic_segments
+
+        # 200 segments, full subtitle ~6000 chars (well under 24k cap).
+        segments = [
+            Seg(start=i * 4.0, end=i * 4.0 + 3.5, text=f"片段{i:03d}描述")
+            for i in range(200)
+        ]
+        ctx = LecturizeContext(
+            bv_id="BV1bigir000",
+            url="x",
+            title="t",
+            author="a",
+            duration=900,  # 15 min
+            cover_url="",
+            segments=segments,
+            frame_descs=[],
+        )
+        # Wide chapter covering the whole timeline, no anchors needed.
+        ir = {
+            "chapters": [{"start": 0, "end": 900, "points": []}],
+            "knowledge_units": [],
+            "visual_evidence": [],
+        }
+        kept = _critic_segments(ctx, ir, max_chars=24000)
+        # Subtitles fit comfortably under the cap → projection must
+        # keep all (or essentially all) segments.
+        assert len(kept) >= int(0.95 * len(segments)), (
+            f"projection over-pruned: kept {len(kept)}/{len(segments)}"
+        )
+
 
 # ---------------- v2: StudyQuestion multi-window sampling ----------------
 
