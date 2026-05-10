@@ -237,26 +237,34 @@ def make_copilot_tools(ctx: ToolContext, *, enable_web: bool = False) -> list[Ba
 
 
 def _build_model() -> Any:
-    """Construct a ``ChatOpenAI`` pointing at the DashScope-compatible endpoint.
+    """Construct a ``ChatOpenAI`` pointing at the DeepSeek endpoint.
 
     Lives behind a factory so tests can monkey-patch it to return a
     lightweight stub (see ``tests/test_copilot.py::TestAgent``).  Any
     object with an async ``ainvoke(messages)`` method and a
     ``bind_tools(tools)`` chainable is acceptable.
+
+    The Copilot shares the text pipeline's DeepSeek credentials
+    (``DEEPSEEK_API_KEY`` + ``DEEPSEEK_BASE_URL``). ``extra_body`` is
+    only forwarded when the configured base URL still points at a
+    DashScope-compatible Qwen endpoint — DeepSeek's ChatCompletions
+    rejects the Qwen-specific ``enable_thinking`` key.
     """
     # Lazy import so pytest collection does not pay the LangChain import
     # cost for tests that do not touch the agent.
     from langchain_openai import ChatOpenAI
 
     settings = get_settings()
-    return ChatOpenAI(
-        model=settings.qwen_copilot_model,
-        base_url=settings.dashscope_base_url,
-        api_key=settings.dashscope_api_key,
-        streaming=True,
-        temperature=0.2,
-        extra_body={"enable_thinking": False},
-    )
+    kwargs: dict[str, Any] = {
+        "model": settings.qwen_copilot_model,
+        "base_url": settings.deepseek_base_url,
+        "api_key": settings.deepseek_api_key,
+        "streaming": True,
+        "temperature": 0.2,
+    }
+    if "dashscope" in (settings.deepseek_base_url or "").lower():
+        kwargs["extra_body"] = {"enable_thinking": False}
+    return ChatOpenAI(**kwargs)
 
 
 # ---------------------------------------------------------------------------

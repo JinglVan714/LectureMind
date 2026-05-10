@@ -1,6 +1,6 @@
 """Lightweight multi-agent helpers for the lecture pipeline.
 
-Two callable agents share a single ``AsyncOpenAI`` client (DashScope
+Two callable agents share a single ``AsyncOpenAI`` client (DeepSeek
 OpenAI-compatible mode) and a small JSON-extraction helper:
 
 * :class:`StudyQuestionAgent` — pre-generates 5-10 study questions from
@@ -374,21 +374,21 @@ class StudyQuestionAgent:
         s = get_settings()
         self._settings = s
         self._client = client or AsyncOpenAI(
-            api_key=s.dashscope_api_key,
-            base_url=s.dashscope_base_url,
-            timeout=s.dashscope_request_timeout,
+            api_key=s.deepseek_api_key,
+            base_url=s.deepseek_base_url,
+            timeout=s.deepseek_request_timeout,
             max_retries=0,
             http_client=httpx.AsyncClient(
-                timeout=s.dashscope_request_timeout,
-                trust_env=s.dashscope_trust_env,
+                timeout=s.deepseek_request_timeout,
+                trust_env=s.deepseek_trust_env,
             ),
         )
         # Use the same text model as the IR builder; questions are cheap
         # but accuracy matters more than latency.
         self._model = s.qwen_text_model
-        self._timeout = s.dashscope_request_timeout
+        self._timeout = s.deepseek_request_timeout
         self._strict = bool(s.lecture_strict_agents)
-        self._enable_thinking = s.qwen_text_enable_thinking
+        self._extra_body = s.text_extra_body()
         self._multi_window = bool(
             getattr(s, "lecture_study_question_multi_window", True)
         )
@@ -434,7 +434,7 @@ class StudyQuestionAgent:
                 temperature=0.4,
                 response_format={"type": "json_object"},
                 timeout=self._timeout,
-                extra_body={"enable_thinking": self._enable_thinking},
+                extra_body=self._extra_body,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Study questions LLM call failed: %s", exc)
@@ -530,21 +530,21 @@ class CriticReviserAgent:
         s = get_settings()
         self._settings = s
         self._client = client or AsyncOpenAI(
-            api_key=s.dashscope_api_key,
-            base_url=s.dashscope_base_url,
-            timeout=s.dashscope_request_timeout,
+            api_key=s.deepseek_api_key,
+            base_url=s.deepseek_base_url,
+            timeout=s.deepseek_request_timeout,
             max_retries=0,
             http_client=httpx.AsyncClient(
-                timeout=s.dashscope_request_timeout,
-                trust_env=s.dashscope_trust_env,
+                timeout=s.deepseek_request_timeout,
+                trust_env=s.deepseek_trust_env,
             ),
         )
         self._model = s.qwen_text_model
-        self._timeout = s.dashscope_request_timeout
+        self._timeout = s.deepseek_request_timeout
         self._critic_timeout = s.lecture_critic_timeout
         self._reviser_timeout = s.lecture_reviser_timeout
         self._strict = bool(s.lecture_strict_agents)
-        self._enable_thinking = s.qwen_text_enable_thinking
+        self._extra_body = s.text_extra_body()
         self._critic_max_prompt_chars = int(
             getattr(s, "lecture_critic_max_prompt_chars", 0) or 0
         )
@@ -605,7 +605,7 @@ class CriticReviserAgent:
                 temperature=0.1,
                 response_format={"type": "json_object"},
                 timeout=self._critic_timeout,
-                extra_body={"enable_thinking": self._enable_thinking},
+                extra_body=self._extra_body,
             )
 
         try:
@@ -721,7 +721,7 @@ class CriticReviserAgent:
                 temperature=0.2,
                 response_format={"type": "json_object"},
                 timeout=self._reviser_timeout,
-                extra_body={"enable_thinking": self._enable_thinking},
+                extra_body=self._extra_body,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reviser LLM call failed: %s", exc)

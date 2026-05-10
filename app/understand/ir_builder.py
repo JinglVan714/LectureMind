@@ -48,18 +48,18 @@ class LectureIRBuilder:
         s = get_settings()
         self._settings = s
         self._client = AsyncOpenAI(
-            api_key=s.dashscope_api_key,
-            base_url=s.dashscope_base_url,
-            timeout=s.dashscope_request_timeout,
+            api_key=s.deepseek_api_key,
+            base_url=s.deepseek_base_url,
+            timeout=s.deepseek_request_timeout,
             max_retries=0,
             http_client=httpx.AsyncClient(
-                timeout=s.dashscope_request_timeout,
-                trust_env=s.dashscope_trust_env,
+                timeout=s.deepseek_request_timeout,
+                trust_env=s.deepseek_trust_env,
             ),
         )
         self._model = s.qwen_text_model
-        self._timeout = s.dashscope_request_timeout
-        self._enable_thinking = s.qwen_text_enable_thinking
+        self._timeout = s.deepseek_request_timeout
+        self._extra_body = s.text_extra_body()
         # Optional sub-agents share the same client to reuse the http
         # connection pool. They are constructed lazily because not every
         # caller (e.g. v1 fallback path) needs them.
@@ -257,7 +257,7 @@ class LectureIRBuilder:
             temperature=0.25,
             response_format={"type": "json_object"},
             timeout=self._timeout,
-            extra_body={"enable_thinking": self._enable_thinking},
+            extra_body=self._extra_body,
         )
         content = resp.choices[0].message.content or ""
         usage = {}
