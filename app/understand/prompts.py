@@ -29,6 +29,22 @@ VLM_FRAME_DESCRIBE_USER = "请描述这一帧。"
 
 
 # ---------------------------------------------------------------------------
+# VLM low-tier prompt (M3): used for frames the KeyframeRanker decided are
+# duplicates / near-blank / low-information. We still call the model — many
+# such frames carry partial OCR text that is useful as a coarse anchor — but
+# skip caption / visual_type / scoring. The shorter prompt + short response
+# cuts ~60% of the per-frame token cost relative to the HIGH-tier prompt.
+# Output contract is intentionally minimal: a single JSON object with
+# ocr_text only. Other FrameDescription fields are filled with neutral
+# defaults by the parser.
+# ---------------------------------------------------------------------------
+
+VLM_FRAME_OCR_ONLY_USER = """请提取这张视频帧中的所有可读文字，仅返回 JSON：
+{"ocr_text": "<文字内容，无文字则为空字符串>"}
+不要给标题、解释、Markdown 包裹。"""
+
+
+# ---------------------------------------------------------------------------
 # Question-Driven extraction
 # ---------------------------------------------------------------------------
 

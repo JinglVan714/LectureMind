@@ -16,22 +16,49 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ---- Models (Qwen / DashScope) ----
+    # ---- Models ----
+    # We run a split stack:
+    #   * Text + Copilot  -> DeepSeek official API (OpenAI-compatible).
+    #   * Vision (VLM)    -> DashScope Qwen native multimodal.
+    #   * Embeddings      -> DashScope tongyi-embedding (native SDK).
+    # This lets us cut text cost with DeepSeek V4 pricing while keeping
+    # Qwen's solid vision + multi-modal embedding quality.
+
+    # -- DeepSeek (text + copilot) --
+    deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL"
+    )
+    deepseek_request_timeout: float = Field(
+        default=180.0, alias="DEEPSEEK_REQUEST_TIMEOUT"
+    )
+    deepseek_trust_env: bool = Field(default=False, alias="DEEPSEEK_TRUST_ENV")
+
+    # -- DashScope (VLM + embeddings) --
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
-    # NOTE: alias kept as QWEN_TEXT_MODEL for backward compatibility. The
-    # recommended default is deepseek-v4-pro on DashScope: it produces the
-    # most stable LectureIR (denser chapters / code blocks / learning paths)
-    # and is the only model we currently rely on for cross-duration
-    # validation. deepseek-v4-flash is acceptable as a fallback when pro
-    # quota is exhausted but tends to drop high-value arrays.
-    qwen_text_model: str = Field(default="deepseek-v4-pro", alias="QWEN_TEXT_MODEL")
-    qwen_vl_model: str = Field(default="qwen3.6-plus", alias="QWEN_VL_MODEL")
+    # NOTE: alias kept as QWEN_TEXT_MODEL for backward compatibility even
+    # though the default now points at DeepSeek. The Critic / Reviser /
+    # StudyQuestion / IR builder all consume this name against the DeepSeek
+    # endpoint (see ``deepseek_*`` above). deepseek-v4-flash is the chosen
+    # baseline: it is dramatically cheaper than v4-pro and, per user
+    # regression on BV1NM1tY3Eu5, delivers acceptable IR density when paired
+    # with the existing Critic + coverage warnings.
+    qwen_text_model: str = Field(default="deepseek-v4-flash", alias="QWEN_TEXT_MODEL")
+    # Vision model used for keyframe captioning + board-OCR. Stays on
+    # DashScope because DeepSeek V4 does not (officially) expose a vision
+    # endpoint yet. qwen3.5-omni-plus is the native-multimodal Qwen model
+    # the user selected for this migration.
+    qwen_vl_model: str = Field(default="qwen3.5-omni-plus", alias="QWEN_VL_MODEL")
     dashscope_base_url: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         alias="DASHSCOPE_BASE_URL",
     )
     dashscope_request_timeout: float = Field(default=180.0, alias="DASHSCOPE_REQUEST_TIMEOUT")
     dashscope_trust_env: bool = Field(default=False, alias="DASHSCOPE_TRUST_ENV")
+    # Legacy flag — only honoured when the text model is clearly a Qwen
+    # model (base URL contains ``dashscope``). DeepSeek uses its own
+    # thinking-mode mechanism (model suffix) and would 400 on this extra
+    # body key, so it is suppressed automatically for DeepSeek traffic.
     qwen_text_enable_thinking: bool = Field(default=False, alias="QWEN_TEXT_ENABLE_THINKING")
     qwen_vl_concurrency: int = Field(
         default=4,
@@ -40,6 +67,55 @@ class Settings(BaseSettings):
         le=16,
         description="Concurrency for VLM frame description calls.",
     )
+
+    # ---- VLM tiering & cache (M3) ----
+    # Two-tier prompting: HIGH-tier frames get the full caption+OCR+
+    # scoring prompt (~1k input + ~200 output tokens). LOW-tier frames
+    # — repeated slides, talking heads, near-blank transitions —
+    # collapse to a much cheaper OCR-only prompt. The mixed strategy
+    # below combines an absolute junk filter (drop near-duplicates and
+    # near-blank frames outright) with a percentage floor (always keep
+    # at least HIGH_FLOOR_RATIO of survivors as HIGH so visually-rich
+    # videos do not lose information just because every frame "looks
+    # similar"). Defaults match the M3 spec; ``VLM_TIERING_ENABLED=
+    # false`` is the emergency escape hatch back to legacy behaviour.
+    vlm_tiering_enabled: bool = Field(default=True, alias="VLM_TIERING_ENABLED")
+    vlm_tiering_high_floor_ratio: float = Field(
+        default=0.5,
+        alias="VLM_TIERING_HIGH_FLOOR_RATIO",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of non-junk frames that must remain HIGH tier "
+            "regardless of score. Set to 1.0 to disable downgrading."
+        ),
+    )
+    vlm_junk_sim_threshold: float = Field(
+        default=0.93,
+        alias="VLM_JUNK_SIM_THRESHOLD",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "If a frame's dHash similarity to the previous frame is "
+            "at or above this value, it is forced into LOW tier."
+        ),
+    )
+    vlm_junk_entropy_threshold: float = Field(
+        default=2.0,
+        alias="VLM_JUNK_ENTROPY_THRESHOLD",
+        ge=0.0,
+        description=(
+            "Frames whose grayscale Shannon entropy is below this "
+            "value (range [0, 8]) are forced into LOW tier."
+        ),
+    )
+    # SQLite-backed content-addressed cache. Key is
+    # (sha256(image_bytes), model, tier) so repeated slides across
+    # videos hit. Setting ``VLM_CACHE_ENABLED=false`` bypasses the
+    # cache entirely (useful for A/B). ``VLM_CACHE_PATH`` defaults to
+    # ``<DATA_DIR>/vlm_cache.sqlite`` when blank.
+    vlm_cache_enabled: bool = Field(default=True, alias="VLM_CACHE_ENABLED")
+    vlm_cache_path: str = Field(default="", alias="VLM_CACHE_PATH")
 
     # ---- Whisper fallback ----
     whisper_model: str = Field(default="base", alias="WHISPER_MODEL")
@@ -169,7 +245,10 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ---- Copilot + MCP (v1) ----
-    qwen_copilot_model: str = Field(default="qwen3.6-plus", alias="QWEN_COPILOT_MODEL")
+    # Copilot shares the DeepSeek endpoint with the text pipeline unless
+    # explicitly overridden. deepseek-v4-flash is a good default: cheap,
+    # low latency, and tool-use capable per DeepSeek V4 release notes.
+    qwen_copilot_model: str = Field(default="deepseek-v4-flash", alias="QWEN_COPILOT_MODEL")
     qwen_embedding_model: str = Field(
         default="tongyi-embedding-vision-flash-2026-03-06",
         alias="QWEN_EMBEDDING_MODEL",
@@ -183,6 +262,22 @@ class Settings(BaseSettings):
     bocha_base_url: str = Field(default="https://api.bochaai.com/v1/web-search", alias="BOCHA_BASE_URL")
     mcp_server_token: str = Field(default="", alias="MCP_SERVER_TOKEN")
     mcp_expose_summarize: bool = Field(default=False, alias="MCP_EXPOSE_SUMMARIZE")
+
+    # ---- Derived helpers ----
+    def _is_dashscope_url(self, url: str) -> bool:
+        return "dashscope" in (url or "").lower()
+
+    def text_extra_body(self) -> dict[str, bool]:
+        """Extra body for text LLM calls.
+
+        Only emits ``{"enable_thinking": ...}`` when the **text client** is
+        pointing at a DashScope Qwen endpoint — DeepSeek toggles thinking
+        mode via the model name suffix and rejects this field, so we must
+        not send it on DeepSeek traffic.
+        """
+        if self._is_dashscope_url(self.deepseek_base_url):
+            return {"enable_thinking": self.qwen_text_enable_thinking}
+        return {}
 
     # ---- Derived paths ----
     @property

@@ -57,6 +57,21 @@ class Tier(str, Enum):
 
 
 @dataclass
+class RankResult:
+    """Bundle returned by :meth:`KeyframeRanker.classify`.
+
+    ``tiers``, ``signals`` and ``is_junk`` are parallel lists with one
+    entry per input frame. Exposed so callers (notably
+    :class:`FrameDescriber`) can produce accurate ``junk_filtered``
+    telemetry without a second pass over the frames.
+    """
+
+    tiers: list["Tier"]
+    signals: list["FrameSignals"]
+    is_junk: list[bool]
+
+
+@dataclass
 class FrameSignals:
     """Per-frame CPU-only descriptors produced by :class:`KeyframeRanker`.
 
@@ -147,10 +162,25 @@ class KeyframeRanker:
 
     def rank(self, frames: "list[Keyframe]") -> list[Tier]:
         """Return one :class:`Tier` per frame, in input order."""
+        return self.classify(frames).tiers
+
+    def classify(self, frames: "list[Keyframe]") -> RankResult:
+        """Return tiers + per-frame signals + per-frame junk mask.
+
+        Computing them together avoids the double-pass that calling
+        :meth:`signals` and :meth:`rank` separately would incur, and
+        gives :class:`FrameDescriber` the data it needs for accurate
+        ``junk_filtered`` telemetry.
+        """
         if not frames:
-            return []
+            return RankResult(tiers=[], signals=[], is_junk=[])
         if not self._enabled:
-            return [Tier.HIGH] * len(frames)
+            sigs = self.signals(frames)
+            return RankResult(
+                tiers=[Tier.HIGH] * len(frames),
+                signals=sigs,
+                is_junk=[False] * len(frames),
+            )
 
         sigs = self.signals(frames)
         is_junk = [
@@ -165,13 +195,15 @@ class KeyframeRanker:
             scored = sorted(range(len(sigs)), key=lambda i: _score(sigs[i]), reverse=True)
             k = max(1, math.ceil(len(frames) * self._floor))
             high = set(scored[:k])
-            return [Tier.HIGH if i in high else Tier.LOW for i in range(len(frames))]
+            tiers = [Tier.HIGH if i in high else Tier.LOW for i in range(len(frames))]
+            return RankResult(tiers=tiers, signals=sigs, is_junk=is_junk)
 
         scores = {i: _score(sigs[i]) for i in survivors}
         # Floor is computed against the survivor set, per spec §2.1.
         k = max(1, math.ceil(len(survivors) * self._floor))
         high = set(sorted(survivors, key=lambda i: scores[i], reverse=True)[:k])
-        return [Tier.HIGH if i in high else Tier.LOW for i in range(len(frames))]
+        tiers = [Tier.HIGH if i in high else Tier.LOW for i in range(len(frames))]
+        return RankResult(tiers=tiers, signals=sigs, is_junk=is_junk)
 
 
 # ---- pure-function signal helpers (also used by tests) ---------------

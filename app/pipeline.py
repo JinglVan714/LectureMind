@@ -142,6 +142,8 @@ class Pipeline:
         frame_descs: list[FrameDescription] = await self.vlm.describe_all(frames)
         timing["vlm_sec"] = round(time.perf_counter() - t_vlm, 3)
         timing["vlm_concurrency"] = getattr(self.vlm, "_concurrency", None)
+        # M3 telemetry: tiering hits / cache hits / estimated savings.
+        timing["vlm"] = self.vlm.last_telemetry
 
         # --- 5. structured lecture ---
         await _progress(75, "generating LectureIR")
