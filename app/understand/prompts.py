@@ -63,11 +63,16 @@ STUDY_QUESTIONS_USER_TEMPLATE = """\
 
 期望问题数量：{q_min} - {q_max} 个。
 
-字幕节选（前 {head_minutes} 分钟，时间戳·文本）：
-{subtitle_head}
+覆盖度要求：
+- 问题应分布到不同时间段，**不要扎堆开头**。
+- 当字幕中存在中段或尾段窗口时，至少 1/3 的问题应对应中段或尾段内容。
+- 如果某段没有可问的实质内容，宁可少问也不要硬造；但是务必避免只覆盖前 1/4 视频。
 
-关键帧视觉描述（前若干帧，时间戳·caption [· OCR]）：
-{frames_head}
+字幕节选（按视频不同时间段分窗给出，时间戳·文本）：
+{subtitle_windows}
+
+关键帧视觉描述（按时间段挑选，时间戳·caption [· OCR]）：
+{frames_windows}
 
 请输出问题清单 JSON。
 """

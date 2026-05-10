@@ -111,6 +111,260 @@ def _domain_hint(ctx: LecturizeContext) -> str:
 class StudyQuestionsResult:
     questions: list[str]
     usage: dict[str, Any]
+    # Soft warnings emitted by the deterministic coverage self-check
+    # (e.g. ``second_half_keyword_ratio_low``). These never block
+    # generation; they are surfaced into pipeline_stats so the matrix
+    # report can flag long videos whose questions never reference the
+    # back half of the timeline.
+    warnings: list[str] = field(default_factory=list)
+    # Diagnostic counters describing how the windows were sampled, kept
+    # symmetric with ``CritiqueResult.metrics``.
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _SamplingWindow:
+    """Time window for multi-window study-question sampling.
+
+    Both ``start`` and ``end`` are clamped into ``[0, duration]`` and
+    the label is a stable Chinese tag (e.g. ``开头``, ``中段-1``,
+    ``尾声``) inserted verbatim into the prompt so the model can tell
+    windows apart without inventing its own headings.
+    """
+
+    label: str
+    start: float
+    end: float
+
+
+def _study_question_windows(
+    duration_sec: float, *, multi_window: bool = True
+) -> list[_SamplingWindow]:
+    """Return time windows the StudyQuestionAgent should sample from.
+
+    Strategy by duration (matching
+    ``docs/superpowers/plans/2026-05-10-study-question-sampling-plan.md``):
+
+    * ``< 10 min`` or ``multi_window=False``: single head window
+      (back-compat with the legacy ``_HEAD_MINUTES``-only sampling).
+    * ``10 - 30 min``: head 4m + mid 3m + tail 2m.
+    * ``30 - 60 min``: head 4m + mid1 3m + mid2 3m + tail 3m.
+    * ``>= 60 min``: head 4m + 3 evenly distributed mid 2m + tail 3m.
+
+    All windows are clamped to ``[0, duration]`` and dropped when they
+    collapse below a 30-second floor (deterministic, stable order).
+    """
+    duration = max(0.0, float(duration_sec or 0))
+    if duration <= 0:
+        return []
+    minutes = duration / 60.0
+
+    def _clamp(start: float, end: float) -> float:
+        return max(0.0, min(end, duration))
+
+    def _make(label: str, start: float, end: float) -> _SamplingWindow | None:
+        s = max(0.0, start)
+        e = _clamp(s, end)
+        if e - s < 30.0:
+            return None
+        return _SamplingWindow(label=label, start=s, end=e)
+
+    if (not multi_window) or minutes < 10:
+        legacy_end = max(60.0, _HEAD_MINUTES * 60.0)
+        w = _make("开头", 0.0, min(duration, legacy_end))
+        return [w] if w else []
+
+    head_end = 4 * 60.0
+    raw: list[_SamplingWindow | None] = []
+
+    if minutes < 30:
+        # Single mid window centered on the midpoint.
+        mid_center = duration / 2.0
+        raw.extend(
+            [
+                _make("开头", 0.0, head_end),
+                _make("中段", mid_center - 90.0, mid_center + 90.0),
+                _make("尾声", duration - 2 * 60.0, duration),
+            ]
+        )
+    elif minutes < 60:
+        c1 = duration / 3.0
+        c2 = duration * 2.0 / 3.0
+        raw.extend(
+            [
+                _make("开头", 0.0, head_end),
+                _make("中段-1", c1 - 90.0, c1 + 90.0),
+                _make("中段-2", c2 - 90.0, c2 + 90.0),
+                _make("尾声", duration - 3 * 60.0, duration),
+            ]
+        )
+    else:
+        c1 = duration * 0.25
+        c2 = duration * 0.5
+        c3 = duration * 0.75
+        raw.extend(
+            [
+                _make("开头", 0.0, head_end),
+                _make("中段-1", c1 - 60.0, c1 + 60.0),
+                _make("中段-2", c2 - 60.0, c2 + 60.0),
+                _make("中段-3", c3 - 60.0, c3 + 60.0),
+                _make("尾声", duration - 3 * 60.0, duration),
+            ]
+        )
+    return [w for w in raw if w is not None]
+
+
+def _fmt_mmss(t: float) -> str:
+    t = max(0.0, float(t))
+    return f"{int(t // 60):02d}:{int(t % 60):02d}"
+
+
+def _format_subtitle_windows(
+    ctx: LecturizeContext, windows: list[_SamplingWindow]
+) -> str:
+    """Render subtitle excerpts grouped by window with stable headings."""
+    if not windows or not ctx.segments:
+        return _format_subtitle_head(ctx)
+    parts: list[str] = []
+    for w in windows:
+        in_window = [
+            seg
+            for seg in ctx.segments
+            if _coerce_float(getattr(seg, "start", 0)) <= w.end
+            and _coerce_float(getattr(seg, "end", 0)) >= w.start
+        ]
+        if not in_window:
+            continue
+        body = _format_segments(in_window)
+        header = f"[{w.label} {_fmt_mmss(w.start)} - {_fmt_mmss(w.end)}]"
+        parts.append(f"{header}\n{body}")
+    if not parts:
+        return _format_subtitle_head(ctx)
+    return "\n\n".join(parts)
+
+
+def _format_frames_windows(
+    ctx: LecturizeContext,
+    windows: list[_SamplingWindow],
+    *,
+    max_per_window: int = 2,
+) -> str:
+    """Pick at most ``max_per_window`` frames per window for the prompt.
+
+    Inside each window, frames whose ``visual_type`` is in
+    ``_CRITIC_HIGH_VALUE_VISUAL_TYPES`` (code/formula/diagram) come
+    first, then by ``importance_score`` descending. Selection is
+    deduplicated globally by frame path so frames near a window
+    boundary are not counted twice.
+    """
+    if not ctx.frame_descs or not windows:
+        return _format_frames_head(ctx)
+
+    def _key(frame: FrameDescription) -> str:
+        return str(getattr(frame, "path", "") or id(frame))
+
+    selected: list[FrameDescription] = []
+    seen: set[str] = set()
+    for w in windows:
+        in_window = [
+            f
+            for f in ctx.frame_descs
+            if w.start <= _coerce_float(getattr(f, "timestamp", 0)) <= w.end
+        ]
+        in_window.sort(
+            key=lambda f: (
+                0
+                if (getattr(f, "visual_type", "") or "").lower()
+                in _CRITIC_HIGH_VALUE_VISUAL_TYPES
+                else 1,
+                -_coerce_float(getattr(f, "importance_score", 0.0)),
+                _coerce_float(getattr(f, "timestamp", 0)),
+            )
+        )
+        kept = 0
+        for f in in_window:
+            if kept >= max_per_window:
+                break
+            k = _key(f)
+            if k in seen:
+                continue
+            seen.add(k)
+            selected.append(f)
+            kept += 1
+    if not selected:
+        return _format_frames_head(ctx)
+    selected.sort(key=lambda f: _coerce_float(getattr(f, "timestamp", 0)))
+    return _format_frames(selected)
+
+
+def _question_match_terms(question: str) -> list[str]:
+    """Extract crude match terms from a Chinese/English question.
+
+    Strategy:
+      * Latin/digit tokens ``>= 3`` chars are kept verbatim (e.g. ``QKV``,
+        ``softmax``).
+      * For each contiguous CJK chunk, every 3-character overlapping
+        window is treated as a search term (``正则化``, ``则化在`` ...).
+        This keeps the heuristic robust to ASR variation while
+        preserving topical specificity.
+
+    The function intentionally never tries to be a real tokenizer; it
+    is only used by the coverage warning heuristic.
+    """
+    terms: list[str] = []
+    for tok in re.findall(r"[A-Za-z0-9]{3,}", question):
+        terms.append(tok)
+    for chunk in re.findall(r"[\u4e00-\u9fff]+", question):
+        if len(chunk) <= 3:
+            terms.append(chunk)
+            continue
+        for i in range(len(chunk) - 2):
+            terms.append(chunk[i : i + 3])
+    return terms
+
+
+def _study_question_coverage_warnings(
+    questions: list[str], ctx: LecturizeContext
+) -> list[str]:
+    """Heuristic coverage check for study questions.
+
+    For videos >= 10 minutes, every emitted question is matched against
+    the second-half subtitle text via simple keyword containment using
+    :func:`_question_match_terms`. If fewer than 30% of questions have
+    any matching term in the second half, emit a warning. The check is
+    purely diagnostic and never mutates the question list.
+    """
+    if not questions or not ctx.segments:
+        return []
+    duration = _coerce_float(getattr(ctx, "duration", 0))
+    if duration < 600.0:  # only meaningful for >=10 min videos
+        return []
+    cleaned = [q.strip() for q in questions if q and q.strip()]
+    if len(cleaned) < 4:
+        return []
+    half = duration / 2.0
+    second_half_text = " ".join(
+        seg.text
+        for seg in ctx.segments
+        if _coerce_float(getattr(seg, "start", 0)) >= half
+    )
+    if not second_half_text.strip():
+        return ["second_half_subtitle_empty"]
+    n_with_evidence = 0
+    for q in cleaned:
+        terms = _question_match_terms(q)
+        if not terms:
+            continue
+        if any(t in second_half_text for t in terms):
+            n_with_evidence += 1
+    ratio = n_with_evidence / len(cleaned)
+    warnings: list[str] = []
+    if ratio < 0.3:
+        warnings.append(
+            f"second_half_keyword_ratio_low ratio={ratio:.2f} "
+            f"questions={len(cleaned)} matched={n_with_evidence}"
+        )
+    return warnings
 
 
 class StudyQuestionAgent:
@@ -135,10 +389,22 @@ class StudyQuestionAgent:
         self._timeout = s.dashscope_request_timeout
         self._strict = bool(s.lecture_strict_agents)
         self._enable_thinking = s.qwen_text_enable_thinking
+        self._multi_window = bool(
+            getattr(s, "lecture_study_question_multi_window", True)
+        )
 
     @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=1, max=8), reraise=True)
     async def generate(self, ctx: LecturizeContext) -> StudyQuestionsResult:
         q_min, q_max = study_questions_target(ctx.duration)
+        windows = _study_question_windows(
+            ctx.duration, multi_window=self._multi_window
+        )
+        sub_block = (
+            _format_subtitle_windows(ctx, windows) if windows else _format_subtitle_head(ctx)
+        )
+        frame_block = (
+            _format_frames_windows(ctx, windows) if windows else _format_frames_head(ctx)
+        )
         user = STUDY_QUESTIONS_USER_TEMPLATE.format(
             bv_id=ctx.bv_id,
             title=ctx.title,
@@ -148,10 +414,16 @@ class StudyQuestionAgent:
             domain_hint=_domain_hint(ctx),
             q_min=q_min,
             q_max=q_max,
-            head_minutes=_HEAD_MINUTES,
-            subtitle_head=_format_subtitle_head(ctx) or "(无字幕节选)",
-            frames_head=_format_frames_head(ctx) or "(无关键帧)",
+            subtitle_windows=sub_block or "(无字幕节选)",
+            frames_windows=frame_block or "(无关键帧)",
         )
+        sampling_metrics = {
+            "multi_window": self._multi_window and len(windows) > 1,
+            "windows": [
+                {"label": w.label, "start": w.start, "end": w.end} for w in windows
+            ],
+            "study_question_prompt_chars": len(user),
+        }
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
@@ -168,7 +440,9 @@ class StudyQuestionAgent:
             logger.warning("Study questions LLM call failed: %s", exc)
             if self._strict:
                 raise
-            return StudyQuestionsResult(questions=[], usage={})
+            return StudyQuestionsResult(
+                questions=[], usage={}, warnings=[], metrics=sampling_metrics
+            )
 
         content = resp.choices[0].message.content or ""
         try:
@@ -177,11 +451,21 @@ class StudyQuestionAgent:
             logger.warning("Study questions returned non-JSON: %s", exc)
             if self._strict:
                 raise
-            return StudyQuestionsResult(questions=[], usage=_usage(resp))
+            return StudyQuestionsResult(
+                questions=[],
+                usage=_usage(resp),
+                warnings=[],
+                metrics=sampling_metrics,
+            )
 
         raw_qs = obj.get("study_questions") or obj.get("questions") or []
         if not isinstance(raw_qs, list):
-            return StudyQuestionsResult(questions=[], usage=_usage(resp))
+            return StudyQuestionsResult(
+                questions=[],
+                usage=_usage(resp),
+                warnings=[],
+                metrics=sampling_metrics,
+            )
         questions: list[str] = []
         seen: set[str] = set()
         for q in raw_qs:
@@ -202,7 +486,13 @@ class StudyQuestionAgent:
         # Floor the count: even with q_min if the model produces fewer
         # we still pass through because forcing repetition would dilute
         # quality.
-        return StudyQuestionsResult(questions=questions, usage=_usage(resp))
+        warnings_emitted = _study_question_coverage_warnings(questions, ctx)
+        return StudyQuestionsResult(
+            questions=questions,
+            usage=_usage(resp),
+            warnings=warnings_emitted,
+            metrics=sampling_metrics,
+        )
 
 
 # ---------------------------------------------------------------------------

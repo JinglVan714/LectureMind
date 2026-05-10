@@ -1461,3 +1461,183 @@ class TestCriticInputProjection:
 
         f = Settings.model_fields["lecture_critic_max_prompt_chars"]
         assert f.default == 24000
+
+
+# ---------------- v2: StudyQuestion multi-window sampling ----------------
+
+
+class TestStudyQuestionSampling:
+    """``StudyQuestionAgent`` now samples subtitles and frames from
+    multiple time windows (head + mid + tail) instead of only the first
+    five minutes. The sampling helpers are deterministic so we can
+    unit-test them without an LLM call.
+    """
+
+    def test_short_video_falls_back_to_head_only_window(self):
+        from app.understand.agents import _study_question_windows
+
+        windows = _study_question_windows(360.0)  # 6 min
+        assert len(windows) == 1
+        assert windows[0].label == "开头"
+        assert windows[0].start == 0.0
+
+    def test_medium_video_yields_three_windows(self):
+        from app.understand.agents import _study_question_windows
+
+        windows = _study_question_windows(20 * 60.0)  # 20 min
+        labels = [w.label for w in windows]
+        assert labels == ["开头", "中段", "尾声"]
+        assert windows[0].start == 0.0
+        assert windows[-1].end <= 20 * 60.0
+
+    def test_long_video_yields_five_windows(self):
+        from app.understand.agents import _study_question_windows
+
+        windows = _study_question_windows(75 * 60.0)  # 75 min
+        labels = [w.label for w in windows]
+        assert labels == ["开头", "中段-1", "中段-2", "中段-3", "尾声"]
+        # Mid windows are spaced through the 25%/50%/75% marks.
+        starts = [w.start for w in windows[1:4]]
+        assert starts == sorted(starts)
+        # No window extends past the video.
+        for w in windows:
+            assert w.end <= 75 * 60.0 + 0.001
+
+    def test_multi_window_disabled_returns_only_head(self):
+        from app.understand.agents import _study_question_windows
+
+        windows = _study_question_windows(45 * 60.0, multi_window=False)
+        assert len(windows) == 1
+        assert windows[0].label == "开头"
+
+    def test_format_subtitle_windows_groups_by_label(self):
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.agents import (
+            _format_subtitle_windows,
+            _study_question_windows,
+        )
+
+        segments = [
+            Seg(start=10.0, end=14.0, text="开头第一句"),
+            Seg(start=200.0, end=204.0, text="开头后期句"),
+            # 20-min video, mid window centered around 600s
+            Seg(start=590.0, end=594.0, text="中段重点句"),
+            Seg(start=1130.0, end=1134.0, text="结尾收束句"),
+        ]
+        ctx = LecturizeContext(
+            bv_id="BV1mid_test",
+            url="x",
+            title="t",
+            author="a",
+            duration=20 * 60,
+            cover_url="",
+            segments=segments,
+            frame_descs=[],
+        )
+        windows = _study_question_windows(20 * 60.0)
+        out = _format_subtitle_windows(ctx, windows)
+        assert "[开头" in out
+        assert "[中段" in out
+        assert "[尾声" in out
+        # Each line shows up under its window heading.
+        assert "开头第一句" in out
+        assert "中段重点句" in out
+        assert "结尾收束句" in out
+
+    def test_coverage_warning_when_questions_skip_second_half(self):
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.agents import _study_question_coverage_warnings
+
+        # 30-min video; second half subtitle introduces the term
+        # "梯度反传" — questions never mention it.
+        segments = [
+            Seg(start=i * 30.0, end=i * 30.0 + 28.0, text="前半段讲注意力机制示例")
+            for i in range(30)
+        ] + [
+            Seg(start=900.0 + i * 30.0, end=900.0 + i * 30.0 + 28.0, text="后半段讲梯度反传")
+            for i in range(30)
+        ]
+        ctx = LecturizeContext(
+            bv_id="BV1cov_test1",
+            url="x",
+            title="t",
+            author="a",
+            duration=30 * 60,
+            cover_url="",
+            segments=segments,
+            frame_descs=[],
+        )
+        questions = [
+            "注意力机制如何工作？",
+            "QKV 是什么？",
+            "softmax 在注意力里怎么用？",
+            "维度变化怎么发生？",
+        ]
+        warnings = _study_question_coverage_warnings(questions, ctx)
+        assert warnings, "expected coverage warning when questions ignore second half"
+        assert any("second_half_keyword_ratio_low" in w for w in warnings)
+
+    def test_coverage_no_warning_when_second_half_covered(self):
+        from app.ingest.subtitle import SubtitleSegment as Seg
+        from app.understand.lecturize import LecturizeContext
+        from app.understand.agents import _study_question_coverage_warnings
+
+        segments = [
+            Seg(start=i * 30.0, end=i * 30.0 + 28.0, text="前半段示例")
+            for i in range(30)
+        ] + [
+            Seg(start=900.0 + i * 30.0, end=900.0 + i * 30.0 + 28.0, text="后半段讲梯度反传与正则化")
+            for i in range(30)
+        ]
+        ctx = LecturizeContext(
+            bv_id="BV1cov_test2",
+            url="x",
+            title="t",
+            author="a",
+            duration=30 * 60,
+            cover_url="",
+            segments=segments,
+            frame_descs=[],
+        )
+        questions = [
+            "注意力机制如何工作？",
+            "梯度反传的具体步骤是什么？",
+            "正则化在训练中如何使用？",
+            "QKV 维度怎么变化？",
+        ]
+        warnings = _study_question_coverage_warnings(questions, ctx)
+        assert warnings == []
+
+    def test_user_template_includes_window_labels_when_filled(self):
+        from app.understand.prompts import STUDY_QUESTIONS_USER_TEMPLATE
+
+        rendered = STUDY_QUESTIONS_USER_TEMPLATE.format(
+            bv_id="BV1xx",
+            title="t",
+            author="a",
+            duration=1200,
+            minutes=20,
+            domain_hint="技术/编程类",
+            q_min=5,
+            q_max=8,
+            subtitle_windows="[开头 00:00 - 04:00]\nx\n\n[中段 09:30 - 10:30]\ny",
+            frames_windows="[ts=10s] z",
+        )
+        assert "[开头 00:00 - 04:00]" in rendered
+        assert "[中段 09:30 - 10:30]" in rendered
+        assert "覆盖度要求" in rendered
+
+    def test_study_questions_result_default_warnings_and_metrics(self):
+        from app.understand.agents import StudyQuestionsResult
+
+        r = StudyQuestionsResult(questions=["a？"], usage={"x": 1})
+        assert r.warnings == []
+        assert r.metrics == {}
+
+    def test_multi_window_default_is_true(self):
+        from app.config import Settings
+
+        f = Settings.model_fields["lecture_study_question_multi_window"]
+        assert f.default is True

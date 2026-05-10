@@ -147,6 +147,8 @@ class LectureIRBuilder:
         # 1. Study questions
         questions: list[str] = []
         questions_usage: dict[str, Any] = {}
+        study_question_warnings: list[str] = []
+        study_question_metrics: dict[str, Any] = {}
         study_question_sec = 0.0
         if question_driven:
             t_q = time.perf_counter()
@@ -156,6 +158,8 @@ class LectureIRBuilder:
                 qres: StudyQuestionsResult = await self._study_agent.generate(ctx)
                 questions = qres.questions
                 questions_usage = qres.usage
+                study_question_warnings = list(qres.warnings or [])
+                study_question_metrics = dict(qres.metrics or {})
                 _accumulate_usage(usage_aggregate, questions_usage)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Study question generation failed (skipping): %s", exc)
@@ -195,6 +199,8 @@ class LectureIRBuilder:
             "stage": "lecture_ir_v3",
             "budget": _budget_to_dict(budget),
             "study_questions": questions,
+            "study_question_warnings": study_question_warnings,
+            "study_question_metrics": study_question_metrics,
             "critique": _critique_to_dict(critique) if critique else None,
             "revise_rounds": revise_rounds,
             "agent_timing": {

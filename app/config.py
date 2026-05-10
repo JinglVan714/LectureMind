@@ -75,6 +75,17 @@ class Settings(BaseSettings):
         alias="LECTURE_QUESTION_DRIVEN",
         description="Pre-generate study questions to drive structured extraction.",
     )
+    lecture_study_question_multi_window: bool = Field(
+        default=True,
+        alias="LECTURE_STUDY_QUESTION_MULTI_WINDOW",
+        description=(
+            "When true (default), the StudyQuestionAgent samples "
+            "subtitles and frames from multiple windows (head + mid + "
+            "tail) instead of only the first ~5 minutes, so questions "
+            "for long videos cover the whole timeline. Set false to "
+            "recover the legacy head-only sampling for A/B testing."
+        ),
+    )
     lecture_critic_enabled: bool = Field(
         default=True,
         alias="LECTURE_CRITIC_ENABLED",
