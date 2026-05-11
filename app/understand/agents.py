@@ -32,9 +32,13 @@ from ..ingest.subtitle import SubtitleSegment
 from ._latex_repair import repair_obj as _repair_latex_escapes
 from .lecturize import LecturizeContext, _format_frames, _format_segments
 from .length_adapt import LengthBudget, study_questions_target
+from .critic_context import CriticContext
+from .ir_patches import IRPatch, RevisePatchResult
 from .prompts import (
     LECTURE_CRITIC_SYSTEM,
     LECTURE_CRITIC_USER_TEMPLATE,
+    LECTURE_REVISER_PATCH_SYSTEM,
+    LECTURE_REVISER_PATCH_USER_TEMPLATE,
     LECTURE_REVISER_SYSTEM,
     LECTURE_REVISER_USER_TEMPLATE,
     STUDY_QUESTIONS_SYSTEM,
@@ -738,6 +742,182 @@ class CriticReviserAgent:
                 raise
             return None, _usage(resp)
         return obj, _usage(resp)
+
+    async def revise_patch(
+        self,
+        *,
+        context: CriticContext,
+        issues: list[CritiqueIssue],
+    ) -> RevisePatchResult:
+        """Patch-mode Reviser (M2 P6): emit a small list of ``IRPatch``.
+
+        Replaces the legacy "rewrite the entire IR" round-trip with a
+        whitelist-bounded surgical-edit pass. The prompt only contains
+        the chapters cited in ``issues[].location`` (parsed via
+        ``chapters[N]`` regex) plus the lecture-level
+        ``knowledge_units`` / ``mainline`` slices the issues touch, so
+        the user message stays well below 8 KB even on epic videos.
+
+        The returned :class:`RevisePatchResult` carries
+        ``patches`` (model-proposed, **not yet** whitelist-filtered —
+        that happens later inside :func:`ir_patches.apply_patches`),
+        ``unfixable_issues`` (verbatim from the LLM), ``raw`` (the
+        decoded JSON for debugging) and ``usage`` (token telemetry).
+        """
+        if not issues:
+            return RevisePatchResult()
+
+        ir_excerpt = _excerpt_ir_for_issues(context.ir_payload, issues)
+        issues_block = json.dumps(
+            [
+                {
+                    "kind": i.kind,
+                    "severity": i.severity,
+                    "location": i.location,
+                    "evidence": i.evidence,
+                    "suggestion": i.suggestion,
+                }
+                for i in issues
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+        sq_block = (
+            "\n".join(
+                f"- {q.get('question', '')}"
+                for q in (context.study_questions_payload or [])
+                if isinstance(q, dict)
+            )
+            or "(无)"
+        )
+
+        version_header = (
+            f"# version: {self._settings.lecture_reviser_prompt_version}\n"
+        )
+        system_msg = version_header + LECTURE_REVISER_PATCH_SYSTEM
+        user_msg = LECTURE_REVISER_PATCH_USER_TEMPLATE.format(
+            bv_id=context.ir_payload.get("bv_id", ""),
+            title=context.ir_payload.get("title", ""),
+            duration=int(context.ir_payload.get("duration", 0) or 0),
+            issues_block=issues_block,
+            ir_excerpt=json.dumps(ir_excerpt, ensure_ascii=False, indent=2),
+            study_questions_block=sq_block,
+        )
+
+        try:
+            resp = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                timeout=self._reviser_timeout,
+                extra_body=self._extra_body,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Patch Reviser LLM call failed: %s", exc)
+            if self._strict:
+                raise
+            return RevisePatchResult()
+
+        content = resp.choices[0].message.content or ""
+        try:
+            obj = _extract_json(content)
+        except ValueError as exc:
+            logger.warning("Patch Reviser returned non-JSON: %s", exc)
+            if self._strict:
+                raise
+            return RevisePatchResult(usage=_usage(resp))
+
+        patches = _coerce_patch_list(obj.get("patches"))
+        unfixable = [
+            str(s).strip()
+            for s in (obj.get("unfixable_issues") or [])
+            if str(s).strip()
+        ]
+        return RevisePatchResult(
+            patches=patches,
+            rejected=[],
+            unfixable_issues=unfixable,
+            usage=_usage(resp),
+            raw=obj,
+        )
+
+
+def _coerce_patch_list(raw: Any) -> list[IRPatch]:
+    """Best-effort decode of the LLM's ``patches`` field into IRPatch.
+
+    Tolerates missing ``value``/``quote``/``text`` slots and unknown
+    extra keys — :func:`apply_patches` does the actual whitelist
+    enforcement, so dropping malformed entries here would just
+    discard data the rejection telemetry could otherwise report.
+    """
+    out: list[IRPatch] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if not op or not path:
+            continue
+        out.append(
+            IRPatch(
+                op=op,
+                path=path,
+                value=item.get("value"),
+                quote=item.get("quote"),
+                text=item.get("text"),
+            )
+        )
+    return out
+
+
+_CHAPTER_LOCATION_RE = re.compile(r"chapters\[(\d+)\]")
+
+
+def _excerpt_ir_for_issues(
+    ir_payload: dict[str, Any], issues: list[CritiqueIssue]
+) -> dict[str, Any]:
+    """Slice ``ir_payload`` down to the chapters cited in ``issues``.
+
+    Lecture-level fields (``mainline`` / ``knowledge_units``) are
+    always retained because they're cheap and a frequent target of
+    Critic issues. When no ``chapters[N]`` location is parseable we
+    fall back to keeping every chapter's *header* (title + summary +
+    counts) so the prompt is never literally empty.
+    """
+    cited: set[int] = set()
+    for issue in issues:
+        for m in _CHAPTER_LOCATION_RE.finditer(issue.location or ""):
+            cited.add(int(m.group(1)))
+    chapters_in = ir_payload.get("chapters") or []
+    if cited:
+        chapters_out = [chapters_in[i] for i in sorted(cited) if 0 <= i < len(chapters_in)]
+    else:
+        chapters_out = [
+            {
+                "index": ch.get("index"),
+                "title": ch.get("title"),
+                "summary": ch.get("summary"),
+                "start": ch.get("start", ch.get("start_sec")),
+                "end": ch.get("end", ch.get("end_sec")),
+                "points_count": len(ch.get("points") or []),
+            }
+            for ch in chapters_in
+            if isinstance(ch, dict)
+        ]
+    return {
+        "bv_id": ir_payload.get("bv_id", ""),
+        "title": ir_payload.get("title", ""),
+        "duration": ir_payload.get("duration", 0),
+        "mainline": list(ir_payload.get("mainline") or []),
+        "knowledge_units": list(ir_payload.get("knowledge_units") or []),
+        "chapters": chapters_out,
+    }
 
 
 def _issue_timestamps(issues: list[CritiqueIssue]) -> list[float]:

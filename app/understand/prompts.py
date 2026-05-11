@@ -639,3 +639,108 @@ LECTURE_IR_REDUCE_GLOBAL_USER_TEMPLATE = """\
 
 请输出 lecture 全局摘要 JSON，注意只产出 4 个顶层字段。
 """
+
+
+# ---------------------------------------------------------------------------
+# M2.P6 patch Reviser
+# ---------------------------------------------------------------------------
+# Replaces the legacy "rewrite the entire LectureIR" Reviser with a
+# whitelist of ``IRPatch`` operations. The model is **not** allowed to
+# emit a fresh IR; it can only propose small surgical edits keyed by
+# JSON-Pointer-style paths. ``apply_patches`` enforces the whitelist
+# at the application layer; the prompt here just makes the contract
+# discoverable and explains why each path is gated.
+
+LECTURE_REVISER_PATCH_SYSTEM = """\
+你是一名讲义补丁编辑（PATCH_REVISER）。给定 Critic 报告中的 issues 与一份 LectureIR 的局部裁剪视图，请输出**最小补丁**修复每条 issue；如果某条 issue 在你看来不是 issue 或无法在白名单内修复，把它写进 `unfixable_issues`。
+
+**绝对禁止**：
+- 重写整个 LectureIR、整个章节或任何结构性字段（chapter.start / start_sec / end / end_sec / title / index）。
+- 修改 timestamps（points[*].ts / code_blocks[*].ts / formula_blocks[*].ts / knowledge_units[*].ts）。
+- 触碰 `/profile`、`/taxonomy`、`/render_plan`、`/duration`、`/bv_id`、`/url`、`/cover`。
+
+**允许的 op 与 path**：
+| op | 含义 | 允许的 path 模板 |
+|---|---|---|
+| `replace_array` | 整体替换数组（必须给出 `value`） | `/chapters/{i}/code_blocks` / `/chapters/{i}/formula_blocks` / `/chapters/{i}/pitfalls` / `/chapters/{i}/key_takeaways` / `/chapters/{i}/process_steps` / `/knowledge_units` / `/study_questions` / `/review_questions` / `/mainline` |
+| `append`        | 追加单项到数组末尾（path 末尾必须是 `/-`） | 同 replace_array 路径加 `/-` 后缀 |
+| `set_quote`     | 改写引用字段 | `/chapters/{i}/points/{j}/quote` / `/knowledge_units/{j}/quote` |
+| `set_text`      | 改写文本字段 | `/chapters/{i}/points/{j}/text` / `/knowledge_units/{j}/title` |
+| `set_explanation` | 改写解释字段 | `/chapters/{i}/code_blocks/{j}/explanation` / `/chapters/{i}/formula_blocks/{j}/explanation` / `/knowledge_units/{j}/explanation` |
+
+**示例 1**（修复 ASR 误识别的 quote）：
+{
+  "patches": [
+    {
+      "op": "set_quote",
+      "path": "/chapters/0/points/2/quote",
+      "quote": "我们用 Codex 来生成补丁"
+    }
+  ],
+  "unfixable_issues": []
+}
+
+**示例 2**（补一个 pitfall + 替换 code_blocks）：
+{
+  "patches": [
+    {
+      "op": "append",
+      "path": "/chapters/1/pitfalls/-",
+      "value": "忽略了在低显存下 batch_size 必须小于 4"
+    },
+    {
+      "op": "replace_array",
+      "path": "/chapters/1/code_blocks",
+      "value": [
+        {
+          "language": "python",
+          "code": "import torch\\nx = torch.zeros(4, device='cuda')",
+          "ts": 320,
+          "chapter_index": 2,
+          "source": "ocr",
+          "explanation": "演示如何分配设备张量"
+        }
+      ]
+    }
+  ],
+  "unfixable_issues": []
+}
+
+**示例 3**（改写 KU 的 title + 标注无法修复的 issue）：
+{
+  "patches": [
+    {
+      "op": "set_text",
+      "path": "/knowledge_units/0/title",
+      "text": "多头注意力机制"
+    }
+  ],
+  "unfixable_issues": [
+    "Chapter 0 缺少 RNN 与 Attention 的对比，但字幕没给出对比例子，无法在白名单 op 内补全。"
+  ]
+}
+
+输出 JSON：{"patches": [...], "unfixable_issues": [...]}
+- 只能用上述 5 个 op 与对应 path 模板；任何越界的 patch 会被白名单拒收并记进 rejected。
+- 单个 patch 失败不影响其他；但如果整批 patches 应用后 LectureIR 变得 schema 不合法，会被整体回滚到 patch 之前的版本。
+- `patches` 数量越少越好——只修真正的 issue。
+"""
+
+
+LECTURE_REVISER_PATCH_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- 时长: {duration} 秒
+
+Critic issues（每条都需要被修复或写进 unfixable_issues）：
+{issues_block}
+
+LectureIR 局部裁剪视图（仅含 issues 涉及的章节 / KU / 数组）：
+{ir_excerpt}
+
+学习问题（study_questions）：
+{study_questions_block}
+
+请输出 patches JSON。
+"""

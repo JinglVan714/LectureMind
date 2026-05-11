@@ -441,6 +441,19 @@ class Settings(BaseSettings):
         ),
     )
     lecture_reviser_timeout: float = Field(default=600.0, alias="LECTURE_REVISER_TIMEOUT")
+    # M2.P6 patch Reviser prompt version. Mixed into the patch
+    # Reviser system prompt header so a future prompt edit can be
+    # rolled out without breaking historical telemetry comparisons.
+    lecture_reviser_prompt_version: str = Field(
+        default="m2-patch-v1",
+        alias="LECTURE_REVISER_PROMPT_VERSION",
+        description=(
+            "Version tag advertised in the patch Reviser system "
+            "prompt header. Bump whenever the patch op whitelist or "
+            "examples change so logs / matrix reports can attribute "
+            "behaviour to a specific prompt revision."
+        ),
+    )
     lecture_strict_agents: bool = Field(default=False, alias="LECTURE_STRICT_AGENTS")
     lecture_code_highlighter: str = Field(
         default="highlight.js",
