@@ -288,6 +288,42 @@ class Settings(BaseSettings):
             "signals; cross-checked against subtitle boundaries)."
         ),
     )
+
+    # ---- M2.P3 ChapterCache (SQLite, prompt_hash keyed) ----
+    # Per-chapter LLM result cache used by ``MapReduceIRBuilder`` (P4).
+    # Key is a SHA-256 of (segments + frames + boundaries + model + prompt
+    # version), so editing a single subtitle line invalidates only the
+    # affected chapter, while bumping ``LECTURE_MAP_PROMPT_VERSION``
+    # invalidates the whole table at once. Disabling the cache turns
+    # ``ChapterCache.put/get`` into no-ops without touching the filesystem
+    # — useful for A/B and emergency disable.
+    lecture_chapter_cache_enabled: bool = Field(
+        default=True,
+        alias="LECTURE_CHAPTER_CACHE_ENABLED",
+        description=(
+            "Master switch for the per-chapter SQLite cache used by "
+            "the map-reduce IR builder. Default on; off makes "
+            "ChapterCache a no-op without touching disk."
+        ),
+    )
+    lecture_chapter_cache_path: str = Field(
+        default="",
+        alias="LECTURE_CHAPTER_CACHE_PATH",
+        description=(
+            "Override the chapter-cache SQLite path. Defaults to "
+            "<DATA_DIR>/chapter_cache.sqlite when blank."
+        ),
+    )
+    lecture_map_prompt_version: str = Field(
+        default="m2-map-v1",
+        alias="LECTURE_MAP_PROMPT_VERSION",
+        description=(
+            "Version tag mixed into every chapter prompt_hash. Bump "
+            "this whenever the map-chapter prompt template is "
+            "edited so all stale rows fall through to a miss."
+        ),
+    )
+
     lecture_critic_max_rounds: int = Field(
         default=1,
         alias="LECTURE_CRITIC_MAX_ROUNDS",
