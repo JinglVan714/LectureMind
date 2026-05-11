@@ -314,6 +314,62 @@ class Settings(BaseSettings):
             "<DATA_DIR>/chapter_cache.sqlite when blank."
         ),
     )
+    # M2.P4 MapReduceIRBuilder timing / retry budget. The builder runs
+    # for long / epic profiles only (router decides in P7); these knobs
+    # stay inert otherwise. ``_max_retries`` is the number of *additional*
+    # attempts after the first (so default 1 ⇒ up to 2 LLM calls), matching
+    # the spec §3.3 fail-fast contract: more aggressive retries hurt
+    # latency without lifting recoverable-failure rates measurably.
+    lecture_map_chapter_max_retries: int = Field(
+        default=1,
+        alias="LECTURE_MAP_CHAPTER_MAX_RETRIES",
+        ge=0,
+        le=3,
+        description=(
+            "Per-chapter retry budget for the map stage. 0 disables "
+            "retries; failed chapters fall back to a placeholder."
+        ),
+    )
+    lecture_map_chapter_timeout: float = Field(
+        default=180.0,
+        alias="LECTURE_MAP_CHAPTER_TIMEOUT",
+        description=(
+            "Timeout (seconds) for a single map-chapter LLM call. "
+            "Spec §3.3.5 default 180s; a chapter rarely exceeds 30s "
+            "in practice but the budget covers worst-case retries."
+        ),
+    )
+    lecture_reduce_global_timeout: float = Field(
+        default=120.0,
+        alias="LECTURE_REDUCE_GLOBAL_TIMEOUT",
+        description=(
+            "Timeout (seconds) for the reduce-global LLM call. "
+            "Spec §3.3.5 default 120s; smaller than map because the "
+            "input is just per-chapter digests, not full segments."
+        ),
+    )
+    lecture_reduce_global_max_retries: int = Field(
+        default=1,
+        alias="LECTURE_REDUCE_GLOBAL_MAX_RETRIES",
+        ge=0,
+        le=3,
+        description=(
+            "Retry budget for the reduce-global pass. After this is "
+            "exhausted ``MapReduceIRBuilder`` raises "
+            "``ReduceGlobalError`` and the pipeline fails fast — by "
+            "design, per spec §3.3.3."
+        ),
+    )
+    lecture_reduce_global_max_tokens: int = Field(
+        default=4000,
+        alias="LECTURE_REDUCE_GLOBAL_MAX_TOKENS",
+        ge=0,
+        description=(
+            "Max output tokens for the reduce-global LLM call. "
+            "Caps prompt-bloat regression; 0 disables the cap."
+        ),
+    )
+
     lecture_map_prompt_version: str = Field(
         default="m2-map-v1",
         alias="LECTURE_MAP_PROMPT_VERSION",

@@ -530,3 +530,112 @@ CHAPTER_SPLIT_SYSTEM = """\
 每个章节给出 title（中文短语）、start、end（秒）。
 输出 JSON：{"chapters": [{"title": "...", "start": 0, "end": 0}]}。
 """
+
+
+# ---------------------------------------------------------------------------
+# M2.P4 MapReduceIRBuilder — per-chapter map prompt
+# ---------------------------------------------------------------------------
+# Used by ``MapReduceIRBuilder._map_chapter_with_retry``. The system
+# prompt deliberately forbids lecture-level fields (``mainline`` /
+# ``lecture_summary`` / global glossary) so the model keeps each call
+# focused on one chapter — that is what makes the map stage cacheable
+# under :func:`compute_prompt_hash` and lets the reduce stages run on
+# small, deterministic inputs.
+
+LECTURE_IR_MAP_CHAPTER_SYSTEM = """\
+你是一名讲义抽取专家，正在为一段视频的**单一章节**生成结构化数据。给定字幕片段、关键帧描述和章节时间窗，请仅产出该章节范围内的内容；不要写主线、全片摘要、全局术语表、交叉引用等 lecture 级字段。
+
+硬性规则：
+1. 所有 ts 必须落在 [chapter_start_sec, chapter_end_sec] 时间窗内（含端点），单位是秒。
+2. points[].quote 必须是字幕原文逐字片段（≤ 80 字），不允许总结或转述；找不到合适字幕时写空字符串。
+3. 仅输出本章节字段，结构如下；其余字段（mainline / lecture_summary / 跨章节引用）禁止出现：
+{
+  "title": "中文章节标题",
+  "summary": "一段完整中文概览，介绍本章解决的问题和推进路径",
+  "learning_goal": "本章要解决的学习问题",
+  "teaching_notes": ["完整中文段落1", "段落2"],
+  "process_steps": ["如有连续可执行操作或机制阶段，按顺序写出；没有则留空"],
+  "points": [{"text": "论点", "ts": 0, "quote": "字幕原话"}],
+  "code_blocks": [{"language": "python", "code": "...", "ts": 0, "explanation": "...", "source": "ocr"}],
+  "formula_blocks": [{"latex": "...", "ts": 0, "explanation": "..."}],
+  "pitfalls": ["误区/边界 1"],
+  "key_takeaways": ["核心收获 1"],
+  "knowledge_units": [
+    {"term": "术语", "definition": "本章给出的解释", "confidence": 0.0, "ts": 0}
+  ]
+}
+4. confidence 是你对该术语在本章定义清晰度的自评（0-1）；越上下文充分越高。
+5. teaching_notes 写完整中文段落，不要空泛 bullet；公式/代码必须落到 formula_blocks / code_blocks，不要塞进文字段落。
+6. 如果本章字幕完全为空或与时间窗不匹配，仍返回上述结构，但 points 可为空，并把 summary 写成"本章字幕缺失，无法抽取"。
+"""
+
+
+LECTURE_IR_MAP_CHAPTER_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- 总时长: {duration_sec} 秒
+
+本章节窗口（务必遵守）：
+- 章节序号: 第 {chapter_index} 章
+- 起始: {chapter_start_sec} 秒
+- 结束: {chapter_end_sec} 秒
+- 锚点提示: {anchor_text}
+
+字幕（仅本章节范围，时间戳·文本）：
+{subtitle_block}
+
+关键帧视觉描述（仅本章节范围，时间戳·caption [· OCR]）：
+{frames_block}
+
+请输出该章节的 JSON。
+"""
+
+
+# ---------------------------------------------------------------------------
+# M2.P4 MapReduceIRBuilder — reduce-global pass prompt
+# ---------------------------------------------------------------------------
+# After the map stage produces N chapter dicts and ``reduce_local``
+# stitches them deterministically, this lightweight LLM call writes
+# the four lecture-level fields the per-chapter calls were forbidden
+# to touch. Output is intentionally minimal (no chapter internals)
+# so the prompt stays small and the call rarely exceeds 30s on epic
+# videos. The "REDUCE_GLOBAL" marker in the system text is also used
+# by the test suite stub to route map vs. global responders.
+
+LECTURE_IR_REDUCE_GLOBAL_SYSTEM = """\
+你是一名讲义全局编辑（REDUCE_GLOBAL）。已知一段视频的所有章节摘要（每章 title + summary + 头部要点 + 候选术语），请输出整片 lecture 的：
+
+- lecture_summary：一段中文综述（2-4 句话），点题、给出主要演化路径与边界。
+- mainline：用户视角的认知/操作主线，每条说明"为什么需要这一步"，并标 chapter_index。
+- glossary_resolved：术语去重后的最终定义；用户输入的 conflicts 已含每候选定义和 winning_chapter_index 候选，可直接采用或结合多章修订。
+- cross_references：章节之间的依赖/对比/引用关系；找不到则输出空数组。
+
+**绝不重写章节内部任何字段**（title / summary / points / code_blocks / formula_blocks 都不要再次输出）。
+仅输出顶层 4 字段，结构如下：
+{
+  "lecture_summary": "...",
+  "mainline": [{"step": 1, "title": "...", "ts": 0, "chapter_index": 1}],
+  "glossary_resolved": [{"term": "...", "definition": "...", "winning_chapter_index": 1}],
+  "cross_references": [{"from_chapter": 1, "to_chapter": 2, "relation": "depends_on|contrasts_with|elaborates|...."}]
+}
+"""
+
+
+LECTURE_IR_REDUCE_GLOBAL_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- 时长: {duration_sec} 秒
+
+章节摘要（按时间顺序，每条已含 title / summary / 头 3 个 points 文本）：
+{chapter_digest}
+
+术语冲突候选（来自 reduce_local；同一术语在多章中给出不同定义）：
+{glossary_conflicts}
+
+学习问题（study_questions）：
+{study_questions_block}
+
+请输出 lecture 全局摘要 JSON，注意只产出 4 个顶层字段。
+"""
