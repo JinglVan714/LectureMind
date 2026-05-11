@@ -208,13 +208,31 @@ class KeyframeExtractor:
             raise RuntimeError("ffmpeg not found in PATH")
         frames: list[Keyframe] = []
         for ts in timestamps:
-            fname = f"{int(ts * 1000):08d}.jpg"
+            # Quantise to milliseconds *before* both the filename and
+            # the in-memory ``Keyframe.timestamp`` so that the
+            # fresh-extraction path and the cached-reload path
+            # (:meth:`_frame_from_path`) produce byte-identical
+            # timestamp values for the same frame.  Without this
+            # quantisation the fresh path keeps PySceneDetect's
+            # microsecond-precision float (e.g. ``12.345678``) while a
+            # subsequent run reconstructs ``int(p.stem) / 1000.0`` =
+            # ``12.345`` from the filename, which then drifts the
+            # ``round(ts, 3)`` bucket in
+            # :func:`app.understand.chapter_cache.compute_prompt_hash`
+            # by 1 ms for nearly every frame and forces a 100 % miss
+            # on the per-chapter cache (epic ``BV1WEovBjEpd`` 二跑 was
+            # exactly this).  ``int(...)`` truncates toward zero,
+            # matching the filename formula so both paths stay in
+            # lockstep.
+            ts_ms = int(ts * 1000)
+            ts_quant = ts_ms / 1000.0
+            fname = f"{ts_ms:08d}.jpg"
             fpath = out_dir / fname
             cmd = [
                 "ffmpeg",
                 "-y",
                 "-ss",
-                f"{ts:.3f}",
+                f"{ts_quant:.3f}",
                 "-i",
                 str(video_path),
                 "-frames:v",
@@ -229,9 +247,9 @@ class KeyframeExtractor:
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode == 0 and fpath.exists():
-                frames.append(Keyframe(timestamp=ts, path=fpath))
+                frames.append(Keyframe(timestamp=ts_quant, path=fpath))
             else:
-                logger.warning("ffmpeg failed at ts=%.2f: %s", ts, proc.stderr[:200])
+                logger.warning("ffmpeg failed at ts=%.2f: %s", ts_quant, proc.stderr[:200])
         return frames
 
     @staticmethod
