@@ -241,14 +241,17 @@ def _build_model() -> Any:
 
     Lives behind a factory so tests can monkey-patch it to return a
     lightweight stub (see ``tests/test_copilot.py::TestAgent``).  Any
-    object with an async ``ainvoke(messages)`` method and a
+    object that exposes ``ainvoke(messages) -> AIMessage`` and a
     ``bind_tools(tools)`` chainable is acceptable.
 
     The Copilot shares the text pipeline's DeepSeek credentials
-    (``DEEPSEEK_API_KEY`` + ``DEEPSEEK_BASE_URL``). ``extra_body`` is
-    only forwarded when the configured base URL still points at a
-    DashScope-compatible Qwen endpoint — DeepSeek's ChatCompletions
-    rejects the Qwen-specific ``enable_thinking`` key.
+    (``DEEPSEEK_API_KEY`` + ``DEEPSEEK_BASE_URL``) and reuses
+    :func:`Settings.text_extra_body` so the thinking-mode disable shape
+    stays consistent with the lecturize / critic / reviser callers.
+    Disabling thinking is *mandatory* here: langchain-openai discards
+    DeepSeek's ``reasoning_content``, so the ReAct loop cannot echo it
+    back and the second turn would otherwise 400 with
+    ``"reasoning_content in the thinking mode must be passed back"``.
     """
     # Lazy import so pytest collection does not pay the LangChain import
     # cost for tests that do not touch the agent.
@@ -262,8 +265,9 @@ def _build_model() -> Any:
         "streaming": True,
         "temperature": 0.2,
     }
-    if "dashscope" in (settings.deepseek_base_url or "").lower():
-        kwargs["extra_body"] = {"enable_thinking": False}
+    extra_body = settings.text_extra_body()
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     return ChatOpenAI(**kwargs)
 
 

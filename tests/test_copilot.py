@@ -1327,6 +1327,88 @@ def _ai_chunk(text):
     return _Chunk()
 
 
+class TestDeepSeekThinkingDisable:
+    """Regression for the multi-turn 400 we hit on 2026-05-11:
+
+    DeepSeek V4 (``api.deepseek.com``) defaults to thinking mode for any
+    tool-call response. Its raw ``reasoning_content`` is *not* surfaced
+    by langchain-openai into ``additional_kwargs``, so the Copilot
+    ReAct loop cannot echo it back, and the second turn 400s with
+    ``"reasoning_content in the thinking mode must be passed back"``.
+
+    The fix lives in :meth:`Settings.text_extra_body` — it must emit the
+    DeepSeek-shaped ``{"thinking": {"type": "disabled"}}`` whenever the
+    text base URL points at deepseek.com **and** the user has not opted
+    back into thinking via ``QWEN_TEXT_ENABLE_THINKING=true``.
+    ``_build_model`` in the Copilot reuses this helper, keeping the
+    lecturize / critic / reviser path and the Copilot path in lock-step.
+    """
+
+    def _settings(self, **overrides):
+        from app.config import Settings
+
+        defaults = dict(
+            dashscope_api_key="placeholder",
+            deepseek_api_key="placeholder",
+            deepseek_base_url="https://api.deepseek.com",
+            qwen_text_model="deepseek-v4-flash",
+            qwen_copilot_model="deepseek-v4-flash",
+            basic_auth_password="placeholder",
+        )
+        defaults.update(overrides)
+        return Settings(**defaults)
+
+    def test_deepseek_base_url_disables_thinking_by_default(self):
+        body = self._settings().text_extra_body()
+        assert body == {"thinking": {"type": "disabled"}}
+
+    def test_dashscope_keeps_legacy_enable_thinking_key(self):
+        body = self._settings(
+            deepseek_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ).text_extra_body()
+        assert body == {"enable_thinking": False}
+
+    def test_user_opt_in_enables_thinking_on_deepseek(self):
+        body = self._settings(qwen_text_enable_thinking=True).text_extra_body()
+        assert body == {"thinking": {"type": "enabled"}}
+
+    def test_unknown_base_url_returns_empty_extra_body(self):
+        body = self._settings(deepseek_base_url="https://example.com/v1").text_extra_body()
+        assert body == {}
+
+    def test_copilot_build_model_forwards_text_extra_body(self, monkeypatch):
+        """``_build_model`` must thread ``text_extra_body()`` into ChatOpenAI.
+
+        We replace ``ChatOpenAI`` with a recorder so we can inspect the
+        kwargs without needing the real langchain-openai package, then
+        assert the disable struct showed up exactly once.
+        """
+        from app.config import get_settings
+        from app.copilot import agent as agent_mod
+
+        captured: dict[str, object] = {}
+
+        class _Recorder:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        # ``_build_model`` does ``from langchain_openai import ChatOpenAI``
+        # inside the function, so monkeypatch the module attribute it will
+        # resolve.
+        import langchain_openai
+
+        monkeypatch.setattr(langchain_openai, "ChatOpenAI", _Recorder)
+
+        # Force a fresh Settings object pointing at deepseek.com so the
+        # process-wide cached settings (which may use any URL) cannot leak.
+        settings = get_settings()
+        monkeypatch.setattr(settings, "deepseek_base_url", "https://api.deepseek.com")
+        monkeypatch.setattr(settings, "qwen_text_enable_thinking", False)
+
+        agent_mod._build_model()
+        assert captured.get("extra_body") == {"thinking": {"type": "disabled"}}
+
+
 class TestSSEHelpers:
     def test_sse_frame_encodes_cjk(self):
         raw = _sse_frame("token", {"delta": "中文 delta"})

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -60,10 +60,18 @@ class Settings(BaseSettings):
     )
     dashscope_request_timeout: float = Field(default=180.0, alias="DASHSCOPE_REQUEST_TIMEOUT")
     dashscope_trust_env: bool = Field(default=False, alias="DASHSCOPE_TRUST_ENV")
-    # Legacy flag — only honoured when the text model is clearly a Qwen
-    # model (base URL contains ``dashscope``). DeepSeek uses its own
-    # thinking-mode mechanism (model suffix) and would 400 on this extra
-    # body key, so it is suppressed automatically for DeepSeek traffic.
+    # Master switch for reasoning / thinking on text LLM calls.
+    #
+    # The same flag controls two API shapes:
+    #
+    # * DashScope Qwen endpoints take ``enable_thinking: bool``.
+    # * DeepSeek V4 (``api.deepseek.com``) takes
+    #   ``thinking: {"type": "adaptive"|"enabled"|"disabled"}`` instead and
+    #   400s on the Qwen key. When this flag is ``False`` we send
+    #   ``{"type": "disabled"}`` — required because the multi-turn Copilot
+    #   ReAct loop cannot echo DeepSeek's ``reasoning_content`` back through
+    #   langchain-openai, which otherwise breaks the second turn with
+    #   ``"reasoning_content in the thinking mode must be passed back"``.
     qwen_text_enable_thinking: bool = Field(default=False, alias="QWEN_TEXT_ENABLE_THINKING")
     qwen_vl_concurrency: int = Field(
         default=4,
@@ -560,16 +568,25 @@ class Settings(BaseSettings):
     def _is_dashscope_url(self, url: str) -> bool:
         return "dashscope" in (url or "").lower()
 
-    def text_extra_body(self) -> dict[str, bool]:
-        """Extra body for text LLM calls.
+    def text_extra_body(self) -> dict[str, Any]:
+        """Extra body for text LLM calls — route the master thinking flag to
+        whichever shape the configured backend expects.
 
-        Only emits ``{"enable_thinking": ...}`` when the **text client** is
-        pointing at a DashScope Qwen endpoint — DeepSeek toggles thinking
-        mode via the model name suffix and rejects this field, so we must
-        not send it on DeepSeek traffic.
+        * DashScope Qwen: ``{"enable_thinking": bool}``
+        * DeepSeek V4: ``{"thinking": {"type": "disabled"|"enabled"}}``;
+          required to keep the Copilot ReAct loop alive (see field comment
+          on ``qwen_text_enable_thinking``).
+        * Anything else: ``{}`` — let the backend pick its own default.
         """
-        if self._is_dashscope_url(self.deepseek_base_url):
+        base = self.deepseek_base_url or ""
+        if self._is_dashscope_url(base):
             return {"enable_thinking": self.qwen_text_enable_thinking}
+        if "deepseek.com" in base.lower():
+            return {
+                "thinking": {
+                    "type": "enabled" if self.qwen_text_enable_thinking else "disabled"
+                }
+            }
         return {}
 
     # ---- Derived paths ----
