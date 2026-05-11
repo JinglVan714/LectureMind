@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -14,6 +15,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # Allow constructor kwargs by field name (in addition to alias)
+        # so tests and internal callers can build Settings without
+        # remembering every uppercase env-var name.
+        populate_by_name=True,
     )
 
     # ---- Models ----
@@ -176,13 +181,46 @@ class Settings(BaseSettings):
         default=False,
         alias="LECTURE_REVISER_ENABLED",
         description=(
-            "When true, allow the Critic-Reviser loop to actually call the "
-            "Reviser to rewrite the IR based on critic issues. Defaults to "
-            "false because the full-IR rewrite is the slowest stage and is "
-            "the primary cause of long-video timeouts. With this off the "
-            "Critic still runs and its issues are recorded for later use; "
-            "turn it on for short / medium / code videos when latency is "
-            "acceptable in exchange for higher coverage."
+            "Legacy on/off switch for the Critic-Reviser loop. Kept for "
+            "back-compat — prefer ``LECTURE_REVISER_MODE``. When "
+            "``LECTURE_REVISER_MODE`` is *not* explicitly set, this flag "
+            "is mapped at load-time to ``mode='full'`` (true) or "
+            "``mode='off'`` (false). When ``LECTURE_REVISER_MODE`` is "
+            "set explicitly it always wins."
+        ),
+    )
+    lecture_reviser_mode: Literal["off", "patch", "full"] = Field(
+        default="off",
+        alias="LECTURE_REVISER_MODE",
+        description=(
+            "Reviser dispatch mode (M2). 'off' disables the Reviser "
+            "while still letting the Critic audit the IR. 'patch' "
+            "applies a whitelist of structured edits returned by the "
+            "Reviser (introduced in M2.P6). 'full' rewrites the entire "
+            "IR (legacy behaviour, slowest path). Default 'off' "
+            "preserves M1 behaviour; M2.P6 will flip the recommended "
+            "default to 'patch'."
+        ),
+    )
+
+    # ---- M2 length-aware routing ----
+    # Boundary policy: thresholds are exclusive on the lower side, so a
+    # video with duration_sec == tiny_th maps to ``standard``. Set via
+    # CSV string in .env (e.g. ``LECTURE_PROFILE_THRESHOLDS_SEC=180,1500,3600``).
+    # ``NoDecode`` disables pydantic-settings' default JSON-decoding for
+    # this complex type so the raw CSV string from .env reaches our
+    # ``_parse_profile_thresholds`` validator intact (otherwise
+    # ``"180,1500,3600"`` would explode in ``json.loads``).
+    lecture_profile_thresholds_sec: Annotated[
+        tuple[int, int, int], NoDecode
+    ] = Field(
+        default=(180, 1500, 3600),
+        alias="LECTURE_PROFILE_THRESHOLDS_SEC",
+        description=(
+            "Three ascending integers (seconds) splitting tiny / "
+            "standard / long / epic profiles. Default (180, 1500, 3600) "
+            "= (<3min / <25min / <60min / 60+min). Override via CSV "
+            "string."
         ),
     )
     lecture_critic_max_rounds: int = Field(
@@ -262,6 +300,65 @@ class Settings(BaseSettings):
     bocha_base_url: str = Field(default="https://api.bochaai.com/v1/web-search", alias="BOCHA_BASE_URL")
     mcp_server_token: str = Field(default="", alias="MCP_SERVER_TOKEN")
     mcp_expose_summarize: bool = Field(default=False, alias="MCP_EXPOSE_SUMMARIZE")
+
+    # ---- Validators ----
+    @field_validator("lecture_profile_thresholds_sec", mode="before")
+    @classmethod
+    def _parse_profile_thresholds(cls, v):
+        """Accept either a CSV string from .env or a native tuple/list.
+
+        Pydantic-settings would otherwise try to JSON-decode tuples and
+        reject ``"180,1500,3600"`` outright. We normalise to a 3-tuple
+        of strictly ascending ints here so downstream callers can rely
+        on the invariant.
+        """
+        if isinstance(v, str):
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            if len(parts) != 3:
+                raise ValueError(
+                    "LECTURE_PROFILE_THRESHOLDS_SEC must be 3 comma-separated"
+                    f" ints, got {v!r}"
+                )
+            try:
+                v = tuple(int(p) for p in parts)
+            except ValueError as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    "LECTURE_PROFILE_THRESHOLDS_SEC contains a non-integer"
+                    f" segment: {v!r}"
+                ) from exc
+        if isinstance(v, (list, tuple)):
+            if len(v) != 3:
+                raise ValueError(
+                    "LECTURE_PROFILE_THRESHOLDS_SEC must contain exactly 3"
+                    f" values, got {len(v)}"
+                )
+            ints = tuple(int(x) for x in v)
+            if not (ints[0] < ints[1] < ints[2]):
+                raise ValueError(
+                    "LECTURE_PROFILE_THRESHOLDS_SEC must be strictly"
+                    f" ascending, got {ints}"
+                )
+            return ints
+        return v
+
+    @model_validator(mode="after")
+    def _apply_reviser_mode_compat(self) -> "Settings":
+        """Map legacy ``LECTURE_REVISER_ENABLED`` to ``LECTURE_REVISER_MODE``.
+
+        Only applies when ``lecture_reviser_mode`` was *not* explicitly
+        set (env var or constructor kwarg). When the user has set the
+        new field directly, it always wins. The mapping is::
+
+            enabled=True  & mode unset → mode='full'  (legacy behaviour)
+            enabled=False & mode unset → mode='off'   (legacy behaviour)
+        """
+        if "lecture_reviser_mode" not in self.model_fields_set:
+            new_mode = "full" if self.lecture_reviser_enabled else "off"
+            # Settings is mutable (BaseSettings is not frozen) so a plain
+            # attribute assignment is enough; ``object.__setattr__`` keeps
+            # us safe even if someone freezes the model later.
+            object.__setattr__(self, "lecture_reviser_mode", new_mode)
+        return self
 
     # ---- Derived helpers ----
     def _is_dashscope_url(self, url: str) -> bool:
