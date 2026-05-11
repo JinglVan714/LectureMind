@@ -146,20 +146,33 @@ class LectureIRBuilder:
         question_driven: bool | None = None,
         critic_enabled: bool | None = None,
         reviser_enabled: bool | None = None,
+        profile: Any = None,
+        chapter_plan: list[Any] | None = None,
+        chapter_cache: Any = None,
     ) -> tuple[LectureIR, dict[str, Any]]:
         """Production path: question-driven extraction + critic-reviser loop.
 
         Order:
 
         1. (optional) ``StudyQuestionAgent`` — produces ``study_questions``.
-        2. ``LectureIRBuilder`` (this class) — same single-pass call as
-           :meth:`build` but with both the length budget and the study
-           questions injected into the user message.
-        3. (optional) ``CriticReviserAgent`` — runs the Critic to audit
-           coverage / missing code / dubious quotes, then optionally
-           runs the Reviser (gated by ``reviser_enabled``) for ≤ N
-           rounds of critique-and-revise. If any round leaves the
-           schema invalid we silently keep the previous valid IR.
+        2. IR build:
+
+           * When ``profile.use_map_reduce`` is True (long / epic), call
+             :class:`MapReduceIRBuilder` and feed it the
+             ``chapter_plan`` (required) plus the same study questions
+             so the global pass can synthesise a coherent mainline.
+           * Otherwise (legacy / tiny / standard), do a single-pass
+             :meth:`_call` with the budget, study questions and the
+             optional chapter_plan rendered into the prompt.
+        3. (optional) Critic + Reviser:
+
+           * When ``profile`` is provided, dispatch through
+             :meth:`_run_critic_loop_v2` (audit() + reviser_mode
+             dispatch), so the per-profile patch / projected behaviour
+             from P5 / P6 is honoured.
+           * When ``profile`` is None, fall back to the M1-era
+             :meth:`_run_critic_loop` so existing callers and tests
+             keep working unchanged.
         """
         s = self._settings
         if question_driven is None:
@@ -202,25 +215,70 @@ class LectureIRBuilder:
             finally:
                 study_question_sec = time.perf_counter() - t_q
 
-        # 2. Initial IR build with budget + questions
-        user = self._user_message(ctx, budget=budget, study_questions=questions)
-        t_initial = time.perf_counter()
-        raw, usage = await self._call(user)
-        initial_ir_sec = time.perf_counter() - t_initial
-        _accumulate_usage(usage_aggregate, usage)
-        t_validate = time.perf_counter()
-        ir_json = self._parse_to_dict(raw, ctx)
-        # Make sure study questions survive even if the LLM ignored them.
-        if questions and not ir_json.get("study_questions"):
-            ir_json["study_questions"] = list(questions)
-        ir = self._validate_dict(ir_json, ctx, raw)
-        validate_sec = time.perf_counter() - t_validate
+        # 2. Initial IR build — either map-reduce (long / epic) or
+        # single-pass (tiny / standard / legacy). Both paths fill
+        # ``ir`` and tally ``initial_ir_sec`` so downstream telemetry
+        # stays comparable across profiles.
+        map_reduce_stats: Any = None
+        use_map_reduce = bool(profile is not None and getattr(profile, "use_map_reduce", False))
+        validate_sec = 0.0
+        if use_map_reduce:
+            from .ir_map_reduce import MapReduceIRBuilder
 
+            mr_builder = MapReduceIRBuilder(
+                client=self._client,
+                settings=s,
+                profile=profile,
+                chapter_cache=chapter_cache,
+            )
+            t_initial = time.perf_counter()
+            ir, map_reduce_stats = await mr_builder.build(
+                chapter_plan=list(chapter_plan or []),
+                segments=ctx.segments,
+                frames=ctx.frame_descs,
+                meta=ctx,
+                study_questions=questions,
+            )
+            initial_ir_sec = time.perf_counter() - t_initial
+            # Map-reduce keeps its own usage telemetry separate; we do
+            # not double-count here.
+        else:
+            user = self._user_message(
+                ctx,
+                budget=budget,
+                study_questions=questions,
+                chapter_plan=chapter_plan,
+            )
+            t_initial = time.perf_counter()
+            raw, usage = await self._call(user)
+            initial_ir_sec = time.perf_counter() - t_initial
+            _accumulate_usage(usage_aggregate, usage)
+            t_validate = time.perf_counter()
+            ir_json = self._parse_to_dict(raw, ctx)
+            # Make sure study questions survive even if the LLM ignored them.
+            if questions and not ir_json.get("study_questions"):
+                ir_json["study_questions"] = list(questions)
+            ir = self._validate_dict(ir_json, ctx, raw)
+            validate_sec = time.perf_counter() - t_validate
+
+        # 3. Critic + Reviser
         critique: CritiqueResult | None = None
         revise_rounds = 0
         critic_sec = 0.0
         reviser_sec = 0.0
-        if critic_enabled and questions:  # only run when we have a goal
+        reviser_telemetry: dict[str, Any] | None = None
+        if profile is not None:
+            critique, ir, revise_rounds, critic_usage, critic_timing = (
+                await self._run_critic_loop_v2(
+                    ctx, ir, questions, profile=profile
+                )
+            )
+            for u in critic_usage:
+                _accumulate_usage(usage_aggregate, u)
+            critic_sec = critic_timing.get("critic_sec", 0.0)
+            reviser_sec = critic_timing.get("reviser_sec", 0.0)
+            reviser_telemetry = critic_timing.get("reviser")
+        elif critic_enabled and questions:  # legacy path, only with study questions
             critique, ir, revise_rounds, critic_usage, critic_timing = await self._run_critic_loop(
                 ctx, ir, questions, reviser_enabled=reviser_enabled
             )
@@ -229,7 +287,7 @@ class LectureIRBuilder:
             critic_sec = critic_timing.get("critic_sec", 0.0)
             reviser_sec = critic_timing.get("reviser_sec", 0.0)
 
-        return ir, {
+        stats: dict[str, Any] = {
             "tokens": usage_aggregate,
             "model": self._model,
             "stage": "lecture_ir_v3",
@@ -247,6 +305,21 @@ class LectureIRBuilder:
                 "validate_sec": round(validate_sec, 3),
             },
         }
+        if reviser_telemetry is not None:
+            stats["reviser"] = reviser_telemetry
+        if map_reduce_stats is not None:
+            mr = map_reduce_stats
+            stats["map_reduce"] = {
+                "map_calls": getattr(mr, "map_calls", 0),
+                "cache_hits": getattr(mr, "cache_hits", 0),
+                "cache_writes": getattr(mr, "cache_writes", 0),
+                "map_failures": list(getattr(mr, "map_failures", ()) or ()),
+                "map_total_sec": round(float(getattr(mr, "map_total_sec", 0.0)), 3),
+                "reduce_local_sec": round(float(getattr(mr, "reduce_local_sec", 0.0)), 3),
+                "reduce_global_sec": round(float(getattr(mr, "reduce_global_sec", 0.0)), 3),
+                "reduce_global_attempts": getattr(mr, "reduce_global_attempts", 0),
+            }
+        return ir, stats
 
     # ------------------------------------------------------------------
     # Internals
@@ -412,6 +485,173 @@ class LectureIRBuilder:
             usages,
             timing,
         )
+
+    async def _run_critic_loop_v2(
+        self,
+        ctx: LecturizeContext,
+        ir: LectureIR,
+        study_questions: list[str],
+        *,
+        profile: Any,
+    ) -> tuple[
+        "CritiqueResult | None",
+        LectureIR,
+        int,
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
+        """M2 P7 profile-driven Critic + Reviser dispatch.
+
+        Branches:
+
+        * ``profile.critic_mode == 'off'`` (tiny) → noop, returns the IR
+          unchanged with an empty :class:`CritiqueResult`-like shape.
+        * Otherwise build a :class:`CriticContext` (full or projected per
+          ``profile.critic_mode``), call
+          :meth:`CriticReviserAgent.audit`, and dispatch by
+          ``profile.reviser_mode``:
+
+          * ``off``: do not invoke the Reviser; the Critic's findings
+            still surface in the report but the IR is returned as-is.
+          * ``patch``: call
+            :meth:`CriticReviserAgent.revise_patch` and apply the
+            whitelisted patches via :func:`ir_patches.apply_patches`.
+          * ``full``: fall back to the legacy
+            :meth:`CriticReviserAgent.revise` rewrite path so existing
+            integrators (and the ``LECTURE_REVISER_MODE=full`` opt-in)
+            keep working.
+
+        Returns ``(critique, latest_ir, rounds, usages, telemetry)``
+        where ``telemetry`` carries ``critic_sec`` /
+        ``reviser_sec`` (always) plus a ``reviser`` dict
+        (mode/proposed/applied/rejected/unfixable) when the Reviser
+        actually ran.
+        """
+        from .critic_context import build_critic_context
+        from .ir_patches import apply_patches
+
+        empty = CritiqueResult("ok", "(critic off)", [], {})
+        telemetry: dict[str, Any] = {
+            "critic_sec": 0.0,
+            "reviser_sec": 0.0,
+        }
+        if profile is None or getattr(profile, "critic_mode", "off") == "off":
+            return empty, ir, 0, [], telemetry
+
+        if self._critic_agent is None:
+            self._critic_agent = CriticReviserAgent()
+
+        max_rounds = int(getattr(self._settings, "lecture_critic_max_rounds", 1) or 0)
+        reviser_mode = str(getattr(profile, "reviser_mode", "off") or "off").lower()
+        latest_ir = ir
+        latest_critique: CritiqueResult | None = None
+        usages: list[dict[str, Any]] = []
+        rounds = 0
+        critic_sec = 0.0
+        reviser_sec = 0.0
+        reviser_summary: dict[str, Any] = {
+            "mode": reviser_mode,
+            "proposed": 0,
+            "applied": 0,
+            "rejected": 0,
+            "rejected_reasons": [],
+            "unfixable": 0,
+            "schema_rollbacks": 0,
+        }
+
+        for _ in range(max(1, max_rounds + 1)):
+            context = build_critic_context(
+                profile,
+                ir=latest_ir,
+                segments=ctx.segments,
+                frames=ctx.frame_descs,
+                study_questions=study_questions,
+            )
+            t_c = time.perf_counter()
+            critique = await self._critic_agent.audit(context)
+            critic_sec += time.perf_counter() - t_c
+            usages.append(critique.usage or {})
+            latest_critique = critique
+
+            if (
+                reviser_mode == "off"
+                or critique.verdict != "needs_revision"
+                or not critique.issues
+                or rounds >= max_rounds
+            ):
+                break
+
+            if reviser_mode == "patch":
+                t_r = time.perf_counter()
+                result = await self._critic_agent.revise_patch(
+                    context=context, issues=critique.issues
+                )
+                reviser_sec += time.perf_counter() - t_r
+                usages.append(result.usage or {})
+                proposed = list(result.patches or [])
+                rejected_pre = list(result.rejected or [])
+                reviser_summary["proposed"] += len(proposed)
+                reviser_summary["unfixable"] += len(result.unfixable_issues or [])
+                if not proposed:
+                    reviser_summary["rejected"] += len(rejected_pre)
+                    for rp in rejected_pre:
+                        reviser_summary["rejected_reasons"].append(rp.reason)
+                    break
+                next_ir, rejected_app = apply_patches(latest_ir, proposed)
+                applied = max(0, len(proposed) - len(rejected_app))
+                # apply_patches signals schema rollback by appending a
+                # RejectedPatch with patch=None and a 'schema_violation:'
+                # prefix; keep that as the visible rollback counter.
+                rollbacks = sum(
+                    1
+                    for rp in rejected_app
+                    if rp.patch is None
+                    and (rp.reason or "").startswith("schema_violation")
+                )
+                reviser_summary["applied"] += applied
+                reviser_summary["rejected"] += len(rejected_pre) + len(rejected_app)
+                reviser_summary["schema_rollbacks"] += rollbacks
+                for rp in rejected_pre + rejected_app:
+                    reviser_summary["rejected_reasons"].append(rp.reason)
+                if next_ir is latest_ir or applied == 0:
+                    # Either fully rolled back (schema violation) or every
+                    # patch rejected — no productive change, stop the loop.
+                    break
+                latest_ir = next_ir
+                rounds += 1
+                continue
+
+            if reviser_mode == "full":
+                t_r = time.perf_counter()
+                revised, rev_usage = await self._critic_agent.revise(
+                    ctx, latest_ir.model_dump(mode="json"), critique.issues
+                )
+                reviser_sec += time.perf_counter() - t_r
+                usages.append(rev_usage or {})
+                if not revised:
+                    break
+                try:
+                    hydrate_lecture_ir_data(revised, ctx)
+                    revised_ir = LectureIR.model_validate(revised)
+                except (ValidationError, RuntimeError, ValueError) as exc:
+                    logger.warning(
+                        "Reviser produced invalid IR; keeping previous: %s", exc
+                    )
+                    break
+                latest_ir = _restore_dropped_content(latest_ir, revised_ir)
+                rounds += 1
+                continue
+
+            logger.warning(
+                "Unknown reviser_mode=%r; treating as off", reviser_mode
+            )
+            break
+
+        telemetry["critic_sec"] = critic_sec
+        telemetry["reviser_sec"] = reviser_sec
+        if reviser_mode != "off":
+            telemetry["reviser"] = reviser_summary
+        return (latest_critique or empty, latest_ir, rounds, usages, telemetry)
 
     def _dump_raw(self, bv_id: str, raw: str, *, reason: str) -> Path:
         s = get_settings()

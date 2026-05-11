@@ -22,9 +22,13 @@ from .ingest.keyframe import KeyframeExtractor
 from .ingest.subtitle import SubtitleExtractor
 from .render.renderer import Renderer
 from .storage.db import Database
+from .understand.chapter_cache import make_chapter_cache_from_settings
+from .understand.chapter_planner import plan_chapters
 from .understand.ir import LectureIR
 from .understand.ir_builder import LectureIRBuilder, lecture_ir_to_lecture_json
 from .understand.lecturize import LecturizeContext, Lecturizer
+from .understand.length_adapt import LengthBudget
+from .understand.profile import select_profile
 from .understand.schema import Frame as LectureFrame
 from .understand.vlm import FrameDescriber, FrameDescription
 
@@ -158,6 +162,68 @@ class Pipeline:
             segments=sub_result.segments,
             frame_descs=frame_descs,
         )
+
+        # M2 P7: route by length profile. The profile selects which
+        # downstream components get to run (chapter planner, chapter
+        # cache, map-reduce IR, projected Critic, patch Reviser) so
+        # each video class can spend its token / latency budget where
+        # it actually matters.
+        profile = select_profile(meta.duration, self.settings)
+        timing["profile"] = {
+            "name": profile.name,
+            "duration_sec": float(profile.duration_sec),
+            "use_chapter_planner": profile.use_chapter_planner,
+            "use_map_reduce": profile.use_map_reduce,
+            "use_chapter_cache": profile.use_chapter_cache,
+            "critic_mode": profile.critic_mode,
+            "reviser_mode": profile.reviser_mode,
+            "study_question_mode": profile.study_question_mode,
+            "chapter_planner_mode": profile.chapter_planner_mode,
+        }
+
+        # Chapter planner — always runs (per spec) but the profile picks
+        # `hint` vs `structural` which only differs in how the anchors
+        # are surfaced to the LLM. Failures degrade to an empty plan
+        # rather than fail the whole pipeline.
+        chapter_plan: list[Any] = []
+        chapter_plan_sec = 0.0
+        if profile.use_chapter_planner:
+            t_plan = time.perf_counter()
+            try:
+                ir_budget = LengthBudget.for_duration(
+                    meta.duration,
+                    keyframe_base_min=self.settings.keyframe_min,
+                    keyframe_base_max=self.settings.keyframe_max,
+                )
+                chapter_plan = list(
+                    plan_chapters(
+                        profile=profile,
+                        duration_sec=float(meta.duration),
+                        segments=sub_result.segments,
+                        frames=frame_descs,
+                        chapters_min=ir_budget.chapters_min,
+                        chapters_max=ir_budget.chapters_max,
+                        settings=self.settings,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ChapterPlanner failed (degrading to empty): %s", exc)
+                chapter_plan = []
+            chapter_plan_sec = time.perf_counter() - t_plan
+        timing["chapter_plan"] = {
+            "anchors": len(chapter_plan),
+            "mode": profile.chapter_planner_mode if profile.use_chapter_planner else None,
+            "sec": round(chapter_plan_sec, 3),
+        }
+
+        chapter_cache_obj = None
+        if profile.use_chapter_cache:
+            try:
+                chapter_cache_obj = make_chapter_cache_from_settings(self.settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ChapterCache init failed (skipping): %s", exc)
+                chapter_cache_obj = None
+
         lecture_ir: LectureIR | None = None
         try:
             # Use the multi-agent path (study questions + critic-reviser
@@ -168,7 +234,12 @@ class Pipeline:
                 or getattr(self.settings, "lecture_critic_enabled", True)
             )
             if use_agents:
-                lecture_ir, stats = await self.ir_builder.build_with_agents(ctx)
+                lecture_ir, stats = await self.ir_builder.build_with_agents(
+                    ctx,
+                    profile=profile,
+                    chapter_plan=chapter_plan,
+                    chapter_cache=chapter_cache_obj,
+                )
             else:
                 lecture_ir, stats = await self.ir_builder.build(ctx)
             self._dump_ir(meta.bv_id, lecture_ir.model_dump(mode="json"))
@@ -190,6 +261,25 @@ class Pipeline:
         if isinstance(stats, dict) and stats.get("agent_timing"):
             timing["agent_timing"] = stats.get("agent_timing")
         timing["revise_rounds"] = stats.get("revise_rounds") if isinstance(stats, dict) else 0
+        # M2 P7: surface map-reduce / reviser / chapter-cache telemetry
+        # into ``timing`` so the verifier and matrix can inspect them
+        # without re-deriving from stats.
+        if isinstance(stats, dict):
+            if "map_reduce" in stats:
+                timing["map_reduce"] = stats["map_reduce"]
+            if "reviser" in stats:
+                timing["reviser"] = stats["reviser"]
+            if isinstance(stats.get("critique"), dict):
+                timing["critic"] = {
+                    "verdict": stats["critique"].get("verdict"),
+                    "issue_count": len(stats["critique"].get("issues") or []),
+                    "metrics": stats["critique"].get("metrics") or {},
+                }
+        if chapter_cache_obj is not None:
+            try:
+                timing["chapter_cache"] = chapter_cache_obj.stats()
+            except Exception:  # noqa: BLE001
+                timing["chapter_cache"] = {}
         self.last_run_stats = stats if isinstance(stats, dict) else {}
 
         # Repair the LLM-supplied taxonomy: white-list the domain, strip

@@ -35,6 +35,8 @@ from .length_adapt import LengthBudget, study_questions_target
 from .critic_context import CriticContext
 from .ir_patches import IRPatch, RevisePatchResult
 from .prompts import (
+    LECTURE_CRITIC_FULL_USER_TEMPLATE,
+    LECTURE_CRITIC_PROJECTED_USER_TEMPLATE,
     LECTURE_CRITIC_SYSTEM,
     LECTURE_CRITIC_USER_TEMPLATE,
     LECTURE_REVISER_PATCH_SYSTEM,
@@ -687,6 +689,155 @@ class CriticReviserAgent:
             metrics=metrics,
         )
 
+    async def audit(self, context: CriticContext) -> CritiqueResult:
+        """M2 P7 Critic dispatcher driven by :class:`CriticContext`.
+
+        Picks ``LECTURE_CRITIC_FULL_USER_TEMPLATE`` for the standard
+        profile (full IR + segments + frames) and
+        ``LECTURE_CRITIC_PROJECTED_USER_TEMPLATE`` for long / epic
+        (lecture-level IR projection only, no segments / no frames).
+
+        ``self._critic_timeout`` is reused for both modes — the prompt
+        size, not the timeout, is the per-profile lever (projected
+        prompts are ~10x smaller than full so finish well under the
+        same wall-clock budget).
+        """
+        if context.mode not in {"full", "projected"}:
+            raise ValueError(f"audit(): unsupported context.mode={context.mode!r}")
+
+        ir_json_str = json.dumps(
+            context.ir_payload, ensure_ascii=False, indent=2
+        )
+        sq_block = (
+            "\n".join(
+                f"- {q.get('question', '')}"
+                for q in (context.study_questions_payload or [])
+                if isinstance(q, dict)
+            )
+            or "(无)"
+        )
+        bv_id = str(context.ir_payload.get("bv_id", ""))
+        title = str(context.ir_payload.get("title", ""))
+        duration = float(context.ir_payload.get("duration", 0.0) or 0.0)
+
+        if context.mode == "full":
+            subtitle_block = _format_segments_payload(
+                context.segments_payload or []
+            ) or "(无)"
+            frames_block = _format_frames_payload(
+                context.frames_payload or []
+            ) or "(无)"
+            user = LECTURE_CRITIC_FULL_USER_TEMPLATE.format(
+                bv_id=bv_id,
+                title=title,
+                duration=duration,
+                study_questions=sq_block,
+                lecture_ir_json=ir_json_str,
+                subtitle_block=subtitle_block,
+                frames_block=frames_block,
+            )
+        else:
+            user = LECTURE_CRITIC_PROJECTED_USER_TEMPLATE.format(
+                bv_id=bv_id,
+                title=title,
+                duration=duration,
+                study_questions=sq_block,
+                lecture_ir_json=ir_json_str,
+            )
+
+        metrics = {
+            "critic_prompt_chars": len(user),
+            "critic_mode": context.mode,
+            "critic_profile": context.profile_name,
+            "critic_segments_kept": len(context.segments_payload or []),
+            "critic_frames_kept": len(context.frames_payload or []),
+            "critic_skip_quote_validation": bool(context.skip_quote_validation),
+        }
+
+        async def _do_call() -> Any:
+            return await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": LECTURE_CRITIC_SYSTEM},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                timeout=self._critic_timeout,
+                extra_body=self._extra_body,
+            )
+
+        try:
+            resp = await _do_call()
+        except APITimeoutError as exc:
+            logger.warning("Audit LLM call timed out (%s); retrying once", exc)
+            try:
+                resp = await _do_call()
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("Audit LLM retry also failed: %s", exc2)
+                if self._strict:
+                    raise
+                return CritiqueResult(
+                    verdict="ok",
+                    summary="(audit skipped)",
+                    issues=[],
+                    usage={},
+                    metrics=metrics,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Audit LLM call failed: %s", exc)
+            if self._strict:
+                raise
+            return CritiqueResult(
+                verdict="ok",
+                summary="(audit skipped)",
+                issues=[],
+                usage={},
+                metrics=metrics,
+            )
+
+        content = resp.choices[0].message.content or ""
+        try:
+            obj = _extract_json(content)
+        except ValueError as exc:
+            logger.warning("Audit returned non-JSON: %s", exc)
+            if self._strict:
+                raise
+            return CritiqueResult(
+                verdict="ok",
+                summary="(audit non-json)",
+                issues=[],
+                usage=_usage(resp),
+                metrics=metrics,
+            )
+
+        raw_issues = obj.get("issues") or []
+        issues: list[CritiqueIssue] = []
+        if isinstance(raw_issues, list):
+            for it in raw_issues:
+                if not isinstance(it, dict):
+                    continue
+                issues.append(
+                    CritiqueIssue(
+                        kind=str(it.get("kind") or "other").strip(),
+                        severity=str(it.get("severity") or "medium").strip(),
+                        location=str(it.get("location") or "").strip(),
+                        evidence=str(it.get("evidence") or "").strip(),
+                        suggestion=str(it.get("suggestion") or "").strip(),
+                    )
+                )
+        verdict = str(obj.get("verdict") or "").strip().lower()
+        if verdict not in {"ok", "needs_revision"}:
+            verdict = "needs_revision" if issues else "ok"
+        summary = str(obj.get("summary") or "").strip()
+        return CritiqueResult(
+            verdict=verdict,
+            summary=summary,
+            issues=issues,
+            usage=_usage(resp),
+            metrics=metrics,
+        )
+
     async def revise(
         self,
         ctx: LecturizeContext,
@@ -979,6 +1130,43 @@ def _format_reviser_frames(ctx: LecturizeContext, issues: list[CritiqueIssue]) -
             ),
         )
     return _format_frames(sorted(frames[:_MAX_REVISER_FRAMES], key=lambda f: f.timestamp))
+
+
+def _format_segments_payload(payloads: list[dict[str, Any]]) -> str:
+    """Render :class:`CriticContext` segment payloads (``{ts,end,text}``).
+
+    Mirrors :func:`lecturize._format_segments` but consumes plain dicts so
+    the audit() Critic dispatcher can stay decoupled from
+    :class:`SubtitleSegment`.
+    """
+    lines: list[str] = []
+    for p in payloads or []:
+        if not isinstance(p, dict):
+            continue
+        ts = float(p.get("ts", 0.0) or 0.0)
+        text = str(p.get("text", "") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{ts:.1f}s] {text}")
+    return "\n".join(lines)
+
+
+def _format_frames_payload(payloads: list[dict[str, Any]]) -> str:
+    """Render :class:`CriticContext` frame payloads (``{ts,ocr,caption}``).
+
+    Mirrors :func:`lecturize._format_frames` but consumes plain dicts.
+    """
+    lines: list[str] = []
+    for p in payloads or []:
+        if not isinstance(p, dict):
+            continue
+        ts = float(p.get("ts", 0.0) or 0.0)
+        caption = str(p.get("caption", "") or "").strip()
+        ocr = str(p.get("ocr", "") or "").strip()
+        bits = [bit for bit in (caption, f"OCR: {ocr}" if ocr else "") if bit]
+        body = " · ".join(bits) if bits else "(空)"
+        lines.append(f"[{ts:.1f}s] {body}")
+    return "\n".join(lines)
 
 
 def _usage(resp: Any) -> dict[str, Any]:

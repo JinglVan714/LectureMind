@@ -55,7 +55,9 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info(
         "LectureMind ready · data_dir=%s · vec=%s · "
         "text=%s@%s · vl=%s@%s · copilot=%s@%s · "
-        "vlm_tiering=%s · vlm_cache=%s · chapter_cache=%s",
+        "profile_router=on · chapter_planner=on · "
+        "chapter_cache=%s · reviser_mode=%s · "
+        "vlm_tiering=%s · vlm_cache=%s",
         settings.data_dir.resolve(),
         getattr(rag, "vec_available", False),
         settings.qwen_text_model,
@@ -64,9 +66,10 @@ async def lifespan(app: FastAPI):
         settings.dashscope_base_url,
         settings.qwen_copilot_model,
         settings.deepseek_base_url,
+        "on" if settings.lecture_chapter_cache_enabled else "off",
+        settings.lecture_reviser_mode,
         "on" if settings.vlm_tiering_enabled else "off",
         "on" if settings.vlm_cache_enabled else "off",
-        "on" if settings.lecture_chapter_cache_enabled else "off",
     )
     try:
         yield
