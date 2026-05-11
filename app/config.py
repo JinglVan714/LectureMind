@@ -340,6 +340,32 @@ class Settings(BaseSettings):
             "with LECTURE_CRITIC_TIMEOUT."
         ),
     )
+    # M2.P5 per-profile Critic timeouts. Standard profile keeps using
+    # the legacy ``lecture_critic_timeout`` (300s) for backward compat
+    # — the M1 critique() path is unchanged in P5. The two new knobs
+    # below are consumed by the upcoming :func:`audit` entrypoint
+    # wired from P7 onwards: full-mode tracks the legacy budget, while
+    # projected-mode is leaner because the prompt drops segments /
+    # frames / point-quote bodies (spec §3.5).
+    lecture_critic_full_timeout: float = Field(
+        default=180.0,
+        alias="LECTURE_CRITIC_FULL_TIMEOUT",
+        description=(
+            "Timeout for the full-mode Critic LLM call (standard "
+            "profile). Spec §3.5 default 180s; consumed by P7 "
+            "wiring, not the legacy critique() path."
+        ),
+    )
+    lecture_critic_projected_timeout: float = Field(
+        default=120.0,
+        alias="LECTURE_CRITIC_PROJECTED_TIMEOUT",
+        description=(
+            "Timeout for the projected-mode Critic LLM call "
+            "(long / epic profiles). Spec §3.5 default 120s; the "
+            "projection drops segments / frames / point quotes so "
+            "the budget is smaller than full-mode by design."
+        ),
+    )
     lecture_critic_max_prompt_chars: int = Field(
         default=24000,
         alias="LECTURE_CRITIC_MAX_PROMPT_CHARS",

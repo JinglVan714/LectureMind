@@ -156,6 +156,68 @@ LECTURE_CRITIC_USER_TEMPLATE = """\
 请输出审稿 JSON。
 """
 
+# M2.P5 — explicit alias for the existing template so the future
+# ``audit()`` entrypoint (P7) can pick a per-mode template by literal
+# name without renaming and breaking external imports of
+# ``LECTURE_CRITIC_USER_TEMPLATE``.
+LECTURE_CRITIC_FULL_USER_TEMPLATE = LECTURE_CRITIC_USER_TEMPLATE
+
+
+# M2.P5 — projected-mode Critic prompt for long / epic profiles.
+# The IR payload is already projected (lecture-level only: summary /
+# mainline / glossary / cross_references / chapter shells). Segments
+# and frames are intentionally absent — quote validation happens in
+# the map stage, so the prompt explicitly forbids quote-level checks
+# here to prevent the LLM from hallucinating ``dubious_quote`` issues
+# without evidence. The 5 checks below match spec §3.5 verbatim.
+LECTURE_CRITIC_PROJECTED_USER_TEMPLATE = """\
+视频元数据：
+- BV: {bv_id}
+- 标题: {title}
+- 时长: {duration} 秒
+
+学习问题（若有）：
+{study_questions}
+
+讲义投影（仅 lecture-level，结构化字段；section/章节明细已被聚合，无 quote / 字幕原文）：
+```json
+{lecture_ir_json}
+```
+
+# 审查指引（projected 模式 · 严格遵循 5 项；其它一律不报）
+
+应做：
+1. **章节时间覆盖**：相邻 chapter 之间 gap > 30s 或与视频边界 gap > 30s 即标 `coverage_gap`。
+2. **mainline 顺序**：mainline 各项的 ts / chapter_index 必须单调不递减；违反标 `mainline_order`。
+3. **glossary 完整性**：若某 chapter.summary 反复使用一个术语而 glossary 中无对应条目，标 `missing_glossary`。
+4. **cross_references 一致性**：每条 cross_reference 的 from_chapter / to_chapter 必须在 [1, len(chapters)] 范围内且不自指；违反标 `bad_cross_reference`。
+5. **study_questions 覆盖**：每条 study_question 至少能在某 chapter.summary 中找到回答线索（关键词重叠或语义对应）；找不到的标 `unanswered_question` 并附 question 索引。
+
+不做：
+- **不要** 验证 point.quote 字面（明细已被剥离，无证据），也不要标 `dubious_quote`。
+- **不要** 检查 ts 是否越界（这由 map 阶段守住）。
+- **不要** 抱怨章节内部细节（points 已聚合为 count）。
+
+输出 schema 与 full 模式一致：
+```json
+{{
+  "issues": [
+    {{
+      "kind": "coverage_gap|mainline_order|missing_glossary|bad_cross_reference|unanswered_question|other",
+      "severity": "high|medium|low",
+      "location": "章节索引或 mainline[i] / cross_references[i]",
+      "evidence": "可引用 chapter.summary 片段或字段值（≤80 字）",
+      "suggestion": "具体修补动作"
+    }}
+  ],
+  "verdict": "ok|needs_revision",
+  "summary": "一句话总结质量"
+}}
+```
+
+如果 5 项检查全部通过，issues 列空数组，verdict 写 "ok"。
+"""
+
 LECTURE_REVISER_SYSTEM = """\
 你是一位 LectureIR 修订器。给定原 LectureIR JSON 与审稿人列出的 issues，
 请直接产出修订后的完整 LectureIR JSON——保持原有结构，只针对 issues 做最小必要修改。
