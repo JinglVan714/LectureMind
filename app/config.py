@@ -377,6 +377,20 @@ class Settings(BaseSettings):
             "Caps prompt-bloat regression; 0 disables the cap."
         ),
     )
+    lecture_ir_max_tokens: int = Field(
+        default=8192,
+        alias="LECTURE_IR_MAX_TOKENS",
+        ge=0,
+        description=(
+            "Max output tokens for the single-call LectureIR build "
+            "(standard / tiny profile path). DeepSeek's per-call "
+            "default is 4096, which truncates 20+ minute code-heavy "
+            "videos mid-JSON and surfaces as "
+            "``LLM returned non-JSON LectureIR``. Default 8192 matches "
+            "DeepSeek's per-call ceiling; set 0 to fall back to the "
+            "backend default."
+        ),
+    )
 
     lecture_map_prompt_version: str = Field(
         default="m2-map-v1",

@@ -123,7 +123,7 @@ class LectureIRBuilder:
         raw, usage = await self._call(user)
         initial_ir_sec = time.perf_counter() - t_call
         t_validate = time.perf_counter()
-        ir = self._parse_and_validate(raw, ctx)
+        ir = self._parse_and_validate(raw, ctx, finish_reason=str(usage.get("finish_reason", "")))
         validate_sec = time.perf_counter() - t_validate
         return ir, {
             "tokens": usage,
@@ -254,7 +254,7 @@ class LectureIRBuilder:
             initial_ir_sec = time.perf_counter() - t_initial
             _accumulate_usage(usage_aggregate, usage)
             t_validate = time.perf_counter()
-            ir_json = self._parse_to_dict(raw, ctx)
+            ir_json = self._parse_to_dict(raw, ctx, finish_reason=str(usage.get("finish_reason", "")))
             # Make sure study questions survive even if the LLM ignored them.
             if questions and not ir_json.get("study_questions"):
                 ir_json["study_questions"] = list(questions)
@@ -374,32 +374,62 @@ class LectureIRBuilder:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=15), reraise=True)
     async def _call(self, user_msg: str) -> tuple[str, dict[str, Any]]:
-        resp = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
                 {"role": "system", "content": LECTURE_IR_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0.25,
-            response_format={"type": "json_object"},
-            timeout=self._timeout,
-            extra_body=self._extra_body,
-        )
-        content = resp.choices[0].message.content or ""
-        usage = {}
+            "temperature": 0.25,
+            "response_format": {"type": "json_object"},
+            "timeout": self._timeout,
+            "extra_body": self._extra_body,
+        }
+        # Pin max_tokens to the configured ceiling so 20+ minute code-heavy
+        # videos do not truncate JSON output at the backend's silent default
+        # (DeepSeek defaults to 4096 per call). 0 means "let the backend
+        # decide" — preserved as an escape hatch for non-DeepSeek backends.
+        max_tokens = int(getattr(self._settings, "lecture_ir_max_tokens", 0) or 0)
+        if max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
+        resp = await self._client.chat.completions.create(**kwargs)
+        choice = resp.choices[0]
+        content = choice.message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None) or ""
+        usage: dict[str, Any] = {}
         if resp.usage:
             usage = {
                 "prompt_tokens": resp.usage.prompt_tokens,
                 "completion_tokens": resp.usage.completion_tokens,
                 "total_tokens": resp.usage.total_tokens,
             }
+        if finish_reason:
+            usage["finish_reason"] = finish_reason
         return content, usage
 
-    def _parse_to_dict(self, raw: str, ctx: LecturizeContext) -> dict[str, Any]:
+    def _parse_to_dict(
+        self,
+        raw: str,
+        ctx: LecturizeContext,
+        *,
+        finish_reason: str = "",
+    ) -> dict[str, Any]:
         try:
             data = _extract_json(raw)
         except ValueError as e:
             self._dump_raw(ctx.bv_id, raw, reason="ir-non-json")
+            # When the backend reports finish_reason='length' the JSON tail
+            # was clipped, so the parser sees an unterminated string. Surface
+            # this distinct failure mode loudly so users know to raise
+            # LECTURE_IR_MAX_TOKENS or route the video to map-reduce instead
+            # of chasing a phantom prompt bug.
+            if finish_reason == "length":
+                raise RuntimeError(
+                    "LLM truncated LectureIR JSON (finish_reason=length, "
+                    f"raw {len(raw)} chars): {e}. Raise LECTURE_IR_MAX_TOKENS "
+                    "or lower LECTURE_PROFILE_THRESHOLDS_SEC so this video "
+                    "routes to the map-reduce builder."
+                ) from e
             raise RuntimeError(f"LLM returned non-JSON LectureIR: {e}") from e
         hydrate_lecture_ir_data(data, ctx)
         return data
@@ -412,8 +442,14 @@ class LectureIRBuilder:
             logger.error("LectureIR validation failed: %s\nraw saved to %s", e, debug_path)
             raise RuntimeError(f"LectureIR schema invalid: {e}") from e
 
-    def _parse_and_validate(self, raw: str, ctx: LecturizeContext) -> LectureIR:
-        data = self._parse_to_dict(raw, ctx)
+    def _parse_and_validate(
+        self,
+        raw: str,
+        ctx: LecturizeContext,
+        *,
+        finish_reason: str = "",
+    ) -> LectureIR:
+        data = self._parse_to_dict(raw, ctx, finish_reason=finish_reason)
         return self._validate_dict(data, ctx, raw)
 
     async def _run_critic_loop(
