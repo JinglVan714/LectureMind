@@ -358,7 +358,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bv", required=True, help="Bilibili BV id or URL")
-    parser.add_argument("--duration", choices=["short", "medium", "long", "code"], required=True)
+    parser.add_argument("--duration", choices=["short", "medium", "long", "code", "tiny", "standard", "epic", "code-heavy"], required=True)
     parser.add_argument("--expect-code", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
