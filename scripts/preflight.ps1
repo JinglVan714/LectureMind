@@ -75,13 +75,22 @@ if (Test-Path .env.example) {
 
 # 4. git tracking sanity (only if repo is initialised)
 if (Test-Path .git) {
-    git ls-files --error-unmatch .env 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { Add-Err '.env is tracked by git -- fix with: git rm --cached .env' }
-    else                     { Add-Ok '.env is not tracked by git' }
+    # Native git non-zero exits + 2>$null still trip $ErrorActionPreference='Stop' in
+    # PowerShell, so temporarily relax it around the probes and rely on $LASTEXITCODE.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        git ls-files --error-unmatch .env *> $null
+        if ($LASTEXITCODE -eq 0) { Add-Err '.env is tracked by git -- fix with: git rm --cached .env' }
+        else                     { Add-Ok '.env is not tracked by git' }
 
-    git ls-files --error-unmatch data 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { Add-Err 'data/ is tracked by git -- fix with: git rm -r --cached data' }
-    else                     { Add-Ok 'data/ is not tracked by git' }
+        git ls-files --error-unmatch data *> $null
+        if ($LASTEXITCODE -eq 0) { Add-Err 'data/ is tracked by git -- fix with: git rm -r --cached data' }
+        else                     { Add-Ok 'data/ is not tracked by git' }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+        $global:LASTEXITCODE = 0
+    }
 } else {
     Add-Warn 'no .git directory -- repo not initialised yet (skip tracking checks)'
 }
@@ -89,9 +98,17 @@ if (Test-Path .git) {
 # 5. optional: run the full regression
 if (-not $SkipTests) {
     Write-Host '==> running scripts/qa_full.ps1 (use -SkipTests to bypass)' -ForegroundColor Cyan
-    $qaArgs = @()
-    if ($NoConda) { $qaArgs += '-NoConda' } else { $qaArgs += @('-CondaEnv', $CondaEnv) }
-    & "$PSScriptRoot/qa_full.ps1" @qaArgs
+    # Hashtable splat → PowerShell binds these as -Named parameters reliably
+    # (positional array splat misbinds when scripts share param names like -CondaEnv).
+    $qaArgs = @{}
+    if ($NoConda) { $qaArgs.NoConda = $true } else { $qaArgs.CondaEnv = $CondaEnv }
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & "$PSScriptRoot/qa_full.ps1" @qaArgs
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
     if ($LASTEXITCODE -ne 0) { Add-Err "qa_full.ps1 failed (exit $LASTEXITCODE)" }
     else                     { Add-Ok 'qa_full.ps1 passed' }
 }
