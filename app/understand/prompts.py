@@ -452,7 +452,7 @@ LECTURE_IR_USER_TEMPLATE = """\
 
 学习问题（study_questions，可能为空）：
 {study_questions_block}
-
+{chapter_plan_block}
 字幕（时间戳·文本）：
 {subtitle_block}
 

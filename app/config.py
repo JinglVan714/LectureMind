@@ -223,6 +223,71 @@ class Settings(BaseSettings):
             "string."
         ),
     )
+
+    # ---- M2.P2 ChapterPlanner ----
+    # Deterministic chapter-anchor extraction. The planner is on by
+    # default but only fires for videos >= ``lecture_chapter_planner_min_sec``;
+    # below that floor a single-chapter lecture is the right answer.
+    lecture_chapter_planner_enabled: bool = Field(
+        default=True,
+        alias="LECTURE_CHAPTER_PLANNER_ENABLED",
+        description=(
+            "Master switch for the deterministic ChapterPlanner. "
+            "When False, ``plan_chapters`` always returns ``[]`` and "
+            "downstream stages fall back to LLM-only chapter inference."
+        ),
+    )
+    lecture_chapter_planner_min_sec: int = Field(
+        default=60,
+        alias="LECTURE_CHAPTER_PLANNER_MIN_SEC",
+        ge=0,
+        description=(
+            "Minimum video duration (seconds) required to run the "
+            "ChapterPlanner. Videos shorter than this skip planning "
+            "and ship a single implicit chapter."
+        ),
+    )
+    lecture_planner_silence_sec: float = Field(
+        default=6.0,
+        alias="LECTURE_PLANNER_SILENCE_SEC",
+        gt=0.0,
+        description=(
+            "Inter-segment gap (seconds) at or above which a silent "
+            "transition is treated as a chapter-break candidate."
+        ),
+    )
+    lecture_planner_transition_phrase_confidence: float = Field(
+        default=0.85,
+        alias="LECTURE_PLANNER_TRANSITION_PHRASE_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Default confidence for chapter anchors found via the "
+            "transition-phrase regex (e.g. '接下来我们看', '总结'). "
+            "Strongest of the 3 deterministic signals."
+        ),
+    )
+    lecture_planner_silence_confidence: float = Field(
+        default=0.6,
+        alias="LECTURE_PLANNER_SILENCE_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Default confidence for chapter anchors found via silent "
+            "gaps in the subtitle stream."
+        ),
+    )
+    lecture_planner_visual_shift_confidence: float = Field(
+        default=0.55,
+        alias="LECTURE_PLANNER_VISUAL_SHIFT_CONFIDENCE",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Default confidence for chapter anchors found via visual "
+            "type changes in adjacent keyframes (weakest of the 3 "
+            "signals; cross-checked against subtitle boundaries)."
+        ),
+    )
     lecture_critic_max_rounds: int = Field(
         default=1,
         alias="LECTURE_CRITIC_MAX_ROUNDS",

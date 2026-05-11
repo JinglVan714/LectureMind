@@ -43,6 +43,42 @@ _GENERIC_MAINLINE_KEYS = {
 }
 
 
+def _format_chapter_plan_block(chapter_plan: list[Any] | None) -> str:
+    """Render a ChapterPlanner output for the ``{chapter_plan_block}``
+    slot in :data:`LECTURE_IR_USER_TEMPLATE`.
+
+    Empty / missing input collapses to an empty string so the prompt
+    body matches the M1 layout byte-for-byte. When provided, a
+    deterministic markdown block tags the suggestions explicitly as
+    *hints* — the LLM is the final authority on chapter boundaries.
+
+    The block carries a leading newline so that, when present, it
+    visually separates from the preceding ``{study_questions_block}``;
+    when absent, a single trailing newline keeps the surrounding
+    template free of awkward double blank lines.
+    """
+    if not chapter_plan:
+        return ""
+
+    lines: list[str] = ["", "章节锚点（chapter_plan，由确定性规则抽取，仅作建议）："]
+    for i, anchor in enumerate(chapter_plan):
+        start = float(getattr(anchor, "start_sec", 0.0) or 0.0)
+        end = float(getattr(anchor, "end_sec", 0.0) or 0.0)
+        conf = float(getattr(anchor, "confidence", 0.0) or 0.0)
+        source = str(getattr(anchor, "source", "") or "")
+        text = str(getattr(anchor, "anchor_text", "") or "").strip()
+        lines.append(
+            f"- [{i+1}] {start:.1f}s → {end:.1f}s · "
+            f"source={source} · conf={conf:.2f} · «{text[:60]}»"
+        )
+    lines.append(
+        "可调整边界（合并/拆分/平移）以贴合实际语义；source=transition_phrase 的"
+        "锚点最可信，equal_split 的最弱。"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 class LectureIRBuilder:
     def __init__(self) -> None:
         s = get_settings()
@@ -222,7 +258,23 @@ class LectureIRBuilder:
         *,
         budget: LengthBudget,
         study_questions: list[str],
+        chapter_plan: list[Any] | None = None,
     ) -> str:
+        """Build the user prompt for the IR builder LLM call.
+
+        ``chapter_plan`` is an optional list of
+        :class:`~app.understand.chapter_planner.ChapterAnchor` objects.
+        When provided (and non-empty), they are rendered into the
+        ``{chapter_plan_block}`` slot as a markdown bullet list of
+        suggested chapter boundaries; the LLM is told to treat them as
+        hints (not hard constraints). When ``None`` or empty, the slot
+        collapses to an empty string and the prompt is byte-identical
+        to the M1 layout — important so caches keyed on the prompt
+        body do not invalidate spuriously when the planner is off.
+
+        P2 only renders the block; the planner is wired into pipeline
+        callers in P7.
+        """
         questions_block = (
             "\n".join(f"- {q}" for q in study_questions)
             if study_questions
@@ -242,6 +294,7 @@ class LectureIRBuilder:
             review_questions_max=budget.review_questions_max,
             density_hint=budget.density_hint(),
             study_questions_block=questions_block,
+            chapter_plan_block=_format_chapter_plan_block(chapter_plan),
             subtitle_block=_format_segments(ctx.segments) or "(无)",
             frames_block=_format_frames(ctx.frame_descs) or "(无)",
         )
