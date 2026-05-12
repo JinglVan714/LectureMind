@@ -44,7 +44,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 AnchorSource = Literal[
-    "transition_phrase", "silence", "visual_shift", "equal_split"
+    "transition_phrase", "silence", "visual_shift", "equal_split",
+    # M2.2: bisection source for chapters that exceeded
+    # ``lecture_chapter_max_duration_sec``. Distinct from ``equal_split``
+    # so telemetry / matrix verifier can flag chapters that were
+    # auto-bisected post-materialisation (these are the chapters most
+    # at risk of having sparse anchor signal in their original window).
+    "equal_split_overflow",
 ]
 AnchorMode = Literal["hint", "structural"]
 
@@ -180,19 +186,36 @@ def plan_chapters(
 
     # -- Mode dispatch -----------------------------------------------------
     if mode == "structural":
-        return _build_structural(
+        chapters = _build_structural(
             candidates,
             duration_sec=duration_sec,
             segments=segments,
             chapters_min=chapters_min,
             chapters_max=chapters_max,
         )
-    return _build_hint(
-        candidates,
-        duration_sec=duration_sec,
-        segments=segments,
-        chapters_max=chapters_max,
-    )
+    else:
+        chapters = _build_hint(
+            candidates,
+            duration_sec=duration_sec,
+            segments=segments,
+            chapters_max=chapters_max,
+        )
+
+    # M2.2 architectural prevention: any chapter wider than
+    # ``LECTURE_CHAPTER_MAX_DURATION_SEC`` gets bisected into
+    # ``ceil(width / threshold)`` equal sub-chapters tagged
+    # ``equal_split_overflow``. Runs uniformly across hint and
+    # structural modes so even hint-mode's "let the LLM finalise"
+    # contract still respects the downstream map-call output budget.
+    max_chapter_sec = float(getattr(settings, "lecture_chapter_max_duration_sec", 0) or 0)
+    if max_chapter_sec > 0.0:
+        chapters = _enforce_max_duration(
+            chapters,
+            max_chapter_sec=max_chapter_sec,
+            segments=segments,
+            mode=mode,
+        )
+    return chapters
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +572,100 @@ def _materialise(
         )
         cursor = nxt
     return chapters
+
+
+# ---------------------------------------------------------------------------
+# M2.2 — post-materialise max-duration enforcement
+# ---------------------------------------------------------------------------
+
+
+def _enforce_max_duration(
+    chapters: list[ChapterAnchor],
+    *,
+    max_chapter_sec: float,
+    segments: list[SubtitleSegment],
+    mode: AnchorMode,
+) -> list[ChapterAnchor]:
+    """Bisect any chapter wider than ``max_chapter_sec`` into equal parts.
+
+    Implements the bilibili-render-pdf skill's *"split by coherent time
+    windows"* rule for the case where the deterministic chapter signals
+    (transition phrase / silence / visual shift) miss a long code-dense
+    stretch and the planner ends up handing the map-chapter LLM call a
+    window too wide to fit under the 8192-token output cap. The split
+    is uniform / deterministic (no LLM) so it is safe to run inside
+    ``plan_chapters`` and produces reproducible cache keys downstream.
+
+    Each oversized chapter is split into
+    ``ceil(width / max_chapter_sec)`` equal sub-chapters; the first
+    sub-chapter keeps the original ``anchor_text`` and ``confidence``,
+    subsequent sub-chapters inherit the title with a ``（续 k/N）``
+    suffix so the human-readable diagnostic still points back to the
+    natural anchor. Source for every produced sub-chapter is
+    ``equal_split_overflow`` so the matrix verifier can flag the
+    architectural fallback even when ``max_chapter_sec`` is later
+    raised back to disable-mode.
+
+    Invariants preserved:
+      * Coverage of ``[0, duration_sec]`` stays continuous (no gaps,
+        no overlaps).
+      * Output is sorted by ``start_sec``.
+      * Chapters already within the budget pass through untouched.
+    """
+    if not chapters or max_chapter_sec <= 0.0:
+        return chapters
+    out: list[ChapterAnchor] = []
+    for chapter in chapters:
+        width = float(chapter.end_sec) - float(chapter.start_sec)
+        if width <= max_chapter_sec:
+            out.append(chapter)
+            continue
+        # Pick the smallest equal split that keeps every sub-chapter
+        # under the budget. ``math.ceil`` of width / threshold is the
+        # right count; using a python expression avoids the ``math``
+        # import.
+        n_parts = int(width // max_chapter_sec)
+        if width % max_chapter_sec > 0.0:
+            n_parts += 1
+        n_parts = max(2, n_parts)
+        slice_sec = width / float(n_parts)
+        for k in range(n_parts):
+            sub_start = float(chapter.start_sec) + k * slice_sec
+            # Last sub-chapter snaps to the exact original end so we
+            # don't accumulate float drift and lose the final ms.
+            sub_end = (
+                float(chapter.end_sec)
+                if k == n_parts - 1
+                else float(chapter.start_sec) + (k + 1) * slice_sec
+            )
+            if k == 0:
+                # Keep the natural anchor on the first sub-chapter so
+                # users still see the planner's strongest signal.
+                anchor_text = str(chapter.anchor_text)
+                confidence = float(chapter.confidence)
+            else:
+                # Probe the segment text at the bisection point for a
+                # human-readable diagnostic; fall back to the parent
+                # title with a 续 k/N suffix when subtitles are silent.
+                seg_text = _segment_text_at(segments, sub_start)[:60]
+                base = str(chapter.anchor_text) or "（章节续）"
+                anchor_text = (
+                    f"{base}（续 {k + 1}/{n_parts}）"
+                    if not seg_text
+                    else f"{seg_text}（续 {k + 1}/{n_parts}）"
+                )
+                confidence = 1.0  # structural placement; not LLM-overridable
+            out.append(
+                ChapterAnchor(
+                    start_sec=sub_start,
+                    end_sec=sub_end,
+                    confidence=confidence,
+                    anchor_text=anchor_text[:80],
+                    source="equal_split_overflow",
+                    mode=mode,
+                )
+            )
+    return out
 
 
 # ---------------------------------------------------------------------------

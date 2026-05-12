@@ -430,7 +430,16 @@ def test_map_reduce_records_map_failures_in_stats(tmp_path: Path) -> None:
             study_questions=[],
         )
     )
-    assert stats.map_failures == (2,)
+    # M2.2: ``map_failures`` is now a tuple of ``MapFailure`` records;
+    # the chapter index alone lives on the ``failure_indices`` legacy
+    # property. Both shapes are pinned so a future schema regression
+    # surfaces here.
+    assert stats.failure_indices == (2,)
+    assert len(stats.map_failures) == 1
+    failure = stats.map_failures[0]
+    assert failure.chapter_index == 2
+    assert failure.error_class == "RuntimeError"
+    assert "boom" in failure.error_excerpt
 
 
 def test_map_reduce_does_not_cache_placeholder(tmp_path: Path) -> None:

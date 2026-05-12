@@ -61,6 +61,56 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class MapFailure:
+    """Per-chapter map-call failure record (M2.2 telemetry upgrade).
+
+    Pre-M2.2 ``MapReduceStats.map_failures`` was just ``tuple[int, ...]``
+    — chapter indices only. Real-machine BV1ypdgBCE9B revealed that
+    "which chapter failed" tells you nothing about **why**, so the
+    user is stuck guessing between prompt-leak / network err / token
+    truncation / subtitle-shape bug. This record carries the full
+    diagnostic context needed to triage each failure from telemetry
+    alone, without trawling logs.
+
+    Attributes
+    ----------
+    chapter_index
+        1-based index, identical to the value stored pre-M2.2.
+    start_sec, end_sec, duration_sec
+        Window bounds. ``duration_sec`` is redundant but stored so
+        verifier scripts can sort by it.
+    subtitle_count, frame_count
+        Input-size proxies. A truncation on a tiny window is a prompt
+        bug; on a huge window it's the user needing to lower
+        ``LECTURE_CHAPTER_MAX_DURATION_SEC``.
+    attempts
+        How many attempts the retry loop made before giving up
+        (truncation short-circuits to 1).
+    finish_reason
+        Backend-reported finish reason of the **last** attempt:
+        ``'length'`` for token-cap truncation, ``'stop'`` for normal
+        completion (still a parse error => prompt bug), ``''`` for
+        legacy / test stubs that don't surface the field.
+    error_class
+        Short class name of the last exception (e.g.
+        ``'TimeoutError'``, ``'ValueError'``, ``'RuntimeError'``).
+    error_excerpt
+        First 240 chars of the last exception message.
+    """
+
+    chapter_index: int
+    start_sec: float = 0.0
+    end_sec: float = 0.0
+    duration_sec: float = 0.0
+    subtitle_count: int = 0
+    frame_count: int = 0
+    attempts: int = 0
+    finish_reason: str = ""
+    error_class: str = ""
+    error_excerpt: str = ""
+
+
+@dataclass(frozen=True)
 class MapReduceStats:
     """Per-build telemetry surface.
 
@@ -71,11 +121,31 @@ class MapReduceStats:
     map_calls: int = 0
     cache_hits: int = 0
     cache_writes: int = 0
-    map_failures: tuple[int, ...] = ()
+    # M2.2: upgraded from ``tuple[int, ...]`` to carry full failure
+    # context. Backward-compat helper :meth:`failure_indices` returns
+    # the legacy shape so older consumers / log scrapers still work.
+    map_failures: tuple[MapFailure, ...] = ()
     map_total_sec: float = 0.0
     reduce_local_sec: float = 0.0
     reduce_global_sec: float = 0.0
     reduce_global_attempts: int = 0
+
+    @property
+    def failure_indices(self) -> tuple[int, ...]:
+        """Legacy shape — just the chapter indices.
+
+        Provided so existing scripts / dashboards that did
+        ``stats.map_failures == (2,)`` can be migrated incrementally
+        to ``stats.failure_indices == (2,)``.
+        """
+        return tuple(f.chapter_index for f in self.map_failures)
+
+
+# M2.2: substring used by map-chapter callers (and our auto-fallback in
+# build_with_agents) to detect the explicit truncation failure mode of
+# a map call without parsing the full error message. Keep the wording
+# in :meth:`_map_chapter_with_retry` synced with this constant.
+MAP_CHAPTER_TRUNCATION_TAG = "Map-chapter LLM truncated JSON"
 
 
 class ReduceGlobalError(RuntimeError):
@@ -321,7 +391,7 @@ class MapReduceIRBuilder:
                 continue
 
             t0 = time.perf_counter()
-            payload, is_placeholder = await self._map_chapter_with_retry(
+            payload, failure = await self._map_chapter_with_retry(
                 anchor=anchor,
                 chapter_index=chapter_index,
                 chap_segs=chap_segs,
@@ -335,8 +405,8 @@ class MapReduceIRBuilder:
             chapter_dict = self._stamp_chapter(
                 payload, anchor=anchor, chapter_index=chapter_index
             )
-            if is_placeholder:
-                stats["map_failures"].append(chapter_index)
+            if failure is not None:
+                stats["map_failures"].append(failure)
             else:
                 # Spec §3.3.1: only cache verified chapter outputs so a
                 # placeholder never short-circuits a future re-run.
@@ -364,15 +434,36 @@ class MapReduceIRBuilder:
         chap_frames: list[Any],
         meta: Any,
         stats: dict[str, Any],
-    ) -> tuple[dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], MapFailure | None]:
         """Try the map call up to ``max_retries + 1`` times.
 
-        Returns ``(payload, is_placeholder)``. The placeholder payload
-        carries the spec §3.3.1 "本章生成失败" title and an empty
-        ``points`` list so downstream renderers degrade gracefully.
+        Returns ``(payload, failure)``. ``failure`` is ``None`` on
+        success and a fully-populated :class:`MapFailure` on
+        placeholder fallback. The placeholder payload carries the spec
+        §3.3.1 "本章生成失败" title and an empty ``points`` list so
+        downstream renderers degrade gracefully — its ``summary`` is
+        rewritten to point at the actionable knob (``MAX_TOKENS`` /
+        ``MAX_DURATION_SEC``) when truncation is the culprit.
+
+        M2.2 changes
+        ------------
+        * Forwards ``LECTURE_MAP_CHAPTER_MAX_TOKENS`` to ``_call_llm``
+          so the per-chapter budget aligns with the rest of the M2
+          pipeline (was unset → DeepSeek default ~4096).
+        * Detects ``finish_reason == 'length'`` explicitly and raises
+          a tagged :data:`MAP_CHAPTER_TRUNCATION_TAG` ``RuntimeError``
+          instead of letting the JSON parser surface a misleading
+          comma-delimiter error.
+        * Truncation **short-circuits the retry loop**: re-issuing
+          the same prompt under the same budget will produce the
+          same truncated output, so wasting another LLM call is
+          pure cost; the failure record sets ``attempts == 1``.
+          Other error classes (timeout / transient API err) still
+          burn the full retry budget.
         """
         max_retries = int(getattr(self._settings, "lecture_map_chapter_max_retries", 1) or 0)
         timeout = float(getattr(self._settings, "lecture_map_chapter_timeout", 180.0) or 180.0)
+        max_tokens = int(getattr(self._settings, "lecture_map_chapter_max_tokens", 0) or 0)
         user = self._format_map_user(
             anchor=anchor,
             chapter_index=chapter_index,
@@ -381,46 +472,123 @@ class MapReduceIRBuilder:
             meta=meta,
         )
         last_exc: BaseException | None = None
+        last_finish_reason = ""
+        attempts_made = 0
+        truncated = False
         for attempt in range(max_retries + 1):
+            attempts_made = attempt + 1
             stats["map_calls"] = int(stats["map_calls"]) + 1
             try:
-                content, _finish_reason = await self._call_llm(
+                content, finish_reason = await self._call_llm(
                     system=LECTURE_IR_MAP_CHAPTER_SYSTEM,
                     user=user,
                     timeout=timeout,
+                    max_tokens=max_tokens or None,
                 )
-                payload = _extract_json(content)
+                last_finish_reason = str(finish_reason or "")
+                try:
+                    payload = _extract_json(content)
+                except ValueError as parse_exc:
+                    if last_finish_reason == "length":
+                        # Tagged error — caught by the outer except
+                        # below so we skip the (futile) retry and
+                        # bubble actionable diagnostics to the
+                        # placeholder summary.
+                        raise RuntimeError(
+                            f"{MAP_CHAPTER_TRUNCATION_TAG} "
+                            f"(finish_reason=length, raw {len(content or '')} chars): "
+                            f"{parse_exc}. Raise LECTURE_MAP_CHAPTER_MAX_TOKENS "
+                            "or lower LECTURE_CHAPTER_MAX_DURATION_SEC so this "
+                            "chapter routes through fewer tokens."
+                        ) from parse_exc
+                    raise
                 # Drop disallowed lecture-level keys defensively in case
                 # the model ignored the system prompt; chapter internals
                 # are all that matters here.
                 for k in ("mainline", "lecture_summary", "cross_references"):
                     payload.pop(k, None)
-                return payload, False
+                return payload, None
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                # Classify so retry decisions reflect intent: same
+                # prompt + same budget = same truncation, never retry.
+                exc_msg = str(exc)
+                truncated = MAP_CHAPTER_TRUNCATION_TAG in exc_msg
                 logger.warning(
-                    "Map-chapter %d attempt %d/%d failed: %s",
+                    "Map-chapter %d attempt %d/%d failed (%s): %s",
                     chapter_index,
-                    attempt + 1,
+                    attempts_made,
                     max_retries + 1,
+                    "truncation" if truncated else type(exc).__name__,
                     exc,
                 )
-                continue
-        # All attempts failed: emit placeholder.
-        logger.warning(
-            "Map-chapter %d exhausted retries (%s); inserting placeholder",
-            chapter_index,
-            last_exc,
+                if truncated:
+                    break
+        # All attempts (or truncation short-circuit): emit placeholder
+        # + structured failure record.
+        failure = MapFailure(
+            chapter_index=chapter_index,
+            start_sec=float(anchor.start_sec),
+            end_sec=float(anchor.end_sec),
+            duration_sec=float(anchor.end_sec) - float(anchor.start_sec),
+            subtitle_count=len(chap_segs),
+            frame_count=len(chap_frames),
+            attempts=attempts_made,
+            finish_reason=last_finish_reason,
+            error_class=type(last_exc).__name__ if last_exc is not None else "",
+            error_excerpt=(str(last_exc)[:240] if last_exc is not None else ""),
         )
-        return self._placeholder_payload(anchor=anchor, chapter_index=chapter_index), True
+        logger.warning(
+            "Map-chapter %d exhausted (%s, finish_reason=%r); inserting placeholder",
+            chapter_index,
+            failure.error_class or "unknown",
+            failure.finish_reason,
+        )
+        return (
+            self._placeholder_payload(
+                anchor=anchor, chapter_index=chapter_index, failure=failure
+            ),
+            failure,
+        )
 
     def _placeholder_payload(
-        self, *, anchor: ChapterAnchor, chapter_index: int
+        self,
+        *,
+        anchor: ChapterAnchor,
+        chapter_index: int,
+        failure: MapFailure | None = None,
     ) -> dict[str, Any]:
+        """Build the "本章生成失败" placeholder.
+
+        When ``failure`` is supplied (post-M2.2 callers), the
+        ``summary`` carries an actionable hint that points the user
+        at the right knob — token cap vs. chapter-duration cap vs.
+        unspecified prompt bug — so the rendered HTML chapter card
+        is self-debugging instead of a dead end. ``failure=None`` is
+        kept for legacy callers / tests that don't need the diagnostic
+        thread.
+        """
+        summary = "本章内容生成失败，请手动重跑或检查日志。"
+        if failure is not None:
+            if failure.finish_reason == "length":
+                summary = (
+                    f"本章抽取失败：LLM 输出截断（finish_reason=length，"
+                    f"该章节 {failure.duration_sec:.0f} 秒 / "
+                    f"{failure.subtitle_count} 条字幕）。"
+                    "请提高 LECTURE_MAP_CHAPTER_MAX_TOKENS 或降低 "
+                    "LECTURE_CHAPTER_MAX_DURATION_SEC 让章节更短。"
+                )
+            elif failure.error_class:
+                summary = (
+                    f"本章抽取失败：{failure.error_class}（"
+                    f"{failure.attempts} 次尝试，该章节 "
+                    f"{failure.duration_sec:.0f} 秒）。"
+                    "请检查日志或手动重跑。"
+                )
         return {
             _PLACEHOLDER_KEY: True,
             "title": f"第 {chapter_index} 章（生成失败）",
-            "summary": "本章内容生成失败，请手动重跑或检查日志。",
+            "summary": summary,
             "learning_goal": "",
             "teaching_notes": [],
             "process_steps": [],
@@ -880,5 +1048,7 @@ class MapReduceIRBuilder:
 __all__ = [
     "MapReduceIRBuilder",
     "MapReduceStats",
+    "MapFailure",
+    "MAP_CHAPTER_TRUNCATION_TAG",
     "ReduceGlobalError",
 ]

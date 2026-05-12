@@ -28,9 +28,19 @@ def _settings(**overrides):
 
     P1 already enabled ``populate_by_name=True``, so we can pass field
     names directly without remembering the env-var aliases.
+
+    M2.2 note: the new ``lecture_chapter_max_duration_sec`` safeguard
+    (default 720s) would re-bisect several of the longer fixtures
+    below — that's a legitimate change in production behaviour but
+    irrelevant to the hint / structural builder contract this file
+    pins. We default it OFF here so the original P2 invariants stay
+    testable in isolation; the safeguard has its own dedicated suite
+    in ``tests/test_chapter_max_duration.py``. Tests that explicitly
+    want to exercise the safeguard still pass an override.
     """
     from app.config import Settings
 
+    overrides.setdefault("lecture_chapter_max_duration_sec", 0)
     return Settings(**overrides)
 
 

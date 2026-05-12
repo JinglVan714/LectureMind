@@ -307,6 +307,34 @@ class Settings(BaseSettings):
             "signals; cross-checked against subtitle boundaries)."
         ),
     )
+    # M2.2 architectural prevention: hard upper bound on a single chapter's
+    # duration. Even when the deterministic signals (transition phrase /
+    # silence / visual shift) miss across a long code-dense stretch, this
+    # post-processing pass bisects any chapter wider than the threshold
+    # into ceil(duration / threshold) equal sub-chapters. This is the
+    # direct implementation of the bilibili-render-pdf skill's "split by
+    # coherent time windows" rule when chapter signals are sparse.
+    #
+    # 720s (12min) leaves ~25% safety margin against the 8192-token
+    # DeepSeek output cap for code-heavy content (empirically a 17min 43s
+    # chapter on BV1ypdgBCE9B produced a ~19601-char IR JSON that did
+    # not fit; 12min should keep us under).
+    lecture_chapter_max_duration_sec: int = Field(
+        default=720,
+        alias="LECTURE_CHAPTER_MAX_DURATION_SEC",
+        ge=0,
+        description=(
+            "Hard upper bound on a single chapter's duration (seconds). "
+            "Any chapter produced by the planner whose width exceeds "
+            "this is bisected into ceil(width / threshold) equal "
+            "sub-chapters with source='equal_split_overflow'. Default "
+            "720s (12min) keeps each chapter under DeepSeek's 8192-token "
+            "single-call output cap on code-dense content. Set 0 to "
+            "disable the safeguard (not recommended; this is what "
+            "shipped before M2.2 and caused BV1ypdgBCE9B chapter 5 to "
+            "truncate)."
+        ),
+    )
 
     # ---- M2.P3 ChapterCache (SQLite, prompt_hash keyed) ----
     # Per-chapter LLM result cache used by ``MapReduceIRBuilder`` (P4).
@@ -356,6 +384,27 @@ class Settings(BaseSettings):
             "Timeout (seconds) for a single map-chapter LLM call. "
             "Spec §3.3.5 default 180s; a chapter rarely exceeds 30s "
             "in practice but the budget covers worst-case retries."
+        ),
+    )
+    # M2.2 truncation safety net for the map-chapter call. Real-machine
+    # BV1ypdgBCE9B (44min code-heavy) produced a single 17min 43s chapter
+    # whose IR JSON did not fit in DeepSeek's default ~4096-token output
+    # cap, surfacing as the user-visible "本章内容生成失败" placeholder.
+    # Bumping the cap and detecting ``finish_reason='length'`` explicitly
+    # surfaces truncation as an actionable error instead of letting it
+    # bleed into the generic placeholder.
+    lecture_map_chapter_max_tokens: int = Field(
+        default=8192,
+        alias="LECTURE_MAP_CHAPTER_MAX_TOKENS",
+        ge=0,
+        description=(
+            "Max output tokens for a single map-chapter LLM call. "
+            "Aligned with LECTURE_IR_MAX_TOKENS / "
+            "LECTURE_REVISER_MAX_TOKENS / LECTURE_REDUCE_GLOBAL_MAX_TOKENS "
+            "so every LLM call in the map-reduce path shares the same "
+            "8192-token ceiling (DeepSeek's hard upper bound). Set 0 to "
+            "fall back to the backend default (~4096), which is what "
+            "shipped before M2.2 and caused the BV1ypdgBCE9B truncation."
         ),
     )
     lecture_reduce_global_timeout: float = Field(

@@ -376,7 +376,22 @@ class LectureIRBuilder:
                 "map_calls": getattr(mr, "map_calls", 0),
                 "cache_hits": getattr(mr, "cache_hits", 0),
                 "cache_writes": getattr(mr, "cache_writes", 0),
-                "map_failures": list(getattr(mr, "map_failures", ()) or ()),
+                # M2.2: ``map_failures`` is now a tuple of ``MapFailure``
+                # dataclasses carrying full diagnostic context (window
+                # size, finish_reason, error_class, …). We expand each
+                # one into a plain dict here so the telemetry block
+                # stays JSON-serialisable for pipeline.py / matrix
+                # tooling and downstream verifier scripts can dispatch
+                # on ``finish_reason`` / ``duration_sec`` without
+                # importing the dataclass type. Legacy callers that
+                # only need indices can use
+                # ``stats.map_reduce.failure_indices`` (still on the
+                # MapReduceStats object) or read each dict's
+                # ``chapter_index`` field.
+                "map_failures": [
+                    _serialise_map_failure(f)
+                    for f in (getattr(mr, "map_failures", ()) or ())
+                ],
                 "map_total_sec": round(float(getattr(mr, "map_total_sec", 0.0)), 3),
                 "reduce_local_sec": round(float(getattr(mr, "reduce_local_sec", 0.0)), 3),
                 "reduce_global_sec": round(float(getattr(mr, "reduce_global_sec", 0.0)), 3),
@@ -840,6 +855,31 @@ class LectureIRBuilder:
         p = debug_dir / f"{bv_id}.lecture_ir.{reason}.txt"
         p.write_text(raw, encoding="utf-8")
         return p
+
+
+def _serialise_map_failure(f: Any) -> dict[str, Any]:
+    """Project a :class:`~app.understand.ir_map_reduce.MapFailure` into
+    a plain dict for the JSON-friendly telemetry block.
+
+    Tolerates pre-M2.2 ``int``-typed entries (just chapter index) so
+    callers passing legacy ``MapReduceStats`` instances (e.g. ad-hoc
+    mocks in older tests) keep working — they degrade to a
+    ``{"chapter_index": <int>}`` shape and lose the diagnostic fields.
+    """
+    if isinstance(f, int):
+        return {"chapter_index": int(f)}
+    return {
+        "chapter_index": int(getattr(f, "chapter_index", 0) or 0),
+        "start_sec": round(float(getattr(f, "start_sec", 0.0) or 0.0), 1),
+        "end_sec": round(float(getattr(f, "end_sec", 0.0) or 0.0), 1),
+        "duration_sec": round(float(getattr(f, "duration_sec", 0.0) or 0.0), 1),
+        "subtitle_count": int(getattr(f, "subtitle_count", 0) or 0),
+        "frame_count": int(getattr(f, "frame_count", 0) or 0),
+        "attempts": int(getattr(f, "attempts", 0) or 0),
+        "finish_reason": str(getattr(f, "finish_reason", "") or ""),
+        "error_class": str(getattr(f, "error_class", "") or ""),
+        "error_excerpt": str(getattr(f, "error_excerpt", "") or ""),
+    }
 
 
 def _accumulate_usage(target: dict[str, int], src: dict[str, Any] | None) -> None:
