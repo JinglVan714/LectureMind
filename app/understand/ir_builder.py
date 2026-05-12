@@ -20,11 +20,19 @@ from .agents import (
     StudyQuestionAgent,
     StudyQuestionsResult,
 )
+from .chapter_cache import make_chapter_cache_from_settings
 from .ir import LectureIR, hydrate_lecture_ir_data
 from .lecturize import LecturizeContext, _format_frames, _format_segments
 from .length_adapt import LengthBudget, mainline_max
 from .prompts import LECTURE_IR_SYSTEM, LECTURE_IR_USER_TEMPLATE
 from .schema import LectureJSON
+
+# Sentinel substring used to identify the single-call truncation
+# RuntimeError emitted by ``_parse_to_dict`` so the auto-fallback in
+# ``build_with_agents`` can recover *only* from that one shape of
+# failure. Anything else (validation errors, real prompt bugs, network
+# issues) bubbles up unmodified.
+_TRUNCATION_ERROR_TAG = "LLM truncated LectureIR JSON"
 
 logger = logging.getLogger(__name__)
 _ONE_LINER_MAX_CHARS = 96
@@ -221,45 +229,100 @@ class LectureIRBuilder:
         # stays comparable across profiles.
         map_reduce_stats: Any = None
         use_map_reduce = bool(profile is not None and getattr(profile, "use_map_reduce", False))
+        # Telemetry flag: set when the single-call path raised the
+        # truncation RuntimeError and we silently re-ran via map-reduce.
+        # Surfaced into ``stats['map_reduce']['auto_fallback']`` so the
+        # verifier / matrix can distinguish a clean standard run from a
+        # rescued one without parsing logs.
+        auto_fallback = False
         validate_sec = 0.0
         if use_map_reduce:
-            from .ir_map_reduce import MapReduceIRBuilder
-
-            mr_builder = MapReduceIRBuilder(
-                client=self._client,
-                settings=s,
+            ir, map_reduce_stats, initial_ir_sec = await self._build_via_map_reduce(
+                ctx=ctx,
                 profile=profile,
+                chapter_plan=chapter_plan,
                 chapter_cache=chapter_cache,
-            )
-            t_initial = time.perf_counter()
-            ir, map_reduce_stats = await mr_builder.build(
-                chapter_plan=list(chapter_plan or []),
-                segments=ctx.segments,
-                frames=ctx.frame_descs,
-                meta=ctx,
                 study_questions=questions,
+                settings=s,
             )
-            initial_ir_sec = time.perf_counter() - t_initial
             # Map-reduce keeps its own usage telemetry separate; we do
             # not double-count here.
         else:
-            user = self._user_message(
-                ctx,
-                budget=budget,
-                study_questions=questions,
-                chapter_plan=chapter_plan,
-            )
             t_initial = time.perf_counter()
-            raw, usage = await self._call(user)
-            initial_ir_sec = time.perf_counter() - t_initial
-            _accumulate_usage(usage_aggregate, usage)
-            t_validate = time.perf_counter()
-            ir_json = self._parse_to_dict(raw, ctx, finish_reason=str(usage.get("finish_reason", "")))
-            # Make sure study questions survive even if the LLM ignored them.
-            if questions and not ir_json.get("study_questions"):
-                ir_json["study_questions"] = list(questions)
-            ir = self._validate_dict(ir_json, ctx, raw)
-            validate_sec = time.perf_counter() - t_validate
+            try:
+                ir, validate_sec = await self._build_via_single_call(
+                    ctx=ctx,
+                    budget=budget,
+                    study_questions=questions,
+                    chapter_plan=chapter_plan,
+                    usage_aggregate=usage_aggregate,
+                )
+                initial_ir_sec = time.perf_counter() - t_initial
+            except RuntimeError as exc:
+                # The single-call IR builder raises this exact RuntimeError
+                # (tagged via ``_TRUNCATION_ERROR_TAG``) when the LLM hits
+                # ``finish_reason='length'`` and the JSON tail is therefore
+                # unterminated. Anything else propagates untouched.
+                if _TRUNCATION_ERROR_TAG not in str(exc):
+                    raise
+                # Architectural fallback: rebuild the IR via map-reduce
+                # using the already-computed chapter_plan + an on-demand
+                # ChapterCache so the user gets a successful IR instead
+                # of a hard failure. Disabled only when the user
+                # explicitly turns off the safety net to debug a root
+                # cause.
+                if not bool(getattr(s, "lecture_ir_auto_fallback_to_map_reduce", True)):
+                    raise
+                plan_list = list(chapter_plan or [])
+                if not plan_list:
+                    # Map-reduce can't run without anchors. Re-raise so
+                    # the upper-level v1 fallback (pipeline.py) can take
+                    # over — better than an empty-IR placeholder.
+                    logger.warning(
+                        "IR truncation detected for %s but chapter_plan "
+                        "is empty; cannot auto-fallback to map-reduce.",
+                        ctx.bv_id,
+                    )
+                    raise
+                logger.warning(
+                    "IR truncation detected for %s (%s); falling back to "
+                    "MapReduceIRBuilder with %d chapter anchors.",
+                    ctx.bv_id,
+                    str(exc).splitlines()[0][:200],
+                    len(plan_list),
+                )
+                # Map-reduce wants a non-None ChapterCache (it touches
+                # ``self._cache.enabled`` on the map path). Standard
+                # profile normally runs with ``chapter_cache=None`` so
+                # we build one on demand; cache writes will persist and
+                # speed up future re-runs of the same video.
+                fallback_cache = chapter_cache
+                if fallback_cache is None:
+                    try:
+                        fallback_cache = make_chapter_cache_from_settings(s)
+                    except Exception as cache_exc:  # noqa: BLE001
+                        logger.warning(
+                            "ChapterCache init failed during truncation "
+                            "fallback (%s); re-raising original error",
+                            cache_exc,
+                        )
+                        raise exc from cache_exc
+                # Synthesise a profile compatible with MapReduceIRBuilder.
+                # The standard profile carries ``use_map_reduce=False``
+                # but the builder itself only reads chapter_planner_mode
+                # / use_chapter_cache and a few stats hooks, so reusing
+                # ``profile`` directly is safe.
+                ir, map_reduce_stats, initial_ir_sec = await self._build_via_map_reduce(
+                    ctx=ctx,
+                    profile=profile,
+                    chapter_plan=plan_list,
+                    chapter_cache=fallback_cache,
+                    study_questions=questions,
+                    settings=s,
+                )
+                auto_fallback = True
+                # Map-reduce keeps its own validation inside ``build`` so
+                # the outer validate_sec stays at 0 on this branch.
 
         # 3. Critic + Reviser
         critique: CritiqueResult | None = None
@@ -318,12 +381,93 @@ class LectureIRBuilder:
                 "reduce_local_sec": round(float(getattr(mr, "reduce_local_sec", 0.0)), 3),
                 "reduce_global_sec": round(float(getattr(mr, "reduce_global_sec", 0.0)), 3),
                 "reduce_global_attempts": getattr(mr, "reduce_global_attempts", 0),
+                # When True, this map-reduce run was triggered by the
+                # single-call truncation safety net (see step 2 above).
+                # Verifier / matrix scripts can use this to distinguish
+                # a clean profile.use_map_reduce=True run from a rescued
+                # one without having to grep the warning log.
+                "auto_fallback": bool(auto_fallback),
             }
         return ir, stats
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    async def _build_via_single_call(
+        self,
+        *,
+        ctx: LecturizeContext,
+        budget: LengthBudget,
+        study_questions: list[str],
+        chapter_plan: list[Any] | None,
+        usage_aggregate: dict[str, int],
+    ) -> tuple[LectureIR, float]:
+        """Execute the single-pass IR build and return ``(ir, validate_sec)``.
+
+        Extracted so the truncation-fallback branch in
+        ``build_with_agents`` can call the original path without
+        duplicating its prompt-building / JSON-parsing / validation
+        logic. ``usage_aggregate`` is mutated in-place per the existing
+        contract; callers do not need to re-merge.
+        """
+        user = self._user_message(
+            ctx,
+            budget=budget,
+            study_questions=study_questions,
+            chapter_plan=chapter_plan,
+        )
+        raw, usage = await self._call(user)
+        _accumulate_usage(usage_aggregate, usage)
+        t_validate = time.perf_counter()
+        ir_json = self._parse_to_dict(
+            raw, ctx, finish_reason=str(usage.get("finish_reason", ""))
+        )
+        # Make sure study questions survive even if the LLM ignored them.
+        if study_questions and not ir_json.get("study_questions"):
+            ir_json["study_questions"] = list(study_questions)
+        ir = self._validate_dict(ir_json, ctx, raw)
+        validate_sec = time.perf_counter() - t_validate
+        return ir, validate_sec
+
+    async def _build_via_map_reduce(
+        self,
+        *,
+        ctx: LecturizeContext,
+        profile: Any,
+        chapter_plan: list[Any] | None,
+        chapter_cache: Any,
+        study_questions: list[str],
+        settings: Any,
+    ) -> tuple[LectureIR, Any, float]:
+        """Execute the map-reduce IR build and return ``(ir, stats, sec)``.
+
+        Shared by:
+        * the planned long / epic dispatch (``profile.use_map_reduce``);
+        * the standard / tiny truncation fallback.
+
+        Kept on the builder so the import of ``MapReduceIRBuilder``
+        stays lazy (avoids a circular-import risk if the map-reduce
+        module ever wants to call back into ir_builder).
+        """
+        from .ir_map_reduce import MapReduceIRBuilder
+
+        mr_builder = MapReduceIRBuilder(
+            client=self._client,
+            settings=settings,
+            profile=profile,
+            chapter_cache=chapter_cache,
+        )
+        t_initial = time.perf_counter()
+        ir, mr_stats = await mr_builder.build(
+            chapter_plan=list(chapter_plan or []),
+            segments=ctx.segments,
+            frames=ctx.frame_descs,
+            meta=ctx,
+            study_questions=study_questions,
+        )
+        initial_ir_sec = time.perf_counter() - t_initial
+        return ir, mr_stats, initial_ir_sec
 
     def _user_message(
         self,

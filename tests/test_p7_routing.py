@@ -144,7 +144,15 @@ class TestProfileRouter:
         """
         s = get_settings()
         assert select_profile(60.0, s).name == "tiny"
-        assert select_profile(900.0, s).name == "standard"
+        # 600s is comfortably inside the new standard band (<900s).
+        # The old threshold default (180, 1500, 3600) put 900s in
+        # standard; the 2026-05-12 fix lowered the upper bound to 900s
+        # so that BV1ypdgBCE9B-class 20+min code-heavy videos route
+        # straight to the map-reduce builder. See app/config.py.
+        assert select_profile(600.0, s).name == "standard"
+        # 900s is now the boundary that flips into long (exclusive
+        # lower edge belongs to the upper bucket).
+        assert select_profile(900.0, s).name == "long"
         assert select_profile(2200.0, s).name == "long"
         assert select_profile(5000.0, s).name == "epic"
 

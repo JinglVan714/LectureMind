@@ -214,21 +214,32 @@ class Settings(BaseSettings):
     # ---- M2 length-aware routing ----
     # Boundary policy: thresholds are exclusive on the lower side, so a
     # video with duration_sec == tiny_th maps to ``standard``. Set via
-    # CSV string in .env (e.g. ``LECTURE_PROFILE_THRESHOLDS_SEC=180,1500,3600``).
+    # CSV string in .env (e.g. ``LECTURE_PROFILE_THRESHOLDS_SEC=180,900,3600``).
     # ``NoDecode`` disables pydantic-settings' default JSON-decoding for
     # this complex type so the raw CSV string from .env reaches our
     # ``_parse_profile_thresholds`` validator intact (otherwise
-    # ``"180,1500,3600"`` would explode in ``json.loads``).
+    # ``"180,900,3600"`` would explode in ``json.loads``).
+    #
+    # 2026-05-12: standard upper bound lowered from 1500 (25min) to 900
+    # (15min). Real-machine BV1ypdgBCE9B (23min code-heavy lecture)
+    # produced a 19 601-char IR JSON that exceeded the 8192-token
+    # single-call output cap and surfaced as ``LLM truncated LectureIR
+    # JSON (finish_reason=length)``. Routing 15+ min videos straight to
+    # the map-reduce builder avoids the wasted single-call attempt; the
+    # auto-fallback in ``ir_builder.build_with_agents`` is still the
+    # safety net for sub-15min code-dense outliers.
     lecture_profile_thresholds_sec: Annotated[
         tuple[int, int, int], NoDecode
     ] = Field(
-        default=(180, 1500, 3600),
+        default=(180, 900, 3600),
         alias="LECTURE_PROFILE_THRESHOLDS_SEC",
         description=(
             "Three ascending integers (seconds) splitting tiny / "
-            "standard / long / epic profiles. Default (180, 1500, 3600) "
-            "= (<3min / <25min / <60min / 60+min). Override via CSV "
-            "string."
+            "standard / long / epic profiles. Default (180, 900, 3600) "
+            "= (<3min / <15min / <60min / 60+min). 15min upper bound "
+            "for standard keeps single-call IR JSON under DeepSeek's "
+            "8192-token output cap; videos beyond that route to the "
+            "map-reduce builder. Override via CSV string."
         ),
     )
 
@@ -403,6 +414,22 @@ class Settings(BaseSettings):
             "truncation risk profile. The patch-mode Reviser is bounded "
             "by issue count and ignores this knob. Set 0 to fall back "
             "to the backend default."
+        ),
+    )
+    lecture_ir_auto_fallback_to_map_reduce: bool = Field(
+        default=True,
+        alias="LECTURE_IR_AUTO_FALLBACK_TO_MAP_REDUCE",
+        description=(
+            "Architectural safety net for the single-call IR builder. "
+            "When the LLM returns ``finish_reason='length'`` and the "
+            "JSON tail is therefore unterminated, the pipeline normally "
+            "raises ``LLM truncated LectureIR JSON``. With this flag on "
+            "(default), the build instead retries the same video via "
+            "``MapReduceIRBuilder`` using the existing chapter_plan and "
+            "an on-demand ChapterCache so the user gets a successful "
+            "IR even when the bumped 8192-token cap is still too "
+            "small. Disable only when debugging a truncation root "
+            "cause and you want the original error to surface."
         ),
     )
 
