@@ -866,31 +866,55 @@ class CriticReviserAgent:
             subtitle_block=_format_reviser_segments(ctx, issues) or "(?)",
             frames_block=_format_reviser_frames(ctx, issues) or "(?)",
         )
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": LECTURE_REVISER_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "timeout": self._reviser_timeout,
+            "extra_body": self._extra_body,
+        }
+        # Pin output budget. The full-rewrite Reviser emits an entire
+        # IR JSON whose size mirrors the original builder; the same
+        # 4096-default truncation that hit ir_builder applies here.
+        # 0 keeps the backend default for non-DeepSeek backends.
+        max_tokens = int(getattr(self._settings, "lecture_reviser_max_tokens", 0) or 0)
+        if max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
         try:
-            resp = await self._client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": LECTURE_REVISER_SYSTEM},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-                timeout=self._reviser_timeout,
-                extra_body=self._extra_body,
-            )
+            resp = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reviser LLM call failed: %s", exc)
             if self._strict:
                 raise
             return None, {}
 
-        content = resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        content = choice.message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None) or ""
         try:
             obj = _extract_json(content)
         except ValueError as exc:
-            logger.warning("Reviser returned non-JSON: %s", exc)
-            if self._strict:
-                raise
+            # Surface the truncation case separately so logs and (strict
+            # mode) RuntimeError messages point users at the right knob
+            # instead of leaving them chasing a phantom prompt bug.
+            if finish_reason == "length":
+                msg = (
+                    "Reviser truncated full-rewrite JSON "
+                    f"(finish_reason=length, raw {len(content)} chars): "
+                    f"{exc}. Raise LECTURE_REVISER_MAX_TOKENS or switch "
+                    "LECTURE_REVISER_MODE=patch to bypass full rewrites."
+                )
+                logger.warning(msg)
+                if self._strict:
+                    raise RuntimeError(msg) from exc
+            else:
+                logger.warning("Reviser returned non-JSON: %s", exc)
+                if self._strict:
+                    raise
             return None, _usage(resp)
         return obj, _usage(resp)
 

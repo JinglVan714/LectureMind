@@ -391,6 +391,20 @@ class Settings(BaseSettings):
             "backend default."
         ),
     )
+    lecture_reviser_max_tokens: int = Field(
+        default=8192,
+        alias="LECTURE_REVISER_MAX_TOKENS",
+        ge=0,
+        description=(
+            "Max output tokens for the full-rewrite Reviser path "
+            "(``LECTURE_REVISER_MODE=full`` or M1 legacy fallback). The "
+            "Reviser emits an entire IR JSON of roughly the same size "
+            "as the original build, so it shares the IR builder's "
+            "truncation risk profile. The patch-mode Reviser is bounded "
+            "by issue count and ignores this knob. Set 0 to fall back "
+            "to the backend default."
+        ),
+    )
 
     lecture_map_prompt_version: str = Field(
         default="m2-map-v1",

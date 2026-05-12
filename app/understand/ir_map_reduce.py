@@ -384,7 +384,7 @@ class MapReduceIRBuilder:
         for attempt in range(max_retries + 1):
             stats["map_calls"] = int(stats["map_calls"]) + 1
             try:
-                content = await self._call_llm(
+                content, _finish_reason = await self._call_llm(
                     system=LECTURE_IR_MAP_CHAPTER_SYSTEM,
                     user=user,
                     timeout=timeout,
@@ -660,13 +660,28 @@ class MapReduceIRBuilder:
             if stats is not None:
                 stats["reduce_global_attempts"] = int(stats["reduce_global_attempts"]) + 1
             try:
-                content = await self._call_llm(
+                content, finish_reason = await self._call_llm(
                     system=LECTURE_IR_REDUCE_GLOBAL_SYSTEM,
                     user=user,
                     timeout=timeout,
                     max_tokens=max_tokens or None,
                 )
-                obj = _extract_json(content)
+                try:
+                    obj = _extract_json(content)
+                except ValueError as parse_exc:
+                    # Distinguish backend truncation from prompt-leak /
+                    # hallucination so the failure log + final
+                    # ReduceGlobalError tell the user where to look.
+                    # See ir_builder._parse_to_dict for the same pattern.
+                    if finish_reason == "length":
+                        raise RuntimeError(
+                            "Reduce-global truncated lecture-level JSON "
+                            f"(finish_reason=length, raw {len(content)} "
+                            f"chars): {parse_exc}. Raise "
+                            "LECTURE_REDUCE_GLOBAL_MAX_TOKENS or shorten "
+                            "the chapter digest (fewer / shorter chapters)."
+                        ) from parse_exc
+                    raise
                 self._apply_global_pass(local_ir, obj)
                 if stats is not None:
                     stats["reduce_global_sec"] = float(stats["reduce_global_sec"]) + (time.perf_counter() - t0)
@@ -827,12 +842,17 @@ class MapReduceIRBuilder:
         user: str,
         timeout: float,
         max_tokens: int | None = None,
-    ) -> str:
+    ) -> tuple[str, str]:
         """Single ``chat.completions.create`` call wrapped in ``wait_for``.
 
         ``asyncio.wait_for`` enforces the per-call timeout independently
         of whatever the underlying client may already do — keeps test
         responders that just raise ``TimeoutError`` honest.
+
+        Returns ``(content, finish_reason)``. ``finish_reason`` is the
+        empty string when the backend (or a test stub) does not surface
+        the field, so callers can branch on ``== 'length'`` for the
+        explicit truncation case without crashing on legacy stubs.
         """
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -851,7 +871,10 @@ class MapReduceIRBuilder:
 
         coro = self._client.chat.completions.create(**kwargs)
         resp = await asyncio.wait_for(coro, timeout=timeout)
-        return resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        content = choice.message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None) or ""
+        return content, finish_reason
 
 
 __all__ = [
