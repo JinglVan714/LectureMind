@@ -144,15 +144,6 @@
       <div class="chapter-summary rich-text">{{ ch.summary | rich_text }}</div>
       {% endif %}
 
-      {% if ch.teaching_notes %}
-      <div class="teaching-notes">
-        <h3>讲解</h3>
-        {% for note in ch.teaching_notes %}
-        <div class="rich-paragraph">{{ note | rich_text }}</div>
-        {% endfor %}
-      </div>
-      {% endif %}
-
       {% if ch.process_steps %}
       <div class="process-steps">
         <h3>过程拆解</h3>
@@ -161,6 +152,15 @@
           <li>{{ step | rich_text }}</li>
           {% endfor %}
         </ol>
+      </div>
+      {% endif %}
+
+      {% if ch.teaching_notes %}
+      <div class="teaching-notes">
+        <h3>讲解</h3>
+        {% for note in ch.teaching_notes %}
+        <div class="rich-paragraph">{{ note | rich_text }}</div>
+        {% endfor %}
       </div>
       {% endif %}
 
