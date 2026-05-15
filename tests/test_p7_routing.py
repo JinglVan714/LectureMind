@@ -8,6 +8,7 @@ the regression net P7 leans on before the 5-video real-machine sweep.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -318,6 +319,39 @@ class TestCriticLoopV2Dispatch:
         assert latest_ir is ir
         assert telemetry["reviser"]["mode"] == "full"
         assert critique.verdict == "needs_revision"
+
+    def test_audit_failure_is_treated_as_skip_not_pipeline_fatal(self):
+        """A malformed Critic response must not kill the lecture pipeline.
+
+        Real runs can reach this branch when the audit call returns a clipped
+        or otherwise malformed JSON object. The builder should keep the
+        current IR and degrade to a no-op critique instead of propagating the
+        parser failure through strict mode.
+        """
+        calls = {"audit": 0}
+
+        class _StubAgent:
+            async def audit(self, context):
+                calls["audit"] += 1
+                raise json.JSONDecodeError("Expecting ',' delimiter", '{"x": 1', 7)
+
+        builder = _builder_with_stub(_StubAgent())
+        ctx = _make_ctx(duration=900.0)
+        ir = _make_ir(ctx)
+        profile = self._profile("standard", critic_mode="full", reviser_mode="patch")
+
+        critique, latest_ir, rounds, usages, telemetry = _run(
+            builder._run_critic_loop_v2(ctx, ir, ["q?"], profile=profile)
+        )
+
+        assert calls["audit"] == 1
+        assert latest_ir is ir
+        assert rounds == 0
+        assert usages == []
+        assert telemetry["critic_sec"] == 0.0
+        assert telemetry["reviser_sec"] == 0.0
+        assert critique.verdict == "ok"
+        assert critique.summary == "(critic skipped after failure)"
 
 
 # ---------------------------------------------------------------------------

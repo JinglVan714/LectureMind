@@ -19,6 +19,7 @@ from app.copilot.rag import RAGStore
 from app.copilot.tools import ToolContext
 from app.storage.db import Database
 from tests.test_copilot import (  # noqa: E402  reuse helpers
+    _attach_note_and_evidence,
     _lecture_with_taxonomy,
     _make_lecture,
 )
@@ -55,7 +56,7 @@ async def _seed_ctx(tmp_path: Path, lectures, rows_meta=None) -> tuple[ToolConte
 
 
 class TestMcpServerShape:
-    async def test_default_tool_listing_has_five_tools(self, tmp_path):
+    async def test_default_tool_listing_has_note_and_evidence_tools(self, tmp_path):
         ctx, rag = await _seed_ctx(tmp_path, [_make_lecture("BV_MCP1")])
         try:
             mcp = build_mcp(ctx, expose_summarize=False)
@@ -64,8 +65,14 @@ class TestMcpServerShape:
                 names = sorted(t.name for t in tools)
             assert names == sorted(
                 [
+                    "search_evidence",
                     "search_lectures",
+                    "get_note_unit",
+                    "get_evidence_object",
                     "get_chapter",
+                    "get_frame",
+                    "get_quote_context",
+                    "explain_frame",
                     "get_knowledge_units",
                     "get_frame_description",
                     "list_lectures",
@@ -118,8 +125,54 @@ class TestMcpToolCalls:
         finally:
             await rag.close()
 
+    async def test_get_note_unit_returns_note_payload(self, tmp_path):
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_make_lecture("BV_NU"))])
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "get_note_unit", {"bv": "BV_NU", "unit_id": "unit-1"}
+                )
+            assert result.is_error is False
+            assert result.data["unit"]["unit_id"] == "unit-1"
+            assert "ev-frame-1" in result.data["related_evidence_ids"]
+        finally:
+            await rag.close()
+
+    async def test_get_evidence_object_returns_evidence_payload(self, tmp_path):
+        ctx, rag = await _seed_ctx(
+            tmp_path, [_attach_note_and_evidence(_make_lecture("BV_EO"))]
+        )
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "get_evidence_object", {"bv": "BV_EO", "evidence_id": "ev-quote-1"}
+                )
+            assert result.is_error is False
+            assert result.data["evidence"]["evidence_id"] == "ev-quote-1"
+            assert result.data["relations"]
+        finally:
+            await rag.close()
+
+    async def test_search_evidence_returns_hits(self, tmp_path):
+        ctx, rag = await _seed_ctx(
+            tmp_path, [_attach_note_and_evidence(_make_lecture("BV_SE_MCP"))]
+        )
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "search_evidence", {"bv": "BV_SE_MCP", "query": "归一化", "top_k": 3}
+                )
+            assert result.is_error is False
+            assert result.data["hits"]
+            assert result.data["hits"][0]["evidence_id"] == "ev-quote-1"
+        finally:
+            await rag.close()
+
     async def test_get_chapter_returns_full_payload(self, tmp_path):
-        ctx, rag = await _seed_ctx(tmp_path, [_make_lecture("BV_GC")])
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_make_lecture("BV_GC"))])
         try:
             mcp = build_mcp(ctx)
             async with Client(mcp) as client:
@@ -131,6 +184,16 @@ class TestMcpToolCalls:
             assert data["chapter_idx"] == 1
             assert data["title"] == "第一章"
             assert len(data["frames"]) >= 1
+            assert data["compatibility_anchor_kind"] == "chapter"
+            assert data["compatibility_anchor_id"] == "Ch1"
+            assert data["primary_ref_kind"] == ""
+            assert data["primary_ref_id"] == ""
+            assert data["primary_evidence_id"] == ""
+            assert data["primary_note_node_id"] == ""
+            assert data["primary_note_unit_id"] == ""
+            assert data["primary_note_node_type"] == ""
+            assert data["primary_note_title"] == ""
+            assert data["primary_evidence_kind"] == ""
         finally:
             await rag.close()
 
@@ -168,7 +231,7 @@ class TestMcpToolCalls:
             await rag.close()
 
     async def test_get_frame_description_returns_frame(self, tmp_path):
-        ctx, rag = await _seed_ctx(tmp_path, [_lecture_with_taxonomy("BV_FD")])
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_lecture_with_taxonomy("BV_FD"))])
         try:
             mcp = build_mcp(ctx)
             async with Client(mcp) as client:
@@ -178,6 +241,105 @@ class TestMcpToolCalls:
             assert result.is_error is False
             assert result.data["frame_id"] == 1
             assert result.data["path"] == "/img/ch1_diagram.jpg"
+            assert result.data["compatibility_anchor_kind"] == "frame"
+            assert result.data["compatibility_anchor_id"] == "F1"
+            assert result.data["primary_ref_kind"] == "evidence"
+            assert result.data["primary_ref_id"] == "ev-frame-1"
+            assert result.data["primary_evidence_id"] == "ev-frame-1"
+            assert result.data["primary_note_node_id"] == "unit-1"
+            assert result.data["primary_note_unit_id"] == "unit-1"
+            assert result.data["primary_note_node_type"] == "teaching_unit"
+            assert result.data["primary_note_title"] == "主线单元一"
+            assert result.data["primary_evidence_kind"] == "frame_evidence"
+        finally:
+            await rag.close()
+
+    async def test_get_frame_returns_frame(self, tmp_path):
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_lecture_with_taxonomy("BV_GF_MCP"))])
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "get_frame", {"bv": "BV_GF_MCP", "frame_id": 1}
+                )
+            assert result.is_error is False
+            data = result.data
+            assert data["frame_id"] == 1
+            assert data["compatibility_anchor_kind"] == "frame"
+            assert data["compatibility_anchor_id"] == "F1"
+            assert data["primary_ref_kind"] == "evidence"
+            assert data["primary_ref_id"] == "ev-frame-1"
+            assert data["caption"] == "架构图"
+        finally:
+            await rag.close()
+
+    async def test_get_frame_description_time_only_match_keeps_canonical_empty(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_FD_TIMEONLY"))
+        lec.evidence_index.evidence_objects[1].path = ""
+        lec.evidence_index.evidence_objects[1].ts = 45
+        ctx, rag = await _seed_ctx(tmp_path, [lec])
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "get_frame_description", {"bv": "BV_FD_TIMEONLY", "frame_id": 1}
+                )
+            assert result.is_error is False
+            data = result.data
+            assert data["compatibility_anchor_kind"] == "frame"
+            assert data["compatibility_anchor_id"] == "F1"
+            assert "ev-frame-1" in data["related_evidence_ids"]
+            assert "unit-1" in data["related_note_node_ids"]
+            assert data["primary_ref_kind"] == ""
+            assert data["primary_ref_id"] == ""
+            assert data["primary_evidence_id"] == ""
+            assert data["primary_note_node_id"] == ""
+            assert data["primary_note_unit_id"] == ""
+            assert data["primary_note_node_type"] == ""
+            assert data["primary_note_title"] == ""
+            assert data["primary_evidence_kind"] == ""
+        finally:
+            await rag.close()
+
+    async def test_get_quote_context_keeps_canonical_empty_without_explicit_quote_bridge(self, tmp_path):
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_make_lecture("BV_QC_MCP"))])
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "get_quote_context", {"bv": "BV_QC_MCP", "quote": "A 就是 X"}
+                )
+            assert result.is_error is False
+            data = result.data
+            assert data["compatibility_anchor_kind"] == "quote"
+            assert data["compatibility_anchor_id"] == "A 就是 X"
+            assert "ev-quote-1" in data["related_evidence_ids"]
+            assert "block-1" in data["related_note_node_ids"]
+            assert data["primary_ref_kind"] == ""
+            assert data["primary_ref_id"] == ""
+            assert data["primary_evidence_id"] == ""
+            assert data["primary_note_node_id"] == ""
+            assert data["primary_note_unit_id"] == ""
+            assert data["primary_note_node_type"] == ""
+            assert data["primary_note_title"] == ""
+            assert data["primary_evidence_kind"] == ""
+        finally:
+            await rag.close()
+
+    async def test_explain_frame_returns_payload(self, tmp_path):
+        ctx, rag = await _seed_ctx(tmp_path, [_attach_note_and_evidence(_lecture_with_taxonomy("BV_EF_MCP"))])
+        try:
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "explain_frame", {"bv": "BV_EF_MCP", "frame_id": 1}
+                )
+            assert result.is_error is False
+            data = result.data
+            assert data["frame_id"] == 1
+            assert data["compatibility_anchor_kind"] == "frame"
+            assert data["compatibility_anchor_id"] == "F1"
+            assert data["why_useful"]
         finally:
             await rag.close()
 
@@ -241,8 +403,14 @@ class TestMcpServerLifespan:
             assert result.is_error is False
             assert result.data["lectures"] == []
         assert {t.name for t in tools} == {
+            "search_evidence",
             "search_lectures",
+            "get_note_unit",
+            "get_evidence_object",
             "get_chapter",
+            "get_frame",
+            "get_quote_context",
+            "explain_frame",
             "get_knowledge_units",
             "get_frame_description",
             "list_lectures",

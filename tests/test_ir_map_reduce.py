@@ -614,6 +614,135 @@ def test_reduce_global_pass_only_overwrites_top_level_fields(tmp_path: Path) -> 
     assert ir.chapters[0].code_blocks[0].code == "x = 1"
 
 
+def test_reduce_global_pass_parses_core_question_taxonomy_and_long_synthesis(tmp_path: Path) -> None:
+    def _global_with_new_fields(user: str, kwargs: dict[str, Any], client: _StubClient) -> dict[str, Any]:
+        return {
+            "lecture_summary": "short summary fallback",
+            "mainline": [
+                {"step": 1, "title": "define QKV", "ts": 0, "chapter_index": 1},
+                {"step": 2, "title": "compute weights", "ts": 600, "chapter_index": 2},
+            ],
+            "glossary_resolved": [],
+            "cross_references": [],
+            "core_question": "How does the lecture build from QKV to a full attention pass?",
+            "final_synthesis_long": (
+                "This lecture starts by fixing the role of Q, K and V as distinct inputs, then it shows how the "
+                "weighting step turns those inputs into an interpretable relevance pattern. It closes by connecting "
+                "that local mechanism to the whole forward pass, highlighting what changes when the same idea is "
+                "scaled across multiple heads and where readers should look next when implementing it themselves."
+            ),
+            "taxonomy": {
+                "domain": "AI 技术",
+                "direction": "Attention Mechanisms",
+                "tags": ["attention", "qkv"],
+                "confidence": 0.91,
+            },
+        }
+
+    client = _StubClient(global_responder=_global_with_new_fields)
+    cache = ChapterCache(tmp_path / "cc.sqlite")
+    builder = _builder(client=client, cache=cache)
+    ir, _ = asyncio.run(
+        builder.build(
+            chapter_plan=[_anchor(0.0, 600.0), _anchor(600.0, 1800.0)],
+            segments=_segments_full(),
+            frames=_frames_full(),
+            meta=_Meta(),
+            study_questions=[],
+        )
+    )
+
+    assert ir.core_question == "How does the lecture build from QKV to a full attention pass?"
+    assert "weighting step" in ir.final_synthesis
+    assert ir.taxonomy is not None
+    assert ir.taxonomy.domain == "AI 技术"
+    assert ir.taxonomy.tags == ["attention", "qkv"]
+    assert ir.mainline == ["define QKV", "compute weights"]
+
+
+def test_reduce_global_pass_backfills_mainline_from_chapter_learning_goals_when_missing(tmp_path: Path) -> None:
+    def _map_with_learning_goals(user: str, kwargs: dict[str, Any], client: _StubClient) -> dict[str, Any]:
+        idx = _chapter_index_from_user(user)
+        return {
+            "title": f"map title {idx}",
+            "summary": f"map title {idx}",
+            "learning_goal": f"goal {idx}: explain stage {idx}",
+            "teaching_notes": [f"note {idx}"],
+            "process_steps": [],
+            "points": [{"text": f"map point {idx}", "ts": float(idx), "quote": f"q{idx}"}],
+            "code_blocks": [],
+            "formula_blocks": [],
+            "pitfalls": [],
+            "key_takeaways": [f"take {idx}"],
+            "knowledge_units": [],
+        }
+
+    def _global_without_mainline(user: str, kwargs: dict[str, Any], client: _StubClient) -> dict[str, Any]:
+        return {
+            "lecture_summary": "fallback summary",
+            "mainline": [],
+            "glossary_resolved": [],
+            "cross_references": [],
+            "core_question": "How do the stages connect?",
+            "final_synthesis_long": "x" * 220,
+            "taxonomy": {"domain": "AI 技术", "direction": "Pipeline", "tags": ["pipeline"], "confidence": 0.8},
+        }
+
+    client = _StubClient(map_responder=_map_with_learning_goals, global_responder=_global_without_mainline)
+    cache = ChapterCache(tmp_path / "cc.sqlite")
+    builder = _builder(client=client, cache=cache)
+    ir, _ = asyncio.run(
+        builder.build(
+            chapter_plan=[_anchor(0.0, 600.0), _anchor(600.0, 1200.0)],
+            segments=_segments_full(),
+            frames=_frames_full(),
+            meta=_Meta(),
+            study_questions=[],
+        )
+    )
+
+    assert ir.mainline == ["goal 1: explain stage 1", "goal 2: explain stage 2"]
+    assert ir.completeness.mainline_closed is True
+
+
+def test_reduce_global_pass_falls_back_when_long_synthesis_degenerates_to_mainline(tmp_path: Path) -> None:
+    def _degenerate_global(user: str, kwargs: dict[str, Any], client: _StubClient) -> dict[str, Any]:
+        titles = [
+            "define QKV in detail and explain why each tensor exists before any weighting happens in the lecture",
+            "compute attention weights step by step, keeping the same notation and intermediate checks in view",
+            "connect the weighted values back to the final output path and restate the exact boundaries already given",
+        ]
+        repeated = " ".join(titles)
+        return {
+            "lecture_summary": "fallback lecture summary",
+            "mainline": [
+                {"step": 1, "title": titles[0], "ts": 0, "chapter_index": 1},
+                {"step": 2, "title": titles[1], "ts": 600, "chapter_index": 2},
+                {"step": 3, "title": titles[2], "ts": 1200, "chapter_index": 2},
+            ],
+            "glossary_resolved": [],
+            "cross_references": [],
+            "core_question": "What is the full path from QKV to output?",
+            "final_synthesis_long": repeated,
+            "taxonomy": {"domain": "AI 技术", "direction": "Attention", "tags": ["attention"], "confidence": 0.7},
+        }
+
+    client = _StubClient(global_responder=_degenerate_global)
+    cache = ChapterCache(tmp_path / "cc.sqlite")
+    builder = _builder(client=client, cache=cache)
+    ir, _ = asyncio.run(
+        builder.build(
+            chapter_plan=[_anchor(0.0, 1800.0)],
+            segments=_segments_full(),
+            frames=_frames_full(),
+            meta=_Meta(),
+            study_questions=[],
+        )
+    )
+
+    assert ir.final_synthesis == "fallback lecture summary"
+
+
 def test_reduce_global_pass_raises_on_timeout_after_retries(tmp_path: Path) -> None:
     """Two consecutive timeouts on the global pass → ReduceGlobalError.
 

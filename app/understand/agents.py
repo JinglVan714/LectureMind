@@ -66,11 +66,14 @@ def _extract_json(raw: str) -> dict[str, Any]:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
     try:
         obj = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         match = _JSON_OBJ_RE.search(text)
         if not match:
-            raise ValueError("no JSON object found in response")
-        obj = json.loads(match.group(0))
+            raise ValueError("no JSON object found in response") from exc
+        try:
+            obj = json.loads(match.group(0))
+        except json.JSONDecodeError as inner_exc:
+            raise ValueError(f"malformed JSON object: {inner_exc}") from inner_exc
     if not isinstance(obj, dict):
         raise ValueError("top-level JSON is not an object")
     return _repair_latex_escapes(obj)

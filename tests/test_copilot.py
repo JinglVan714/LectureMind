@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 
 # Match the fixture isolation pattern in test_smoke.py: any code that
 # touches Settings during import will pick up a sandboxed DATA_DIR.
@@ -34,9 +35,12 @@ from app.copilot.taxonomy import (  # noqa: E402
 from app.storage.db import Database  # noqa: E402
 from app.understand.schema import (  # noqa: E402
     Chapter,
+    EvidenceObject,
+    EvidenceIndex,
     Frame,
     KnowledgeUnitView,
     LectureJSON,
+    LectureNoteIR,
     Point,
     Taxonomy,
 )
@@ -92,13 +96,13 @@ class TestTaxonomyNormalize:
         t = Taxonomy(domain="AI 技术", direction="注意力机制", tags=raw, confidence=0.8)
         out = normalize(t)
         assert out is not None
-        assert len(out.tags) == 8
+        assert len(out.tags) == 5
         # Original casing of the *first* occurrence is preserved.
         assert out.tags[0] == "Transformer"
         assert out.tags[1] == "KV-cache"
         # No duplicates, case-insensitive.
         lowered = [t.lower() for t in out.tags]
-        assert len(set(lowered)) == 8
+        assert len(set(lowered)) == 5
 
     def test_tags_drop_empty_and_non_string(self):
         t = Taxonomy(
@@ -282,6 +286,35 @@ class TestChunkLecture:
         assert "模块 A" in text
         # path preserved in meta for downstream tools
         assert frame_chunk.meta["path"] == "/img/ch1_diagram.jpg"
+    def test_prefers_evidence_index_rag_chunks_when_present(self):
+        lecture = _attach_note_and_evidence(_make_lecture("BV_EVIDENCE"))
+        chunks = chunk_lecture(lecture)
+
+        assert [chunk.kind for chunk in chunks] == ["quote", "frame_ocr"]
+        quote_chunk = chunks[0]
+        assert quote_chunk.text == "证据块：先比较再归一化"
+        assert quote_chunk.meta["evidence_id"] == "ev-quote-1"
+        assert quote_chunk.meta["note_node_id"] == "block-1"
+        assert quote_chunk.meta["evidence_kind"] == "quote_evidence"
+        assert quote_chunk.meta["quote"] == "原字幕：A 就是 X，因为先比较再归一化。"
+
+    def test_falls_back_to_legacy_chunks_when_evidence_index_has_no_rag_chunks(self):
+        lecture = _make_lecture("BV_EVIDENCE_EMPTY")
+        lecture.evidence_index = EvidenceIndex.model_validate(
+            {
+                "evidence_objects": [
+                    {
+                        "evidence_id": "ev-empty",
+                        "kind": "compound_evidence",
+                    }
+                ]
+            }
+        )
+
+        chunks = chunk_lecture(lecture)
+
+        assert any(chunk.kind == "teaching_note" for chunk in chunks)
+        assert any(chunk.kind == "quote" for chunk in chunks)
 
 
 class _StubEmbedder:
@@ -434,12 +467,15 @@ from app.copilot.tools import (  # noqa: E402
     ToolContext,
     ToolError,
     explain_frame,
+    get_evidence_object,
     get_chapter,
     get_frame,
     get_frame_description,
     get_knowledge_units,
+    get_note_unit,
     get_quote_context,
     list_lectures,
+    search_evidence,
     search_lecture,
     search_lectures,
     summarize_video,
@@ -574,6 +610,96 @@ def _lecture_with_taxonomy(bv: str, *, domain="AI 技术", direction="注意力�
     return lec
 
 
+def _attach_note_and_evidence(lecture: LectureJSON) -> LectureJSON:
+    lecture.lecture_note_ir = LectureNoteIR.model_validate(
+        {
+            "front_matter": {
+                "one_sentence_claim": "这份讲义先交代主问题，再解释证据如何逐步支撑结论。",
+                "takeaways_top": [
+                    "先看主线，再定位证据",
+                    "point A 是第一段解释的核心",
+                ],
+            },
+            "body": {
+                "teaching_units": [
+                    {
+                        "unit_id": "unit-1",
+                        "title": "主线单元一",
+                        "core_message": "先理解概念 A 的作用，再连接到概念 B。",
+                        "content_blocks": [
+                            {
+                                "block_id": "block-1",
+                                "title": "概念 A",
+                                "paragraphs": ["概念 A 决定了后续比较方式。"],
+                            }
+                        ],
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "title": "主线单元二",
+                        "core_message": "再用关键证据说明概念 B 如何收束前面的论证。",
+                        "content_blocks": [
+                            {
+                                "block_id": "block-2",
+                                "title": "概念 B",
+                                "paragraphs": ["概念 B 负责把前面的局部判断组合起来。"],
+                            }
+                        ],
+                    },
+                ]
+            },
+        }
+    )
+    lecture.evidence_index = EvidenceIndex.model_validate(
+        {
+            "evidence_objects": [
+                {
+                    "evidence_id": "ev-quote-1",
+                    "kind": "quote_evidence",
+                    "summary": "原话先比较再归一化。",
+                    "quote": "原字幕：A 就是 X，因为先比较再归一化。",
+                    "chapter_index": 1,
+                    "note_node_ids": ["block-1"],
+                    "rag_chunks": [
+                        {
+                            "kind": "quote",
+                            "chapter_idx": 1,
+                            "t_start": 30,
+                            "t_end": 30,
+                            "text": "证据块：先比较再归一化",
+                            "note_node_id": "block-1",
+                            "meta": {"source": "subtitle"},
+                        }
+                    ],
+                },
+                {
+                    "evidence_id": "ev-frame-1",
+                    "kind": "frame_evidence",
+                    "summary": "关键图示把 A 和 B 的关系放在一张图里。",
+                    "chapter_index": 1,
+                    "path": "/img/ch1_diagram.jpg",
+                    "note_node_ids": ["unit-1"],
+                    "rag_chunks": [
+                        {
+                            "kind": "frame_ocr",
+                            "chapter_idx": 1,
+                            "t_start": 45,
+                            "t_end": 45,
+                            "text": "证据图：A -> B",
+                            "note_node_id": "unit-1",
+                        }
+                    ],
+                },
+            ],
+            "evidence_relations": [
+                {"relation": "supports", "from_id": "ev-quote-1", "to_id": "block-1"},
+                {"relation": "supports", "from_id": "ev-frame-1", "to_id": "unit-1"},
+            ],
+        }
+    )
+    return lecture
+
+
 class TestToolGetChapter:
     async def test_valid(self, tmp_path):
         lec = _make_lecture("BV_GC")
@@ -611,6 +737,57 @@ class TestToolGetChapter:
         finally:
             await rag.close()
 
+    async def test_exposes_note_and_evidence_entrypoints_when_present(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_GC_NOTE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_chapter(ctx, bv="BV_GC_NOTE", chapter_idx=1)
+            assert "ev-quote-1" in out.related_evidence_ids
+            assert out.related_note_node_ids == []
+            assert out.compatibility_anchor_kind == "chapter"
+            assert out.compatibility_anchor_id == "Ch1"
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+    async def test_chapter_primary_requires_explicit_chapter_bridge(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_GC_CHAPTER"))
+        lec.evidence_index.evidence_objects.append(
+            EvidenceObject.model_validate(
+                {
+                    "evidence_id": "chapter-1",
+                    "kind": "chapter_evidence",
+                    "title": "第一章主桥",
+                    "chapter_index": 1,
+                    "note_node_ids": ["unit-1"],
+                }
+            )
+        )
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_chapter(ctx, bv="BV_GC_CHAPTER", chapter_idx=1)
+            assert "ev-quote-1" in out.related_evidence_ids
+            assert "chapter-1" in out.related_evidence_ids
+            assert out.compatibility_anchor_kind == "chapter"
+            assert out.compatibility_anchor_id == "Ch1"
+            assert out.primary_ref_kind == "evidence"
+            assert out.primary_ref_id == "chapter-1"
+            assert out.primary_evidence_id == "chapter-1"
+            assert out.primary_note_node_id == "unit-1"
+            assert out.primary_note_unit_id == "unit-1"
+            assert out.primary_note_node_type == "teaching_unit"
+            assert out.primary_note_title == "主线单元一"
+            assert out.primary_evidence_kind == "chapter_evidence"
+        finally:
+            await rag.close()
+
 
 class TestToolGetFrame:
     async def test_valid(self, tmp_path):
@@ -637,6 +814,48 @@ class TestToolGetFrame:
         finally:
             await rag.close()
 
+    async def test_returns_related_evidence_backlinks_when_present(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_GF_NOTE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_frame(ctx, bv="BV_GF_NOTE", frame_id=1)
+            assert "ev-frame-1" in out.related_evidence_ids
+            assert "unit-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.primary_ref_kind == "evidence"
+            assert out.primary_ref_id == "ev-frame-1"
+            assert out.primary_evidence_id == "ev-frame-1"
+            assert out.primary_note_node_id == "unit-1"
+            assert out.primary_note_unit_id == "unit-1"
+            assert out.primary_note_node_type == "teaching_unit"
+            assert out.primary_note_title == "主线单元一"
+            assert out.primary_evidence_kind == "frame_evidence"
+        finally:
+            await rag.close()
+
+    async def test_frame_time_only_match_keeps_canonical_fields_empty(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_GF_TIMEONLY"))
+        lec.evidence_index.evidence_objects[1].path = ""
+        lec.evidence_index.evidence_objects[1].ts = 45
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_frame(ctx, bv="BV_GF_TIMEONLY", frame_id=1)
+            assert "ev-frame-1" in out.related_evidence_ids
+            assert "unit-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
 
 class TestToolExplainFrame:
     async def test_returns_context_quotes(self, tmp_path):
@@ -656,6 +875,48 @@ class TestToolExplainFrame:
         try:
             out = await explain_frame(ctx, bv="BV_EF2", frame_id=1, context_radius_seconds=0)
             assert out.context_quotes == []
+        finally:
+            await rag.close()
+
+    async def test_returns_related_backlinks_when_present(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_EF_NOTE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await explain_frame(ctx, bv="BV_EF_NOTE", frame_id=1)
+            assert "ev-frame-1" in out.related_evidence_ids
+            assert "unit-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.primary_ref_kind == "evidence"
+            assert out.primary_ref_id == "ev-frame-1"
+            assert out.primary_evidence_id == "ev-frame-1"
+            assert out.primary_note_node_id == "unit-1"
+            assert out.primary_note_unit_id == "unit-1"
+            assert out.primary_note_node_type == "teaching_unit"
+            assert out.primary_note_title == "主线单元一"
+            assert out.primary_evidence_kind == "frame_evidence"
+        finally:
+            await rag.close()
+
+    async def test_explain_frame_time_only_match_keeps_canonical_fields_empty(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_EF_TIMEONLY"))
+        lec.evidence_index.evidence_objects[1].path = ""
+        lec.evidence_index.evidence_objects[1].ts = 45
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await explain_frame(ctx, bv="BV_EF_TIMEONLY", frame_id=1)
+            assert "ev-frame-1" in out.related_evidence_ids
+            assert "unit-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
         finally:
             await rag.close()
 
@@ -683,7 +944,230 @@ class TestToolGetQuoteContext:
             await rag.close()
 
 
+    async def test_returns_related_backlinks_when_present(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_QC_NOTE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_quote_context(ctx, bv="BV_QC_NOTE", quote="A 就是 X")
+            assert "ev-quote-1" in out.related_evidence_ids
+            assert "block-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "quote"
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+    async def test_quote_context_does_not_backfill_chapter_wide_quote_evidence(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_QC_STRICT"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_quote_context(ctx, bv="BV_QC_STRICT", quote="因为 ...")
+            assert out.related_evidence_ids == []
+            assert out.related_note_node_ids == []
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+    async def test_quote_context_primary_requires_explicit_quote_bridge(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_QC_EXPLICIT"))
+        unit = lec.lecture_note_ir.body.teaching_units[0]
+        block = unit.content_blocks[0]
+        unit.source_chapter_refs = [1]
+        block.source_chapter_refs = [1]
+        block.evidence_refs = ["ev-quote-1"]
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_quote_context(ctx, bv="BV_QC_EXPLICIT", quote="A 就是 X")
+            assert "ev-quote-1" in out.related_evidence_ids
+            assert "block-1" in out.related_note_node_ids
+            assert out.compatibility_anchor_kind == "quote"
+            assert out.compatibility_anchor_id == "A 就是 X"
+            assert out.primary_ref_kind == "evidence"
+            assert out.primary_ref_id == "ev-quote-1"
+            assert out.primary_evidence_id == "ev-quote-1"
+            assert out.primary_note_node_id == "block-1"
+            assert out.primary_note_unit_id == "unit-1"
+            assert out.primary_note_node_type == "content_block"
+            assert out.primary_note_title == "概念 A"
+            assert out.primary_evidence_kind == "quote_evidence"
+        finally:
+            await rag.close()
+
+    async def test_get_chapter_without_explicit_bridge_keeps_canonical_fields_empty(self, tmp_path):
+        lec = _make_lecture("BV_GC_STRICT")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_chapter(ctx, bv="BV_GC_STRICT", chapter_idx=1)
+            assert out.compatibility_anchor_kind == "chapter"
+            assert out.compatibility_anchor_id == "Ch1"
+            assert out.related_evidence_ids == []
+            assert out.related_note_node_ids == []
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+    async def test_get_frame_without_explicit_bridge_keeps_canonical_fields_empty(self, tmp_path):
+        lec = _lecture_with_taxonomy("BV_GF_STRICT")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_frame(ctx, bv="BV_GF_STRICT", frame_id=1)
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.related_evidence_ids == []
+            assert out.related_note_node_ids == []
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+    async def test_explain_frame_without_explicit_bridge_keeps_canonical_fields_empty(self, tmp_path):
+        lec = _lecture_with_taxonomy("BV_EF_STRICT")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await explain_frame(ctx, bv="BV_EF_STRICT", frame_id=1)
+            assert out.compatibility_anchor_kind == "frame"
+            assert out.compatibility_anchor_id == "F1"
+            assert out.related_evidence_ids == []
+            assert out.related_note_node_ids == []
+            assert out.primary_ref_kind == ""
+            assert out.primary_ref_id == ""
+            assert out.primary_evidence_id == ""
+            assert out.primary_note_node_id == ""
+            assert out.primary_note_unit_id == ""
+            assert out.primary_note_node_type == ""
+            assert out.primary_note_title == ""
+            assert out.primary_evidence_kind == ""
+        finally:
+            await rag.close()
+
+
+class TestToolGetNoteUnit:
+    async def test_returns_teaching_unit(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_GNU"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_note_unit(ctx, bv="BV_GNU", unit_id="unit-1")
+            assert out.unit.unit_id == "unit-1"
+            assert out.focused_block is None
+            assert "ev-frame-1" in out.related_evidence_ids
+            assert out.primary_ref_kind == "note"
+            assert out.primary_ref_id == "unit-1"
+            assert out.primary_evidence_id == "ev-frame-1"
+        finally:
+            await rag.close()
+
+    async def test_accepts_block_id_and_returns_focused_block(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_GNU_BLOCK"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_note_unit(ctx, bv="BV_GNU_BLOCK", unit_id="block-1")
+            assert out.unit.unit_id == "unit-1"
+            assert out.focused_block is not None
+            assert out.focused_block.block_id == "block-1"
+            assert out.resolved_node_type == "content_block"
+            assert "ev-quote-1" in out.related_evidence_ids
+        finally:
+            await rag.close()
+
+
+class TestToolGetEvidenceObject:
+    async def test_returns_evidence_and_relations(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_GEO"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await get_evidence_object(ctx, bv="BV_GEO", evidence_id="ev-quote-1")
+            assert out.evidence.evidence_id == "ev-quote-1"
+            assert any(rel.relation == "supports" for rel in out.relations)
+            assert "unit-1" in out.related_note_unit_ids
+            assert out.primary_ref_kind == "evidence"
+            assert out.primary_ref_id == "ev-quote-1"
+            assert out.primary_note_node_id == "unit-1"
+        finally:
+            await rag.close()
+
+
+class TestToolSearchEvidence:
+    async def test_searches_evidence_index(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_SE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            out = await search_evidence(ctx, bv="BV_SE", query="归一化", top_k=3)
+            assert out.hits
+            assert out.hits[0].evidence_id == "ev-quote-1"
+            assert "block-1" in out.hits[0].note_node_ids
+        finally:
+            await rag.close()
+
+
 class TestToolSearchLecture:
+    async def test_fts_only_falls_back_to_evidence_backed_chunks(self, tmp_path, monkeypatch):
+        try:
+            import sqlite_vec
+        except ModuleNotFoundError:
+            sqlite_vec = None
+
+        if sqlite_vec is not None:
+            def _fake_load(conn):  # type: ignore[no-untyped-def]
+                raise RuntimeError("simulated: sqlite-vec native lib not loadable")
+
+            monkeypatch.setattr(sqlite_vec, "load", _fake_load)
+
+        lec = _attach_note_and_evidence(_make_lecture("BV_S1_EVIDENCE_FTS"))
+        lec.evidence_index.evidence_objects[0].title = "Harness 可控性"
+        lec.evidence_index.evidence_objects[0].summary = "隔离样本强调 Harness 可控性与可复现验证。"
+        lec.evidence_index.evidence_objects[0].rag_chunks[0].text = "deterministic fixture setup"
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        assert rag.vec_available is False
+        try:
+            from app.copilot.indexer import index_lecture as _index_lecture
+
+            n = await _index_lecture(rag, "BV_S1_EVIDENCE_FTS", lec)
+            assert n == 2
+            assert await rag.search("Harness 可控性", bv_id="BV_S1_EVIDENCE_FTS", top_k=3) == []
+
+            out = await search_lecture(
+                ctx,
+                bv="BV_S1_EVIDENCE_FTS",
+                query="Harness 可控性",
+                top_k=3,
+            )
+
+            assert out.chunks
+            hit = out.chunks[0]
+            assert hit.text == "deterministic fixture setup"
+            assert hit.evidence_id == "ev-quote-1"
+            assert hit.note_node_id == "block-1"
+            assert hit.evidence_kind == "quote_evidence"
+            assert hit.meta["evidence_id"] == "ev-quote-1"
+        finally:
+            await rag.close()
+
     async def test_top_k_returns_chunks(self, tmp_path):
         lec = _make_lecture("BV_S1")
         mapping = {
@@ -707,6 +1191,60 @@ class TestToolSearchLecture:
             # top_k cap is honoured.
             out_more = await search_lecture(ctx, bv="BV_S1", query="concept query", top_k=10)
             assert len(out_more.chunks) <= 10
+        finally:
+            await rag.close()
+
+    async def test_evidence_index_hits_preserve_backlinks(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_S1_EVIDENCE"))
+        mapping = {
+            "主线证据 query": [1.0, 0.0, 0.0, 0.0],
+            "证据块：先比较再归一化": [0.95, 0.05, 0.0, 0.0],
+            "证据图：A -> B": [0.9, 0.1, 0.0, 0.0],
+        }
+        ctx, rag = await _build_ctx(tmp_path, [lec], embedder_mapping=mapping)
+        if not rag.vec_available:
+            await rag.close()
+            pytest.skip("sqlite-vec extension unavailable")
+        try:
+            from app.copilot.indexer import index_lecture as _index_lecture
+
+            n = await _index_lecture(rag, "BV_S1_EVIDENCE", lec)
+            assert n == 2
+            out = await search_lecture(ctx, bv="BV_S1_EVIDENCE", query="主线证据 query", top_k=2)
+            assert len(out.chunks) == 2
+            hit = out.chunks[0]
+            assert hit.meta["evidence_id"] == "ev-quote-1"
+            assert hit.meta["note_node_id"] == "block-1"
+            assert hit.meta["evidence_kind"] == "quote_evidence"
+            assert hit.evidence_id == "ev-quote-1"
+            assert hit.note_node_id == "block-1"
+            assert hit.evidence_kind == "quote_evidence"
+            assert hit.quote == "原字幕：A 就是 X，因为先比较再归一化。"
+        finally:
+            await rag.close()
+
+    async def test_search_lecture_backlink_matches_evidence_object_rag_chunk_note_node(self, tmp_path):
+        lec = _attach_note_and_evidence(_make_lecture("BV_S1_CHAIN"))
+        mapping = {
+            "主线证据 chain query": [1.0, 0.0, 0.0, 0.0],
+            "证据块：先比较再归一化": [0.95, 0.05, 0.0, 0.0],
+            "证据图：A -> B": [0.9, 0.1, 0.0, 0.0],
+        }
+        ctx, rag = await _build_ctx(tmp_path, [lec], embedder_mapping=mapping)
+        if not rag.vec_available:
+            await rag.close()
+            pytest.skip("sqlite-vec extension unavailable")
+        try:
+            from app.copilot.indexer import index_lecture as _index_lecture
+
+            await _index_lecture(rag, "BV_S1_CHAIN", lec)
+            out = await search_lecture(ctx, bv="BV_S1_CHAIN", query="主线证据 chain query", top_k=2)
+            hit = next(chunk for chunk in out.chunks if chunk.evidence_id == "ev-quote-1")
+            evidence_out = await get_evidence_object(ctx, bv="BV_S1_CHAIN", evidence_id=hit.evidence_id)
+            expected_note_node_id = evidence_out.evidence.rag_chunks[0].note_node_id
+
+            assert expected_note_node_id == "block-1"
+            assert hit.note_node_id == expected_note_node_id
         finally:
             await rag.close()
 
@@ -821,7 +1359,10 @@ class TestToolRegistryShape:
     def test_copilot_tools_count(self):
         assert set(COPILOT_TOOLS) == {
             "search_lecture",
+            "search_evidence",
             "search_lectures",
+            "get_note_unit",
+            "get_evidence_object",
             "get_chapter",
             "get_frame",
             "get_quote_context",
@@ -831,10 +1372,15 @@ class TestToolRegistryShape:
     def test_mcp_tools_count(self):
         assert set(MCP_TOOLS) == {
             "summarize_video",
+            "search_evidence",
             "search_lectures",
+            "get_note_unit",
+            "get_evidence_object",
             "get_chapter",
+            "get_frame",
+            "get_quote_context",
+            "explain_frame",
             "get_knowledge_units",
-            "get_frame_description",
             "list_lectures",
         }
 
@@ -869,14 +1415,14 @@ from app.copilot.prompts import (  # noqa: E402
 
 class TestAnchorPatterns:
     def test_t_pattern_matches(self):
-        matches = ANCHOR_PATTERNS["t"].findall("前言 [t=12:34] 尾声 [t=1:05]")
-        assert matches == [("12", "34"), ("1", "05")]
+        matches = ANCHOR_PATTERNS["t"].findall("preface [t=12:34] tail [t=1:05] [t=24]")
+        assert matches == ["12:34", "1:05", "24"]
 
     def test_f_pattern_matches(self):
         assert ANCHOR_PATTERNS["F"].findall("引 [F12] [F03]") == ["12", "03"]
 
     def test_ch_pattern_matches(self):
-        assert ANCHOR_PATTERNS["Ch"].findall("见 [Ch3] [Ch15]") == ["3", "15"]
+        assert ANCHOR_PATTERNS["Ch"].findall("see [Ch3] [CH15]") == ["3", "15"]
 
     def test_system_prompt_has_all_placeholders(self):
         # Rendering with all keys must not KeyError.
@@ -911,6 +1457,22 @@ class TestAnchorPatterns:
         assert "即使只有一段也不能省略" in FINAL_RESPONSE_PROMPT
         assert "[[background]]、[[deep_dive]]、[[application]]" in FINAL_RESPONSE_PROMPT
 
+    def test_system_prompt_declares_note_evidence_native_default_strategy(self):
+        rendered = COPILOT_SYSTEM.format(
+            bv="BV_X",
+            title="example",
+            domain="AI",
+            direction="attention",
+            references_block="none",
+            max_tool_calls=6,
+        )
+        assert "Default tool path: search_lecture -> get_note_unit -> search_evidence -> get_evidence_object." in rendered
+        assert "Copilot is note-first, evidence-second." in rendered
+        assert "Compatibility tools (get_chapter, get_frame, get_quote_context, explain_frame)" in rendered
+        assert "Only use compatibility tools when the user explicitly asks for chapter/frame/quote anchors" in rendered
+        assert "Treat chapter/frame references as compatibility anchors" in rendered
+        assert "they may be omitted entirely from the available tool list" in rendered
+
     def test_format_references_block_empty(self):
         assert format_references_block(None) == "（无）"
         assert format_references_block([]) == "（无）"
@@ -923,18 +1485,45 @@ class TestAnchorPatterns:
         ]
         block = format_references_block(refs)
         assert "[Ch3]" in block and "[F12]" in block and "softmax" in block
+        assert "兼容章节锚点" in block
+        assert "兼容关键帧锚点" in block
 
+    def test_format_references_block_supports_note_and_evidence_kinds(self):
+        refs = [
+            {"kind": "note", "note_node_id": "block-1", "text": "mainline block"},
+            {"kind": "evidence", "evidence_id": "ev-quote-1", "text": "key quote"},
+        ]
+        block = format_references_block(refs)
+        assert "block-1" in block
+        assert "ev-quote-1" in block
+        assert "mainline block" in block
+
+
+    def test_system_prompt_makes_note_evidence_path_explicit(self):
+        rendered = COPILOT_SYSTEM.format(
+            bv="BV_X",
+            title="示例",
+            domain="AI 技术",
+            direction="注意力机制",
+            references_block="（无）",
+            max_tool_calls=6,
+        )
+        assert "get_note_unit" in rendered
+        assert "search_evidence" in rendered
+        assert "get_evidence_object" in rendered
+        assert "chapter/frame/quote" in rendered
 
 class TestValidateAnchors:
     async def test_ok_keeps_answer_unchanged(self, tmp_path):
         lec = _make_lecture("BV_VA_OK")  # duration = 120 per _make_lecture fixture
         ctx, rag = await _build_ctx(tmp_path, [lec])
         try:
-            answer = "[[evidence]]\n核心观点 A [t=00:30] 详见第一章 [Ch1] 与关键帧 [F1]。"
+            answer = "[[evidence]]\ncore point A [t=00:30] see [Ch1] and [F1]."
             patched, warnings = await validate_anchors(answer, "BV_VA_OK", ctx.db, ctx.rag)
             assert patched == answer
             assert warnings == []
         finally:
+
             await rag.close()
 
     async def test_bad_timestamp_wrapped(self, tmp_path):
@@ -957,26 +1546,51 @@ class TestValidateAnchors:
             assert " Ch9" in patched
             assert " F9" in patched
             kinds = {w["kind"] for w in warnings}
-            assert kinds == {"Ch", "F"}
+            assert kinds == {"Ch", "F", "section"}
+            assert "evidence_section_chapter_only_anchor" in {w["reason"] for w in warnings}
+        finally:
+            await rag.close()
+
+    async def test_chapter_only_evidence_anchor_warns(self, tmp_path):
+        lec = _make_lecture("BV_VA_CH_ONLY")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            answer = "[[evidence]]\nonly chapter fallback [Ch1]"
+            patched, warnings = await validate_anchors(answer, "BV_VA_CH_ONLY", ctx.db, ctx.rag)
+            assert patched == answer
+            assert "evidence_section_chapter_only_anchor" in {w["reason"] for w in warnings}
         finally:
             await rag.close()
 
     async def test_malformed_anchors_are_normalized_and_warned(self, tmp_path):
-        lec = _lecture_with_taxonomy("BV_VA_MAL", domain="AI 技术", direction="注意力机制")
+        lec = _lecture_with_taxonomy("BV_VA_MAL", domain="AI ??", direction="?????")
         ctx, rag = await _build_ctx(tmp_path, [lec])
         try:
-            answer = "[[evidence]]\n证据在 [t=065]、[Ch<2>] 和 [F<1>]。"
+            answer = "[[evidence]]\nproof at [t=065], [t=24], [CH<2>] and [F<1>]."
             patched, warnings = await validate_anchors(answer, "BV_VA_MAL", ctx.db, ctx.rag)
             assert "[t=01:05]" in patched
+            assert "[t=00:24]" in patched
             assert "[Ch2]" in patched
             assert "[F1]" in patched
-            assert "[Ch<2>]" not in patched
+            assert "[CH<2>]" not in patched
             assert "[F<1>]" not in patched
             reasons = {w["reason"] for w in warnings}
             assert "malformed_seconds" in reasons
             assert "malformed_angle_brackets" in reasons
         finally:
             await rag.close()
+    async def test_uppercase_chapter_anchor_is_normalized(self, tmp_path):
+        lec = _make_lecture("BV_VA_CH_UPPER")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            answer = "[[evidence]]\ncompat chapter [CH1]."
+            patched, warnings = await validate_anchors(answer, "BV_VA_CH_UPPER", ctx.db, ctx.rag)
+            assert "[Ch1]" in patched
+            assert "[CH1]" not in patched
+            assert "evidence_section_chapter_only_anchor" in {w["reason"] for w in warnings}
+        finally:
+            await rag.close()
+
 
     async def test_v2_section_warnings(self, tmp_path):
         lec = _lecture_with_taxonomy("BV_VA_SEC", domain="AI", direction="attention")
@@ -1004,6 +1618,37 @@ class TestValidateAnchors:
         try:
             _, warnings = await validate_anchors("plain answer [Ch1]", "BV_VA_NOSEC", ctx.db, ctx.rag)
             assert {w["reason"] for w in warnings} == {"missing_section_label"}
+        finally:
+            await rag.close()
+
+    async def test_first_section_must_be_evidence_unless_pure_offtopic(self, tmp_path):
+        lec = _lecture_with_taxonomy("BV_VA_FIRST", domain="AI", direction="attention")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            answer = "[[background]]\n鍏堣鑳屾櫙 [t=00:30]\n\n[[evidence]]\n鍚庨潰鍐嶇粰璇佹嵁 [t=00:45]"
+            _, warnings = await validate_anchors(answer, "BV_VA_FIRST", ctx.db, ctx.rag)
+            assert "first_section_not_evidence" in {w["reason"] for w in warnings}
+
+            _, warnings = await validate_anchors(
+                "[[offtopic]]\nThis is off-topic.",
+                "BV_VA_FIRST",
+                ctx.db,
+                ctx.rag,
+            )
+            assert "first_section_not_evidence" not in {w["reason"] for w in warnings}
+        finally:
+            await rag.close()
+
+    async def test_evidence_section_cannot_start_with_compatibility_framing(self, tmp_path):
+        lec = _lecture_with_taxonomy("BV_VA_FRAME", domain="AI", direction="attention")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            answer = "[[evidence]]\n[Ch1] 鏍稿績鍒ゆ柇鍦ㄥ悗闈?[t=00:30]"
+            _, warnings = await validate_anchors(answer, "BV_VA_FRAME", ctx.db, ctx.rag)
+            assert "evidence_section_starts_with_compatibility_framing" in {
+                w["reason"] for w in warnings
+            }
+            assert "evidence_section_chapter_only_anchor" not in {w["reason"] for w in warnings}
         finally:
             await rag.close()
 
@@ -1053,7 +1698,9 @@ class TestValidateAnchors:
             )
             _, warnings = await validate_anchors(answer, "BV_VA_SECTION_RULES", ctx.db, ctx.rag)
             reasons = {w["reason"] for w in warnings}
+            assert "evidence_section_chapter_only_anchor" in reasons
             assert "section_count_exceeded" in reasons
+            assert "support_section_triple_combo" in reasons
             assert "duplicated_section_type" in reasons
             assert "offtopic_mixed_with_answer" in reasons
         finally:
@@ -1082,6 +1729,45 @@ class TestBuildInitialState:
             assert "[Ch1]" in sys_msg.content  # reference rendered
             human = state["messages"][1]
             assert human.content == "KV cache 做了什么？"
+        finally:
+            await rag.close()
+
+
+    async def test_injects_note_outline_and_evidence_context_when_present(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_BIS_NOTE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            state = await build_initial_state(ctx, "BV_BIS_NOTE", "这节课主线是什么？")
+            assert len(state["messages"]) == 3
+            note_context = state["messages"][1]
+            assert "Lecture Note IR" in note_context.content
+            assert "主线单元一" in note_context.content
+            assert "Evidence Index" in note_context.content
+            assert "ev-quote-1" in note_context.content
+            assert state["messages"][2].content == "这节课主线是什么？"
+        finally:
+            await rag.close()
+
+
+    async def test_renders_note_and_evidence_references_into_system_prompt(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_BIS_REF"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            refs = [
+                {"kind": "note", "note_node_id": "block-1", "text": "mainline block"},
+                {"kind": "evidence", "evidence_id": "ev-quote-1", "text": "key quote"},
+            ]
+            state = await build_initial_state(
+                ctx,
+                "BV_BIS_REF",
+                "use references",
+                references=refs,
+            )
+            sys_msg = state["messages"][0]
+            rendered_block = format_references_block(refs)
+            assert "block-1" in sys_msg.content
+            assert "ev-quote-1" in sys_msg.content
+            assert rendered_block in sys_msg.content
         finally:
             await rag.close()
 
@@ -1187,14 +1873,14 @@ class _EmptyAfterToolModel:
 class TestAgentInvoke:
     async def test_invoke_mock_llm_runs_tool_and_returns_anchored_answer(self, tmp_path):
         lec = _lecture_with_taxonomy("BV_AG", domain="AI 技术", direction="注意力机制")
-        ctx, rag = await _build_ctx(tmp_path, [lec])
+        ctx, rag = await _build_ctx(tmp_path, [_attach_note_and_evidence(lec)])
         try:
             stub = _StubChatModel(
-                tool_name="get_chapter",
-                tool_args={"bv": "BV_AG", "chapter_idx": 1},
+                tool_name="get_note_unit",
+                tool_args={"bv": "BV_AG", "unit_id": "unit-1"},
                 final="第一章讲了核心概念 [t=00:30] 详见 [Ch1] 和 [F1]。",
             )
-            graph = build_graph(ctx, model=stub)
+            graph = build_graph(ctx, model=stub, question="核心问题是什么？")
             init = await build_initial_state(ctx, "BV_AG", "这一章的核心问题？")
             final = await graph.ainvoke(init)
 
@@ -1202,11 +1888,10 @@ class TestAgentInvoke:
             assert stub.calls == 2
             assert stub.bound_tool_names == [
                 "search_lecture",
+                "get_note_unit",
+                "search_evidence",
+                "get_evidence_object",
                 "search_lectures",
-                "get_chapter",
-                "get_frame",
-                "get_quote_context",
-                "explain_frame",
             ]
             # step_count increments once per call_model, and tools ran once.
             assert final["step_count"] == 2
@@ -1232,7 +1917,7 @@ class TestAgentInvoke:
                 bv="BV_BUDGET",
                 final="已经基于现有工具结果汇总答案 [Ch1]。",
             )
-            graph = build_graph(ctx, model=stub)
+            graph = build_graph(ctx, model=stub, question="第1章怎么讲？")
             init = await build_initial_state(ctx, "BV_BUDGET", "一直检索会怎样？")
             final = await graph.ainvoke(init)
 
@@ -1251,7 +1936,7 @@ class TestAgentInvoke:
                 bv="BV_EMPTY_FINAL",
                 final="工具后空响应已被兜底为最终答案 [Ch1]。",
             )
-            graph = build_graph(ctx, model=stub)
+            graph = build_graph(ctx, model=stub, question="第1章怎么看？")
             init = await build_initial_state(ctx, "BV_EMPTY_FINAL", "工具后空响应怎么办？")
             final = await graph.ainvoke(init)
 
@@ -1263,11 +1948,11 @@ class TestAgentInvoke:
 
     async def test_quick_ask_validates_anchors(self, tmp_path):
         lec = _lecture_with_taxonomy("BV_QA", domain="AI", direction="attention")
-        ctx, rag = await _build_ctx(tmp_path, [lec])
+        ctx, rag = await _build_ctx(tmp_path, [_attach_note_and_evidence(lec)])
         try:
             stub = _StubChatModel(
-                tool_name="get_chapter",
-                tool_args={"bv": "BV_QA", "chapter_idx": 1},
+                tool_name="search_evidence",
+                tool_args={"bv": "BV_QA", "query": "归一化", "top_k": 3},
                 final="[[evidence]]\nclaim [t=00:30]; invalid [Ch9] [F9].",
             )
             answer, warnings = await quick_ask(
@@ -1296,6 +1981,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from langchain_core.messages import ToolMessage  # noqa: E402
 
 from app.copilot.api import (  # noqa: E402
+    Reference,
     _extract_chunk_text,
     _sse_frame,
     _strip_thinking_tags,
@@ -1455,6 +2141,114 @@ class TestSSEHelpers:
         assert out["ok"] is False
         assert out["error"]["code"] == "not_found"
 
+    def test_summarise_tool_output_note_and_evidence_counts(self):
+        out = _summarise_tool_output(
+            "get_frame",
+            {
+                "frame_id": 1,
+                "caption": "架构图",
+                "path": "/img/ch1_diagram.jpg",
+                "compatibility_anchor_kind": "frame",
+                "compatibility_anchor_id": "F1",
+                "primary_ref_kind": "evidence",
+                "primary_ref_id": "ev-frame-1",
+                "primary_evidence_id": "ev-frame-1",
+                "primary_note_node_id": "unit-1",
+                "primary_note_unit_id": "unit-1",
+                "primary_note_node_type": "teaching_unit",
+                "primary_note_title": "主线单元一",
+                "primary_evidence_kind": "frame_evidence",
+                "related_evidence_ids": ["ev-frame-1"],
+                "related_note_node_ids": ["unit-1", "block-1"],
+            },
+        )
+        assert out["evidence_count"] == 1
+        assert out["note_nodes_count"] == 2
+        assert out["primary_ref_kind"] == "evidence"
+        assert out["primary_ref_id"] == "ev-frame-1"
+        assert out["primary_evidence_id"] == "ev-frame-1"
+        assert out["primary_note_node_id"] == "unit-1"
+        assert out["primary_note_unit_id"] == "unit-1"
+        assert out["primary_note_node_type"] == "teaching_unit"
+        assert out["primary_note_title"] == "主线单元一"
+        assert out["primary_evidence_kind"] == "frame_evidence"
+        assert out["compatibility_anchor_kind"] == "frame"
+        assert out["compatibility_anchor_id"] == "F1"
+        assert out["caption"] == "架构图"
+        assert out["path"] == "/img/ch1_diagram.jpg"
+        assert out["evidence_id"] == "ev-frame-1"
+        assert out["note_node_id"] == "unit-1"
+
+    def test_summarise_tool_output_keeps_display_fields_for_core_four(self):
+        chapter = _summarise_tool_output(
+            "get_chapter",
+            {"title": "第一章", "compatibility_anchor_kind": "chapter", "compatibility_anchor_id": "Ch1"},
+        )
+        frame = _summarise_tool_output(
+            "get_frame",
+            {"frame_id": 1, "caption": "架构图", "path": "/img/ch1_diagram.jpg"},
+        )
+        quote = _summarise_tool_output(
+            "get_quote_context",
+            {"matched_quote": "原字幕：A 就是 X，因为先比较再归一化。"},
+        )
+        explain = _summarise_tool_output(
+            "explain_frame",
+            {"frame_id": 1, "why_useful": "说明 A 与 B 的依赖关系"},
+        )
+        assert chapter["title"] == "第一章"
+        assert frame["caption"] == "架构图"
+        assert frame["path"] == "/img/ch1_diagram.jpg"
+        assert quote["matched_quote"].startswith("原字幕")
+        assert explain["why_useful"] == "说明 A 与 B 的依赖关系"
+
+    def test_summarise_tool_output_does_not_invent_primary_or_compatibility_shape(self):
+        out = _summarise_tool_output(
+            "get_frame",
+            {
+                "frame_id": 1,
+                "chapter_idx": 2,
+                "related_evidence_ids": ["ev-frame-1"],
+                "related_note_node_ids": ["unit-1"],
+            },
+        )
+        assert out["frame_id"] == 1
+        assert out["chapter_idx"] == 2
+        assert out["evidence_count"] == 1
+        assert out["note_nodes_count"] == 1
+        assert "primary_ref_kind" not in out
+        assert "primary_ref_id" not in out
+        assert "primary_evidence_id" not in out
+        assert "primary_note_node_id" not in out
+        assert "evidence_id" not in out
+        assert "note_node_id" not in out
+        assert "compatibility_anchor_kind" not in out
+        assert "compatibility_anchor_id" not in out
+
+    def test_summarise_tool_output_keeps_dedicated_explicit_aliases_without_primary_backfill(self):
+        out = _summarise_tool_output(
+            "get_evidence_object",
+            {
+                "evidence": {"evidence_id": "ev-quote-1"},
+                "requested_node_id": "block-1",
+                "related_evidence_ids": ["ev-quote-1"],
+                "related_note_node_ids": ["block-1"],
+            },
+        )
+        assert out["evidence_count"] == 1
+        assert out["note_nodes_count"] == 1
+        assert out["evidence_id"] == "ev-quote-1"
+        assert out["note_node_id"] == "block-1"
+        assert "primary_evidence_id" not in out
+        assert "primary_note_node_id" not in out
+
+    def test_reference_accepts_string_native_ids(self):
+        ref = Reference.model_validate(
+            {"kind": "evidence", "id": "ev-quote-1", "evidence_id": "ev-quote-1"}
+        )
+        assert ref.id == "ev-quote-1"
+        assert ref.evidence_id == "ev-quote-1"
+
 
 class TestCopilotRealE2EReport:
     def test_report_records_section_and_web_diagnostics(self, tmp_path):
@@ -1498,7 +2292,7 @@ class TestCopilotRealE2EReport:
 
 class TestRunAgentSse:
     async def test_emits_token_tool_and_done(self, tmp_path):
-        lec = _lecture_with_taxonomy("BV_SSE")
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_SSE"))
         ctx, rag = await _build_ctx(tmp_path, [lec])
         try:
             events = [
@@ -1539,11 +2333,43 @@ class TestRunAgentSse:
             done_line = [f for f in frames if f.startswith(b"event: done")][0]
             payload = _json.loads(done_line.decode("utf-8").split("data: ", 1)[1])
             assert payload["anchors_validated"] is True
+            assert payload["note_context"]["source"] == "lecture_note_ir"
+            assert payload["evidence_context"]["source"] == "evidence_index"
             kinds = {w["kind"] for w in payload["warnings"]}
             assert kinds == {"Ch", "F"}
             assert payload["patched_answer"] is not None
             assert "⚠ Ch9" in payload["patched_answer"]
             assert "⚠ F9" in payload["patched_answer"]
+        finally:
+            await rag.close()
+
+    async def test_done_payload_carries_framing_contract_warnings(self, tmp_path):
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_SSE_FRAME"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            events = [
+                {
+                    "event": "on_chat_model_stream",
+                    "data": {"chunk": _ai_chunk("[[background]]\nContext first [t=00:05]\n\n")},
+                },
+                {
+                    "event": "on_chat_model_stream",
+                    "data": {
+                        "chunk": _ai_chunk(
+                            "[[evidence]]\n[Ch1] Core point comes after this [t=00:30]"
+                        )
+                    },
+                },
+            ]
+            frames: list[bytes] = []
+            async for b in run_agent_sse(_FakeGraph(events), {}, ctx, "BV_SSE_FRAME"):
+                frames.append(b)
+
+            done_line = [f for f in frames if f.startswith(b"event: done")][0]
+            payload = _json.loads(done_line.decode("utf-8").split("data: ", 1)[1])
+            reasons = {w["reason"] for w in payload["warnings"]}
+            assert "first_section_not_evidence" in reasons
+            assert "evidence_section_starts_with_compatibility_framing" in reasons
         finally:
             await rag.close()
 
@@ -1675,6 +2501,81 @@ class TestCopilotAskRoute:
         finally:
             await rag.close()
 
+    async def test_preserves_note_and_evidence_reference_identity(self, tmp_path, monkeypatch):
+        import app.copilot.api as api_mod
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        lec = _attach_note_and_evidence(_make_lecture("BV_ASK_NATIVE"))
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        captured: dict[str, object] = {}
+
+        async def _fake_build_initial_state(
+            _ctx,
+            bv,
+            question,
+            references=None,
+            history=None,
+        ):
+            captured["initial_state"] = {
+                "bv": bv,
+                "question": question,
+                "references": references,
+                "history": history,
+            }
+            return {
+                "messages": [
+                    SystemMessage(content="system"),
+                    HumanMessage(content=question),
+                ]
+            }
+
+        def _fake_build_graph(_ctx, **kwargs):
+            captured["graph"] = kwargs
+            return _FakeGraph([])
+
+        monkeypatch.setattr(api_mod.agent_mod, "build_initial_state", _fake_build_initial_state)
+        monkeypatch.setattr(api_mod.agent_mod, "build_graph", _fake_build_graph)
+
+        try:
+            app = _build_app_with_state(ctx)
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/api/copilot/ask",
+                    headers=_basic_headers(),
+                    json={
+                        "bv": "BV_ASK_NATIVE",
+                        "question": "聚焦这两个原生引用",
+                        "references": [
+                            {
+                                "kind": "note",
+                                "id": "block-1",
+                                "note_node_id": "block-1",
+                                "text": "mainline block",
+                            },
+                            {
+                                "kind": "evidence",
+                                "id": "ev-quote-1",
+                                "evidence_id": "ev-quote-1",
+                                "text": "key quote",
+                            },
+                        ],
+                    },
+                )
+            assert resp.status_code == 200
+            assert "event: done" in resp.text
+
+            initial = captured["initial_state"]
+            graph = captured["graph"]
+            assert initial["references"] == graph["references"]
+            assert initial["references"][0]["kind"] == "note"
+            assert initial["references"][0]["id"] == "block-1"
+            assert initial["references"][0]["note_node_id"] == "block-1"
+            assert initial["references"][1]["kind"] == "evidence"
+            assert initial["references"][1]["id"] == "ev-quote-1"
+            assert initial["references"][1]["evidence_id"] == "ev-quote-1"
+        finally:
+            await rag.close()
+
 
 class TestCopilotReindexEndpoint:
     async def test_taxonomy_only_patches_rows(self, tmp_path):
@@ -1773,6 +2674,23 @@ class TestFrontendRender:
             # The template emits ``data-ref-id="<id>"`` on the figure.
             assert f'data-ref-id="{fid}"' in html, f"frame id {fid} missing for {path}"
 
+    def test_note_and_evidence_native_dom_metadata_rendered(self, tmp_path, monkeypatch):
+        from app.config import get_settings
+        from app.render.renderer import Renderer
+
+        settings = get_settings()
+        monkeypatch.setattr(settings, "data_dir", tmp_path)
+        (tmp_path / "reports").mkdir(parents=True, exist_ok=True)
+
+        lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_FE_NOTE"))
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert 'data-ref-kind="note"' in html
+        assert 'data-note-node-id="unit-1"' in html
+        assert 'data-note-node-id="block-1"' in html
+        assert 'data-evidence-id="ev-quote-1"' in html
+
 
 class TestStaticServing:
     def test_static_assets_reachable(self):
@@ -1834,7 +2752,7 @@ class TestWebSearchParsing:
 
 
 class TestMakeCopilotToolsShape:
-    async def test_returns_five_tools_with_names(self, tmp_path):
+    async def test_returns_tools_with_note_and_evidence_names(self, tmp_path):
         lec = _make_lecture("BV_MT")
         ctx, rag = await _build_ctx(tmp_path, [lec])
         try:
@@ -1842,6 +2760,9 @@ class TestMakeCopilotToolsShape:
             names = [t.name for t in tools]
             assert names == [
                 "search_lecture",
+                "get_note_unit",
+                "search_evidence",
+                "get_evidence_object",
                 "search_lectures",
                 "get_chapter",
                 "get_frame",
@@ -1851,6 +2772,22 @@ class TestMakeCopilotToolsShape:
             # Every tool must have a non-empty description (fastmcp/LangChain
             # both pull it from the docstring first line).
             assert all(t.description for t in tools)
+        finally:
+            await rag.close()
+
+    async def test_can_hide_compatibility_tools_for_default_runtime(self, tmp_path):
+        lec = _make_lecture("BV_MT_NOTE")
+        ctx, rag = await _build_ctx(tmp_path, [lec])
+        try:
+            tools = make_copilot_tools(ctx, include_compatibility_tools=False)
+            names = [t.name for t in tools]
+            assert names == [
+                "search_lecture",
+                "get_note_unit",
+                "search_evidence",
+                "get_evidence_object",
+                "search_lectures",
+            ]
         finally:
             await rag.close()
 
@@ -1865,6 +2802,74 @@ class TestMakeCopilotToolsShape:
             assert "search_lectures" in names
         finally:
             await rag.close()
+
+    async def test_explicit_anchor_question_keeps_compatibility_tools_available(self, tmp_path):
+        lec = _lecture_with_taxonomy("BV_AG_COMPAT", domain="AI", direction="attention")
+        ctx, rag = await _build_ctx(tmp_path, [_attach_note_and_evidence(lec)])
+        try:
+            stub = _StubChatModel(
+                tool_name="get_chapter",
+                tool_args={"bv": "BV_AG_COMPAT", "chapter_idx": 1},
+                final="第一章补充定位 [Ch1]。",
+            )
+            graph = build_graph(ctx, model=stub, question="第1章具体讲了什么？")
+            init = await build_initial_state(ctx, "BV_AG_COMPAT", "第1章具体讲了什么？")
+            await graph.ainvoke(init)
+
+            assert stub.bound_tool_names == [
+                "search_lecture",
+                "get_note_unit",
+                "search_evidence",
+                "get_evidence_object",
+                "search_lectures",
+                "get_chapter",
+                "get_frame",
+                "get_quote_context",
+                "explain_frame",
+            ]
+        finally:
+            await rag.close()
+
+
+class TestFrontendReferencePayload:
+    def test_visible_ref_labels_are_note_evidence_native_first(self):
+        body = Path("app/static/copilot.js").read_text(encoding="utf-8")
+        assert 'return "讲义节点";' in body
+        assert 'return "证据对象";' in body
+        assert 'return "兼容章节";' in body
+        assert 'return "兼容关键帧";' in body
+        assert 'return `兼容章节 Ch${ref.id}`;' in body
+        assert 'return `兼容关键帧 F${ref.id}`;' in body
+
+    def test_chip_prefers_native_dom_metadata_and_native_kind_promotion(self):
+        body = Path("app/static/copilot.js").read_text(encoding="utf-8")
+        assert 'const noteNodeId = host.dataset.noteNodeId || null' in body
+        assert 'const evidenceId = host.dataset.evidenceId || null' in body
+        assert 'if (evidenceId) return "evidence";' in body
+        assert 'if (noteNodeId) return "note";' in body
+        assert 'const nativeRef = refFromHost(host);' in body
+
+    def test_chip_dedupe_key_prefers_native_ids_over_chapter_frame_ids(self):
+        body = Path("app/static/copilot.js").read_text(encoding="utf-8")
+        assert 'if (ref.evidence_id) return "evidence|" + ref.evidence_id;' in body
+        assert 'if (ref.note_node_id) return "note|" + ref.note_node_id;' in body
+        assert 'const nativeKey = chipKey(nativeRef);' in body
+
+    def test_chip_payload_keeps_note_and_evidence_native_ids(self):
+        body = Path("app/static/copilot.js").read_text(encoding="utf-8")
+        assert "note_node_id: c.note_node_id || null" in body
+        assert "evidence_id: c.evidence_id || null" in body
+        assert "const noteNodeId = ref.note_node_id || null" in body
+        assert "const evidenceId = ref.evidence_id || null" in body
+
+    def test_tool_trace_prefers_note_and_evidence_signals_before_compat_ids(self):
+        body = Path("app/static/copilot.js").read_text(encoding="utf-8")
+        assert 'bits.push(`主引用 讲义节点 ${payload.primary_ref_id}`);' in body
+        assert 'bits.push(`主引用 证据对象 ${payload.primary_ref_id}`);' in body
+        assert 'bits.push(`讲义节点 ${payload.note_node_id}`);' in body
+        assert 'bits.push(`证据 ${payload.evidence_id}`);' in body
+        assert 'bits.push(`兼容章节 Ch${payload.chapter_idx}`);' in body
+        assert 'bits.push(`兼容关键帧 F${payload.frame_id}`);' in body
 
 
 # ---------------------------------------------------------------------------

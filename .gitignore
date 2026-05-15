@@ -20,33 +20,37 @@ htmlcov/
 # Runtime data
 data/
 *.log
+.tmp/
+.tmp/**
+.tmp_compose/
+.tmp_compose/**
+.tmp_pytest/
+.tmp_pytest/**
+.tmp_smoke/
+.tmp_smoke/**
+/tmp
+/tmp/
+tmp/
+tmp/**
+*.tmp
+README_develop.md
 
 # --- Dev-only artefacts (kept out of the public repo) ---
-/README_develop.md
 /handoff.md
 /handoff_copilot.md
 /handoff_mutiagent.md
 /handoff_arch_roadmap.md
 /handoff_m2.md
 /handoff_closeout.md
+/scripts/_content_quality_survey.py
+/scripts/_inspect_bv.py
+/scripts/_repair_summary_sanity.py
 /scripts/_debug_*.py
 /scripts/debug_*.py
 /scripts/_verify_*.py
-/docs/qa/
-/docs/superpowers/*
-!/docs/superpowers/specs/
-/docs/superpowers/specs/*
-!/docs/superpowers/specs/2026-05-12-lecturemind-long-video-lecture-fields-design.md
-# Keep this approved standalone-handout spec reachable for review in a mostly ignored docs/superpowers tree.
-!/docs/superpowers/specs/2026-05-13-lecturemind-standalone-handout-composition-design.md
-!/docs/superpowers/plans/
-/docs/superpowers/plans/*
-!/docs/superpowers/plans/2026-05-12-lecturemind-long-video-lecture-fields-implementation-plan.md
-!/docs/superpowers/handoffs/
-/docs/superpowers/handoffs/*
-!/docs/superpowers/handoffs/video-summary.md
+/docs/*
+!/docs/deploy.md
 
-# IDE
 .vscode/
 .idea/
 .history/

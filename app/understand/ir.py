@@ -9,6 +9,7 @@ from .length_adapt import (
     chapter_frame_max,
     points_per_chapter_max,
 )
+from .ir_sanity import sanitize_ir_data
 from .schema import Taxonomy
 
 PrimaryType = Literal["technical_formula", "conceptual_talk", "procedural_tutorial", "generic_lecture"]
@@ -102,6 +103,7 @@ class KnowledgeUnit(BaseModel):
     id: str = ""
     type: KnowledgeType = "concept"
     title: str = ""
+    term_short: str = ""
     explanation: str = ""
     ts: float = Field(default=0.0, ge=0)
     quote: str = ""
@@ -208,6 +210,16 @@ def hydrate_lecture_ir_data(data: dict[str, Any], ctx: Any) -> None:
     data["core_question"] = str(data.get("core_question") or f"这段视频要解决什么问题：{data['title']}").strip()
     data["chapters"] = _normalise_chapters(data.get("chapters"), ctx)
     data["mainline"] = _normalise_string_list(data.get("mainline")) or _fallback_mainline(data["chapters"])
+    # Q1-Q4 post-IR sanity net (see ir_sanity module docstring): strip
+    # leading list-number prefixes from process_steps; clear mainline /
+    # core_question when they have collapsed into chapter-title echoes;
+    # renumber chapters so indices are contiguous 1..N. Telemetry is
+    # parked on ctx for the builder to surface via pipeline_stats.
+    sanity = sanitize_ir_data(data)
+    try:
+        setattr(ctx, "ir_sanity", sanity)
+    except Exception:  # noqa: BLE001 — ctx may be a frozen dataclass in tests
+        pass
     data["visual_evidence"] = _normalise_visuals(data.get("visual_evidence"), ctx)
     _attach_visuals_to_chapters(data["chapters"], data["visual_evidence"])
     data["knowledge_units"] = _normalise_units(data.get("knowledge_units"), data["chapters"], data["profile"], ctx)
@@ -416,6 +428,7 @@ def _normalise_units(raw: Any, chapters: list[dict[str, Any]], profile: dict[str
             "id": str(unit.get("id") or f"ku-{idx}"),
             "type": kind if kind in allowed else "concept",
             "title": str(unit.get("title") or unit.get("term") or f"知识点 {idx}").strip(),
+            "term_short": str(unit.get("term_short") or "").strip(),
             "explanation": str(unit.get("explanation") or unit.get("summary") or "").strip(),
             "ts": ts_value,
             "quote": str(unit.get("quote") or unit.get("evidence") or "").strip(),

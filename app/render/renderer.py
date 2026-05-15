@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import logging
 import re
 import shutil
@@ -35,6 +36,7 @@ _HIGHLIGHT_REQUIRED_ASSETS = (
     "highlight.min.js",
     "atom-one-light.min.css",
 )
+_LONG_VIDEO_THRESHOLD_SEC = 20 * 60
 # Stable jsDelivr URLs used as fallback when no vendored bundle is present.
 # Keep version pinned so a CDN-side breakage doesn't silently change behaviour.
 _HIGHLIGHT_CDN_VERSION = "11.10.0"
@@ -49,6 +51,29 @@ _HIGHLIGHT_CDN_CSS = (
 
 
 _PENDING_DOMAIN = "待归类"
+
+
+def _is_long_lecture(duration: float | int) -> bool:
+    return float(duration or 0.0) >= _LONG_VIDEO_THRESHOLD_SEC
+
+
+def _text_key(text: str) -> str:
+    return re.sub(r"[\s锛屻€傦紒锛??銆侊紱;锛?,.銆娿€嬧€溾€漒\"'锛堬級()\[\]銆愩€慭-鈥擾]+", "", str(text or "")).lower()
+
+
+def _texts_heavily_overlap(left: str, right: str, *, threshold: float = 0.82) -> bool:
+    left_key = _text_key(left)
+    right_key = _text_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter = min(len(left_key), len(right_key))
+    longer = max(len(left_key), len(right_key))
+    if shorter and (left_key in right_key or right_key in left_key):
+        if shorter / max(longer, 1) >= 0.72:
+            return True
+    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= threshold
 
 
 def group_summaries_by_domain(rows: list) -> list[dict]:
@@ -299,6 +324,8 @@ def _summary_cover_url(row: object) -> str:
 
 def _type_recap(lecture: LectureJSON) -> dict[str, object] | None:
     units = [u for u in lecture.knowledge_units if u.title]
+    if _is_long_lecture(lecture.duration) and len(lecture.chapters) >= 4:
+        return None
     primary = lecture.profile.primary_type
     if primary == "technical_formula":
         selected = [u for u in units if u.type in {"formula", "code", "mechanism", "pitfall"}]
@@ -334,7 +361,12 @@ def _mainline_items(lecture: LectureJSON) -> list[str]:
     return out
 
 
-def _timeline_detail_items(items: list[str]) -> list[dict[str, str]]:
+def _timeline_detail_items(
+    items: list[str],
+    *,
+    mainline_items: list[str] | None = None,
+    long_mode: bool = False,
+) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for item in items:
         text = _compact_inline_text(item)
@@ -346,8 +378,514 @@ def _timeline_detail_items(items: list[str]) -> list[dict[str, str]]:
         if match:
             time = re.sub(r"\s+", "", match.group("time"))
             body = match.group("body").strip() or text
+        if mainline_items and _texts_heavily_overlap(body, " ".join(mainline_items), threshold=0.78):
+            continue
+        if any(_texts_heavily_overlap(body, existing["text"], threshold=0.82) for existing in out):
+            continue
         out.append({"time": time, "text": body})
+        if long_mode and len(out) >= 4:
+            break
     return out
+
+
+def _hero_one_liner(lecture: LectureJSON) -> str:
+    if lecture.core_question and _texts_heavily_overlap(
+        lecture.one_liner,
+        lecture.core_question,
+        threshold=0.76,
+    ):
+        return ""
+    return lecture.one_liner
+
+
+def _cover_one_liner(lecture: LectureJSON, note_projection: dict[str, object]) -> str:
+    one_liner = ""
+    if note_projection.get("has_units"):
+        front_matter = note_projection.get("front_matter") or {}
+        one_liner = str(front_matter.get("one_sentence_claim") or "").strip()
+        if lecture.core_question and _texts_heavily_overlap(one_liner, lecture.core_question, threshold=0.76):
+            one_liner = ""
+    if not one_liner:
+        one_liner = _hero_one_liner(lecture)
+    return one_liner
+
+
+def _review_questions_to_render(lecture: LectureJSON) -> list[str]:
+    study = [str(item).strip() for item in lecture.study_questions if str(item).strip()]
+    review = [str(item).strip() for item in lecture.review_questions if str(item).strip()]
+    if not review:
+        return []
+    if len(study) == len(review) and all(
+        _texts_heavily_overlap(left, right) for left, right in zip(study, review)
+    ):
+        return []
+    return review
+
+
+def _format_section_ref_label(refs: list[int], total_chapters: int) -> str:
+    unique_refs = sorted({int(ref) for ref in refs if int(ref) > 0})
+    if not unique_refs:
+        return ""
+    if total_chapters > 0 and unique_refs == list(range(1, total_chapters + 1)):
+        return "综合全片"
+    if unique_refs == list(range(unique_refs[0], unique_refs[-1] + 1)):
+        if unique_refs[0] == 1 and len(unique_refs) >= 3:
+            return f"对应原视频前 {len(unique_refs)} 章"
+        if len(unique_refs) >= 3:
+            return f"对应原视频第 {unique_refs[0]}-{unique_refs[-1]} 章"
+    if len(unique_refs) == 1:
+        return f"对应原视频第 {unique_refs[0]} 章"
+    return "对应原视频第 " + "、".join(str(ref) for ref in unique_refs) + " 章"
+
+
+def _composition_body_sections(lecture: LectureJSON) -> list[dict[str, object]]:
+    if not lecture.composition or not lecture.composition.body_sections:
+        return []
+    total_chapters = len(lecture.chapters)
+    rendered: list[dict[str, object]] = []
+    for section_index, section in enumerate(lecture.composition.body_sections, start=1):
+        block_payloads: list[dict[str, object]] = []
+        for block in section.outline_blocks:
+            block_payloads.append(
+                {
+                    "id": block.id,
+                    "ordinal": f"{section_index}.{int(block.ordinal)}",
+                    "title": block.title,
+                    "lead": block.lead,
+                    "paragraphs": list(block.paragraphs),
+                    "source_timestamps": list(block.source_timestamps),
+                }
+            )
+        rendered.append(
+            {
+                "id": section.id,
+                "title": section.title,
+                "section_role": section.section_role,
+                "summary": section.summary,
+                "section_ref_label": _format_section_ref_label(
+                    list(section.source_chapter_refs),
+                    total_chapters,
+                ),
+                "supporting_visuals": [
+                    visual.model_dump(mode="json") for visual in section.supporting_visuals
+                ],
+                "outline_blocks": block_payloads,
+            }
+        )
+    return rendered
+
+
+def _compat_note_projection_from_composition(lecture: LectureJSON) -> dict[str, object]:
+    sections = _composition_body_sections(lecture)
+    takeaways = list(getattr(lecture.composition, "key_takeaways_top", []) or [])
+    reading_map = [str(sec.get("title") or "").strip() for sec in sections if str(sec.get("title") or "").strip()]
+    teaching_units: list[dict[str, object]] = []
+    for index, sec in enumerate(sections, start=1):
+        teaching_units.append(
+            {
+                "id": sec["id"],
+                "ordinal": str(index),
+                "title": sec["title"],
+                "unit_role": sec["section_role"],
+                "core_message": sec["summary"],
+                "transition_from_previous": "",
+                "primary_timestamp": 0.0,
+                "section_ref_label": sec["section_ref_label"],
+                "content_blocks": [
+                    {
+                        "id": block["id"],
+                        "ordinal": block["ordinal"],
+                        "show_ordinal": True,
+                        "show_head": True,
+                        "title": block["title"],
+                        "lead": block["lead"],
+                        "paragraphs": list(block["paragraphs"]),
+                        "source_timestamps": list(block["source_timestamps"]),
+                    }
+                    for block in sec["outline_blocks"]
+                ],
+                "visual_slots": list(sec["supporting_visuals"]),
+            }
+        )
+    return {
+        "mode": "compat",
+        "has_units": bool(teaching_units),
+        "audience_fit": getattr(lecture.composition, "audience_fit", ""),
+        "front_matter": {
+            "one_sentence_claim": _hero_one_liner(lecture),
+            "reader_orientation": lecture.core_question,
+            "takeaways_top": takeaways,
+            "reading_map": reading_map,
+            "reader_prerequisites": [],
+            "suitable_for": [],
+            "not_suitable_for": [],
+        },
+        "teaching_units": teaching_units,
+        "back_matter": {
+            "boundary_and_risks": [],
+            "term_quick_ref": [],
+            "source_index_entrypoints": [],
+            "appendices": [],
+            "transfer_and_next_steps": list(getattr(lecture, "review_questions", [])[:4]),
+        },
+    }
+
+
+def _lecture_note_projection(lecture: LectureJSON) -> dict[str, object]:
+    note = lecture.lecture_note_ir
+    if note is None:
+        return _compat_note_projection_from_composition(lecture)
+    total_chapters = len(lecture.chapters)
+    evidence_refs_by_node: dict[str, list[str]] = {}
+    evidence_objects_by_node: dict[str, list] = {}
+    if lecture.evidence_index is not None:
+        for obj in lecture.evidence_index.evidence_objects:
+            if not obj.evidence_id:
+                continue
+            for node_id in obj.note_node_ids:
+                if not node_id:
+                    continue
+                evidence_refs_by_node.setdefault(node_id, [])
+                if obj.evidence_id not in evidence_refs_by_node[node_id]:
+                    evidence_refs_by_node[node_id].append(obj.evidence_id)
+                evidence_objects_by_node.setdefault(node_id, []).append(obj)
+    teaching_units: list[dict[str, object]] = []
+    for unit_index, unit in enumerate(note.body.teaching_units, start=1):
+        block_count = len(unit.content_blocks)
+        content_blocks: list[dict[str, object]] = []
+        primary_timestamp = 0.0
+        for block_index, block in enumerate(unit.content_blocks, start=1):
+            block_evidence_refs = list(block.evidence_refs)
+            for evidence_id in evidence_refs_by_node.get(block.block_id, []):
+                if evidence_id not in block_evidence_refs:
+                    block_evidence_refs.append(evidence_id)
+            timestamps = list(block.source_timestamps)
+            if not primary_timestamp and timestamps:
+                primary_timestamp = float(timestamps[0])
+            show_head = block_count > 1 and bool(block.title or timestamps or block_evidence_refs)
+            content_blocks.append(
+                {
+                    "id": block.block_id,
+                    "ordinal": f"{unit_index}.{block_index}",
+                    "show_ordinal": block_count > 1,
+                    "show_head": show_head,
+                    "title": _fallback_block_title(
+                        block.title,
+                        block_role=block.block_role,
+                        unit_role=unit.unit_role,
+                        block_index=block_index,
+                    ),
+                    "lead": block.lead,
+                    "paragraphs": list(block.paragraphs),
+                    "source_timestamps": timestamps,
+                    "evidence_refs": block_evidence_refs,
+                }
+            )
+        unit_evidence_refs = list(unit.evidence_refs)
+        for evidence_id in evidence_refs_by_node.get(unit.unit_id, []):
+            if evidence_id not in unit_evidence_refs:
+                unit_evidence_refs.append(evidence_id)
+        visual_slots = [
+            _project_visual_slot(
+                {
+                    "slot_id": slot.slot_id,
+                    "visual_role": slot.visual_role,
+                    "path": slot.source_paths[0] if slot.source_paths else "",
+                    "caption": slot.caption,
+                    "title": slot.title,
+                    "ts": float(slot.ts or 0.0),
+                    "evidence_refs": list(slot.evidence_refs),
+                }
+            )
+            for slot in unit.visual_slots
+            if slot.source_paths
+        ]
+        if not visual_slots:
+            visual_slots = _fallback_visual_slots_for_unit(
+                lecture,
+                unit_id=unit.unit_id,
+                source_chapter_refs=list(unit.source_chapter_refs),
+                evidence_objects=evidence_objects_by_node.get(unit.unit_id, []),
+            )
+        teaching_units.append(
+            {
+                "id": unit.unit_id,
+                "ordinal": unit.ordinal or str(unit_index),
+                "title": unit.title,
+                "unit_role": unit.unit_role,
+                "core_message": unit.core_message,
+                "transition_from_previous": unit.transition_from_previous,
+                "primary_timestamp": primary_timestamp,
+                "evidence_refs": unit_evidence_refs,
+                "source_chapter_refs": list(unit.source_chapter_refs),
+                "section_ref_label": _format_section_ref_label(list(unit.source_chapter_refs), total_chapters),
+                "content_blocks": content_blocks,
+                "visual_slots": visual_slots,
+            }
+        )
+    audience_fit = ""
+    if lecture.composition and lecture.composition.audience_fit:
+        audience_fit = lecture.composition.audience_fit
+    elif note.front_matter.suitable_for:
+        audience_fit = "适合：" + "；".join(note.front_matter.suitable_for[:2])
+    return {
+        "mode": "lecture_note_ir",
+        "has_units": bool(teaching_units),
+        "audience_fit": audience_fit,
+        "front_matter": {
+            "one_sentence_claim": note.front_matter.one_sentence_claim,
+            "reader_orientation": note.front_matter.reader_orientation,
+            "takeaways_top": list(note.front_matter.takeaways_top),
+            "reading_map": list(note.front_matter.reading_map),
+            "reader_prerequisites": list(note.front_matter.reader_prerequisites),
+            "suitable_for": list(note.front_matter.suitable_for),
+            "not_suitable_for": list(note.front_matter.not_suitable_for),
+        },
+        "teaching_units": teaching_units,
+        "back_matter": {
+            "boundary_and_risks": list(note.back_matter.boundary_and_risks),
+            "term_quick_ref": list(note.back_matter.term_quick_ref),
+            "source_index_entrypoints": list(note.back_matter.source_index_entrypoints),
+            "appendices": _reader_appendices_view(list(note.back_matter.appendices)),
+            "transfer_and_next_steps": list(note.back_matter.transfer_and_next_steps),
+        },
+    }
+
+
+def _fallback_visual_slots_for_unit(
+    lecture: LectureJSON,
+    *,
+    unit_id: str,
+    source_chapter_refs: list[int],
+    evidence_objects: list,
+) -> list[dict[str, object]]:
+    visuals: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    for obj in evidence_objects:
+        path = str(getattr(obj, "path", "") or "").strip()
+        if not path or path in seen_paths:
+            continue
+        kind = str(getattr(obj, "kind", "") or "").strip()
+        if kind and kind != "frame_evidence":
+            continue
+        seen_paths.add(path)
+        visuals.append(
+            _project_visual_slot(
+                {
+                    "slot_id": f"{unit_id}-fallback-evidence-{len(visuals) + 1}",
+                    "visual_role": "keyframe_explainer",
+                    "path": path,
+                    "caption": str(getattr(obj, "summary", "") or "").strip(),
+                    "title": str(getattr(obj, "title", "") or "").strip(),
+                    "ts": float(getattr(obj, "ts", 0.0) or 0.0),
+                    "evidence_refs": [str(getattr(obj, "evidence_id", "") or "").strip()] if getattr(obj, "evidence_id", "") else [],
+                }
+            )
+        )
+    if visuals:
+        visuals.sort(key=_visual_slot_rank, reverse=True)
+        return visuals[:1]
+    if not source_chapter_refs:
+        return visuals
+    chapter_frames: list[dict[str, object]] = []
+    for chapter in lecture.chapters:
+        if chapter.index not in source_chapter_refs:
+            continue
+        for frame_index, frame in enumerate(chapter.frames, start=1):
+            path = str(frame.path or "").strip()
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            chapter_frames.append(
+                _project_visual_slot(
+                    {
+                        "slot_id": f"{unit_id}-chapter-frame-{chapter.index}-{frame_index}",
+                        "visual_role": "keyframe_explainer",
+                        "path": path,
+                        "caption": frame.insight or frame.selected_reason or "",
+                        "title": frame.caption or "",
+                        "ts": float(frame.ts or 0.0),
+                        "evidence_refs": [],
+                    }
+                )
+            )
+    chapter_frames.sort(key=_visual_slot_rank, reverse=True)
+    return chapter_frames[:1]
+
+
+def _project_visual_slot(raw: dict[str, object]) -> dict[str, object]:
+    title = _clean_visual_text(raw.get("title"))
+    caption = _clean_visual_text(raw.get("caption"))
+    if title and caption and _texts_heavily_overlap(title, caption, threshold=0.76):
+        title = ""
+    return {
+        "slot_id": str(raw.get("slot_id") or "").strip(),
+        "visual_role": str(raw.get("visual_role") or "").strip(),
+        "path": str(raw.get("path") or "").strip(),
+        "caption": caption,
+        "title": title,
+        "ts": float(raw.get("ts") or 0.0),
+        "evidence_refs": [str(item).strip() for item in list(raw.get("evidence_refs") or []) if str(item).strip()],
+    }
+
+
+def _clean_visual_text(value: object, *, max_len: int = 88) -> str:
+    text = _compact_inline_text(value)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if '"ocr_text"' in lowered or lowered.startswith("{") or lowered.startswith("["):
+        return ""
+    noisy_tokens = (
+        "icloud",
+        "macintosh",
+        "downloads",
+        "airdrop",
+        "finder",
+        "标签",
+        "最近使用",
+        "共享位置",
+        "文稿",
+        "收藏",
+        "个人收藏",
+        "隔空投送",
+    )
+    if any(token in lowered for token in noisy_tokens):
+        return ""
+    punctuation_count = sum(text.count(ch) for ch in '{}[]":')
+    if punctuation_count >= 4:
+        return ""
+    if len(text) > 52 and text.count(" ") >= 6 and not any(ch in text for ch in "。！？；;：:"):
+        return ""
+    if len(text) > 30 and text.count(" ") >= 4 and not any(ch in text for ch in "。！？；;：:"):
+        return ""
+    if len(text) > max_len:
+        sentence = re.split(r"[。！？；;]", text, maxsplit=1)[0].strip()
+        if 8 <= len(sentence) <= max_len:
+            text = sentence
+        else:
+            text = text[:max_len].rstrip("，,、；;:： ")
+    return text + ("…" if len(text) == max_len else "")
+
+
+def _visual_slot_rank(slot: dict[str, object]) -> tuple[float, float]:
+    score = 0.0
+    if slot.get("caption"):
+        score += 2.0
+    if slot.get("title"):
+        score += 1.0
+    if slot.get("evidence_refs"):
+        score += 0.25
+    return (score, -float(slot.get("ts") or 0.0))
+
+
+def _source_index(lecture: LectureJSON) -> dict[str, object]:
+    if not lecture.composition or not lecture.composition.source_index:
+        return {}
+    return dict(lecture.composition.source_index)
+
+
+def _reader_appendices_view(items: list[object]) -> list[dict[str, str]]:
+    views: list[dict[str, str]] = []
+    kind_labels = {
+        "boundary_review": "边界复盘",
+        "related_material": "相关材料",
+        "reference": "参考资料",
+    }
+    for item in items:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                views.append({"title": "补充说明", "summary": text, "kind_label": ""})
+            continue
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("label") or "").strip()
+        summary = str(
+            item.get("summary")
+            or item.get("explanation")
+            or item.get("note")
+            or item.get("reason")
+            or item.get("text")
+            or ""
+        ).strip()
+        if not summary:
+            continue
+        kind = str(item.get("kind") or "").strip()
+        views.append(
+            {
+                "title": title,
+                "summary": summary,
+                "kind_label": kind_labels.get(kind, kind.replace("_", " ").strip()),
+            }
+        )
+    return views
+
+
+def _fallback_block_title(
+    explicit_title: str,
+    *,
+    block_role: str = "",
+    unit_role: str = "",
+    block_index: int = 1,
+) -> str:
+    title = str(explicit_title or "").strip()
+    if title:
+        return title
+    role = str(block_role or "").strip().lower()
+    if not role:
+        role = str(unit_role or "").strip().lower()
+    labels = {
+        "claim": "核心内容",
+        "concept": "核心内容",
+        "problem": "问题与判断",
+        "mechanism": "原理说明",
+        "process": "步骤与方法",
+        "case": "案例展开",
+        "example": "案例展开",
+        "boundary": "边界与风险",
+        "synthesis": "小结",
+        "summary": "小结",
+    }
+    if role in labels:
+        return labels[role]
+    if block_index == 1:
+        return "核心内容"
+    return "展开说明"
+
+
+def _compat_evidence_projection_from_source_index(lecture: LectureJSON) -> dict[str, object]:
+    source_index = _source_index(lecture)
+    return {
+        "mode": "compat",
+        "has_items": bool(source_index),
+        "source_index_view": list(source_index.get("source_index_view", [])),
+        "chapter_map": list(source_index.get("chapter_map", [])),
+        "evidence_quotes": list(source_index.get("evidence_quotes", [])),
+        "term_index": list(source_index.get("term_index", [])),
+        "glossary_view": [],
+        "appendix_view": list(source_index.get("tool_appendix", [])),
+        "tool_appendix": list(source_index.get("tool_appendix", [])),
+    }
+
+
+def _evidence_projection(lecture: LectureJSON) -> dict[str, object]:
+    evidence = lecture.evidence_index
+    if evidence is None:
+        return _compat_evidence_projection_from_source_index(lecture)
+    views = dict(evidence.projection_views)
+    has_items = any(bool(views.get(key)) for key in ("source_index_view", "chapter_map", "evidence_quotes", "term_index", "glossary_view", "appendix_view"))
+    return {
+        "mode": "evidence_index",
+        "has_items": has_items,
+        "source_index_view": list(views.get("source_index_view", [])),
+        "chapter_map": list(views.get("chapter_map", [])),
+        "evidence_quotes": list(views.get("evidence_quotes", [])),
+        "term_index": list(views.get("term_index", [])),
+        "glossary_view": list(views.get("glossary_view", [])),
+        "appendix_view": list(views.get("appendix_view", [])),
+        "tool_appendix": list(views.get("tool_appendix", [])),
+    }
 
 
 def _ensure_katex_assets(reports_dir: Path) -> bool:
@@ -409,10 +947,16 @@ def _ensure_highlight_assets(reports_dir: Path) -> bool:
 
 
 def _global_visual_evidence(lecture: LectureJSON) -> list:
+    chapter_paths = {
+        str(frame.path or "").strip()
+        for chapter in lecture.chapters
+        for frame in chapter.frames
+        if str(frame.path or "").strip()
+    }
     frames = []
     seen: set[str] = set()
     for frame in lecture.visual_evidence:
-        if not frame.path or frame.path in seen:
+        if not frame.path or frame.path in seen or frame.path in chapter_paths:
             continue
         seen.add(frame.path)
         frames.append(frame)
@@ -473,16 +1017,36 @@ class Renderer:
             for idx, (fr, _chapter_idx) in enumerate(_flat_frames(lecture), start=1)
             if fr.path
         }
+        mainline_items = _mainline_items(lecture)
+        long_mode = _is_long_lecture(lecture.duration)
+        note_projection = _lecture_note_projection(lecture)
+        evidence_projection = _evidence_projection(lecture)
         html = tpl.render(
             lecture=lecture,
+            hero_one_liner=_hero_one_liner(lecture),
+            cover_one_liner=_cover_one_liner(lecture, note_projection),
+            review_questions_to_render=_review_questions_to_render(lecture),
+            composition_body_sections=_composition_body_sections(lecture),
+            source_index=_source_index(lecture),
+            note_projection=note_projection,
+            evidence_projection=evidence_projection,
+            summary_mode=lecture.composition.summary_mode,
             css_inline=css_inline,
             copilot_css_inline=self.load_copilot_css(),
             frame_id_map=frame_id_map,
             cover_url=_cover_url(lecture, cover_path),
             type_recap=_type_recap(lecture),
-            mainline_items=_mainline_items(lecture),
-            timeline_turning_points=_timeline_detail_items(lecture.timeline.turning_points),
-            timeline_state_evolution=_timeline_detail_items(lecture.timeline.state_evolution),
+            mainline_items=mainline_items,
+            timeline_turning_points=_timeline_detail_items(
+                lecture.timeline.turning_points,
+                mainline_items=mainline_items,
+                long_mode=long_mode,
+            ),
+            timeline_state_evolution=_timeline_detail_items(
+                lecture.timeline.state_evolution,
+                mainline_items=mainline_items,
+                long_mode=long_mode,
+            ),
             global_visual_evidence=_global_visual_evidence(lecture),
             katex_assets_available=katex_assets_available,
             highlight_assets_available=highlight_assets_available,

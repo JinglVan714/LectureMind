@@ -202,6 +202,47 @@ def build_mcp(
         return _dump(out)
 
     @mcp.tool(
+        name="search_evidence",
+        description=_describe(tool_registry.search_evidence),
+    )
+    async def search_evidence(
+        bv: str,
+        query: str,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        try:
+            out = await tool_registry.search_evidence(
+                _ctx(), bv=bv, query=query, top_k=top_k
+            )
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
+        name="get_note_unit",
+        description=_describe(tool_registry.get_note_unit),
+    )
+    async def get_note_unit(bv: str, unit_id: str) -> dict[str, Any]:
+        try:
+            out = await tool_registry.get_note_unit(_ctx(), bv=bv, unit_id=unit_id)
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
+        name="get_evidence_object",
+        description=_describe(tool_registry.get_evidence_object),
+    )
+    async def get_evidence_object(bv: str, evidence_id: str) -> dict[str, Any]:
+        try:
+            out = await tool_registry.get_evidence_object(
+                _ctx(), bv=bv, evidence_id=evidence_id
+            )
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
         name="get_chapter",
         description=_describe(tool_registry.get_chapter),
     )
@@ -209,6 +250,46 @@ def build_mcp(
         try:
             out = await tool_registry.get_chapter(
                 _ctx(), bv=bv, chapter_idx=chapter_idx
+            )
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
+        name="get_frame",
+        description=_describe(tool_registry.get_frame),
+    )
+    async def get_frame(bv: str, frame_id: int) -> dict[str, Any]:
+        try:
+            out = await tool_registry.get_frame(_ctx(), bv=bv, frame_id=frame_id)
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
+        name="get_quote_context",
+        description=_describe(tool_registry.get_quote_context),
+    )
+    async def get_quote_context(bv: str, quote: str) -> dict[str, Any]:
+        try:
+            out = await tool_registry.get_quote_context(_ctx(), bv=bv, quote=quote)
+        except ToolError as exc:
+            _handle_tool_error(exc)
+        return _dump(out)
+
+    @mcp.tool(
+        name="explain_frame",
+        description=_describe(tool_registry.explain_frame),
+    )
+    async def explain_frame(
+        bv: str, frame_id: int, context_radius_seconds: int = 60
+    ) -> dict[str, Any]:
+        try:
+            out = await tool_registry.explain_frame(
+                _ctx(),
+                bv=bv,
+                frame_id=frame_id,
+                context_radius_seconds=context_radius_seconds,
             )
         except ToolError as exc:
             _handle_tool_error(exc)

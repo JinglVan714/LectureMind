@@ -106,8 +106,8 @@
   // Anchor rendering (post-process the accumulated answer string)
   // ------------------------------------------------------------------
 
-  // Matches [t=12:34], [F12], [Ch3] plus the [⚠ t=12:34] invalid form.
-  const ANCHOR_REGEX = /\[(⚠\s)?(t=\d{1,2}:\d{2}|F\d+|Ch\d+)\]/g;
+  // Matches [t=12:34], [t=24], [F12], [Ch3]/[CH3] plus the invalid [⚠ ...] form.
+  const ANCHOR_REGEX = /\[(⚠\s)?(t=(?:\d{1,2}:\d{2}|\d+)|F\d+|(?:Ch|CH)\d+)\]/g;
 
   function escapeHtml(s) {
     return s
@@ -119,8 +119,10 @@
   }
 
   function refKindLabel(kind) {
-    if (kind === "chapter") return "章节";
-    if (kind === "frame") return "图片";
+    if (kind === "note" || kind === "note_node") return "讲义节点";
+    if (kind === "evidence" || kind === "evidence_object") return "证据对象";
+    if (kind === "chapter") return "兼容章节";
+    if (kind === "frame") return "兼容关键帧";
     if (kind === "selection") return "文本";
     return "引用";
   }
@@ -128,8 +130,10 @@
   function refSummary(ref) {
     if (!ref) return "";
     if (ref.text) return ref.text;
-    if (ref.kind === "chapter") return `章节 ${ref.id}`;
-    if (ref.kind === "frame") return `关键帧 F${ref.id}`;
+    if (ref.kind === "note" || ref.kind === "note_node") return `讲义节点 ${ref.note_node_id || ref.id || ""}`.trim();
+    if (ref.kind === "evidence" || ref.kind === "evidence_object") return `证据对象 ${ref.evidence_id || ref.id || ""}`.trim();
+    if (ref.kind === "chapter") return `兼容章节 Ch${ref.id}`;
+    if (ref.kind === "frame") return `兼容关键帧 F${ref.id}`;
     return ref.label || ref.kind || "";
   }
 
@@ -160,16 +164,139 @@
     try { localStorage.removeItem(key); } catch {}
   }
 
-  function storedRef(ref) {
+  function normalizeTimestampValue(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    if (/^\d+$/.test(raw)) {
+      const secs = parseInt(raw, 10);
+      const mm = Math.floor(secs / 60);
+      const ss = secs % 60;
+      return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+    }
+    const m = /^(\d{1,2}):(\d{2})$/.exec(raw);
+    if (!m) return null;
+    return `${String(parseInt(m[1], 10)).padStart(2, "0")}:${m[2]}`;
+  }
+
+  function normalizeAnchorToken(token) {
+    const raw = String(token || "").trim();
+    if (!raw) return null;
+    if (raw.startsWith("t=")) {
+      const normalized = normalizeTimestampValue(raw.slice(2));
+      if (!normalized) return null;
+      return { kind: "t", id: normalized, text: `t=${normalized}` };
+    }
+    if (/^F\d+$/.test(raw)) {
+      const fid = String(parseInt(raw.slice(1), 10));
+      return { kind: "F", id: fid, text: `F${fid}` };
+    }
+    if (/^(?:Ch|CH)\d+$/.test(raw)) {
+      const cid = String(parseInt(raw.replace(/^(?:Ch|CH)/, ""), 10));
+      return { kind: "Ch", id: cid, text: `Ch${cid}` };
+    }
+    return null;
+  }
+
+  function normalizeRefKind(kind, noteNodeId, evidenceId) {
+    if (evidenceId) return "evidence";
+    if (noteNodeId) return "note";
+    return kind;
+  }
+
+  function displayKindLabel(kind) {
+    if (kind === "note" || kind === "note_node") return "讲义节点";
+    if (kind === "evidence" || kind === "evidence_object") return "证据对象";
+    if (kind === "chapter") return "兼容章节";
+    if (kind === "frame") return "兼容关键帧";
+    if (kind === "selection") return "文本";
+    return "引用";
+  }
+
+  function displayRefLabel(ref) {
+    if (!ref) return "";
+    if (ref.label) return ref.label;
+    if (ref.kind === "note" || ref.kind === "note_node") return `讲义节点 ${ref.note_node_id || ref.id || ""}`.trim();
+    if (ref.kind === "evidence" || ref.kind === "evidence_object") return `证据对象 ${ref.evidence_id || ref.id || ""}`.trim();
+    if (ref.kind === "chapter") return `兼容章节 Ch${ref.id}`;
+    if (ref.kind === "frame") return `兼容关键帧 F${ref.id}`;
+    return "";
+  }
+
+  function refLabel(ref) {
+    if (!ref) return "";
+    if (ref.label) return ref.label;
+    if (ref.kind === "note" || ref.kind === "note_node") return `讲义节点 ${ref.note_node_id || ref.id || ""}`.trim();
+    if (ref.kind === "evidence" || ref.kind === "evidence_object") return `证据对象 ${ref.evidence_id || ref.id || ""}`.trim();
+    if (ref.kind === "chapter") return `兼容章节 Ch${ref.id}`;
+    if (ref.kind === "frame") return `兼容关键帧 F${ref.id}`;
+    return "";
+  }
+
+  function normalizedRef(ref) {
     if (!ref || typeof ref !== "object") return null;
-    const kind = String(ref.kind || "").trim();
+    const rawKind = String(ref.kind || "").trim();
+    const id = ref.id != null ? ref.id : null;
+    const noteNodeId = ref.note_node_id || null;
+    const evidenceId = ref.evidence_id || null;
+    const kind = normalizeRefKind(rawKind, noteNodeId, evidenceId);
     if (!kind) return null;
     return {
       kind,
-      id: ref.id != null ? ref.id : null,
+      id,
+      note_node_id: noteNodeId,
+      evidence_id: evidenceId,
       text: ref.text || null,
-      label: ref.label || null,
+      label: displayRefLabel({
+        kind,
+        id,
+        note_node_id: noteNodeId,
+        evidence_id: evidenceId,
+        label: ref.label || null,
+      }) || null,
+      image: ref.image || "",
     };
+  }
+
+  function chipKey(ref) {
+    if (ref.evidence_id) return "evidence|" + ref.evidence_id;
+    if (ref.note_node_id) return "note|" + ref.note_node_id;
+    return ref.kind + "|" + (ref.id != null ? ref.id : (ref.text || ""));
+  }
+
+  function refFromHost(host) {
+    if (!host || !host.dataset) return null;
+    const kind = String(host.dataset.refKind || "").trim();
+    const rawId = host.dataset.refId;
+    const numericId = rawId != null && rawId !== "" && /^-?\d+$/.test(rawId) ? parseInt(rawId, 10) : rawId;
+    const text = host.dataset.refText || hostPreviewText(host) || null;
+    const noteNodeId = host.dataset.noteNodeId || null;
+    const evidenceId = host.dataset.evidenceId || null;
+    const label =
+      host.dataset.noteLabel ||
+      host.dataset.evidenceLabel ||
+      host.dataset.refLabel ||
+      null;
+    const ref = normalizedRef({
+      kind,
+      id: numericId != null ? numericId : null,
+      note_node_id: noteNodeId,
+      evidence_id: evidenceId,
+      text,
+      label,
+    });
+    if (!ref) return null;
+    if (kind === "frame") {
+      const img = host.querySelector("img");
+      ref.image = img ? (img.currentSrc || img.src) : "";
+    }
+    if (ref.kind === "selection" && !ref.label && ref.text) {
+      ref.label = "「" + ref.text.slice(0, 24) + "」";
+    }
+    return ref;
+  }
+
+  function storedRef(ref) {
+    return normalizedRef(ref);
   }
 
   function storedHistoryTurn(turn) {
@@ -190,13 +317,11 @@
       if (warn) {
         return `<span class="cp-anchor-invalid" title="锚点越界">[⚠ ${escapeHtml(token)}]</span>`;
       }
-      let kind, id;
-      if (token.startsWith("t=")) { kind = "t";  id = token.slice(2); }
-      else if (token.startsWith("F"))  { kind = "F";  id = token.slice(1); }
-      else if (token.startsWith("Ch")) { kind = "Ch"; id = token.slice(2); }
-      else { return escapeHtml(m); }
+      const normalized = normalizeAnchorToken(token);
+      if (!normalized) return escapeHtml(m);
+      const { kind, id, text } = normalized;
       return `<a href="#" class="cp-anchor" data-anchor-kind="${kind}" ` +
-             `data-anchor-id="${escapeHtml(id)}">[${escapeHtml(token)}]</a>`;
+             `data-anchor-id="${escapeHtml(id)}">[${escapeHtml(text)}]</a>`;
     });
   }
 
@@ -296,7 +421,9 @@
   // ------------------------------------------------------------------
 
   function timestampToSeconds(value) {
-    const m = /^(\d{1,2}):(\d{2})$/.exec(value);
+    const normalized = normalizeTimestampValue(value);
+    if (!normalized) return null;
+    const m = /^(\d{2,}):(\d{2})$/.exec(normalized);
     if (!m) return null;
     return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
   }
@@ -307,9 +434,59 @@
     setTimeout(() => el.classList.remove("cp-anchor-flash"), 1600);
   }
 
+  function chapterCompatibleTarget(id) {
+    const chapterId = String(id);
+    const legacy = document.getElementById("chapter-" + chapterId);
+    if (legacy) return legacy;
+    const noteSections = [...document.querySelectorAll(".body-section[data-source-chapters]")];
+    for (const el of noteSections) {
+      const refs = String(el.dataset.sourceChapters || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (refs.includes(chapterId)) return el;
+    }
+    const compatRef = document.querySelector(`.visual-compat-ref`);
+    if (compatRef) {
+      const host = compatRef.closest(".body-section, .outline-block, .source-index-item");
+      if (host) return host;
+    }
+    return document.querySelector(".body-section, .outline-block, .source-index-item");
+  }
+
+  function nearestTimestampTarget(secs) {
+    if (secs == null) return null;
+    const anchors = [
+      ...document.querySelectorAll(".body-section .ts-anchor, .outline-block .ts-anchor, .anchor-btn, .source-index .ts-anchor")
+    ];
+    let exact = null;
+    let nearest = null;
+    let nearestDist = Infinity;
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute("href") || "";
+      const match = /[?&]t=(\d+)/.exec(href);
+      if (!match) continue;
+      const anchorSecs = parseInt(match[1], 10);
+      const host = anchor.closest(".outline-block, .body-section, .source-index-item, [data-ref-kind='chapter']");
+      if (!host) continue;
+      if (anchorSecs === secs) return host;
+      const dist = Math.abs(anchorSecs - secs);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearest = host;
+      }
+      if (!exact && host.dataset && host.dataset.refKind === "chapter") {
+        const start = parseInt(host.dataset.chStart || "0", 10);
+        const end = parseInt(host.dataset.chEnd || "0", 10);
+        if (secs >= start && secs <= end) exact = host;
+      }
+    }
+    return nearest || exact;
+  }
+
   function findAnchorTarget(kind, id, bv) {
     if (kind === "Ch") {
-      return document.getElementById("chapter-" + id);
+      return chapterCompatibleTarget(id);
     }
     if (kind === "F") {
       return document.querySelector(
@@ -319,6 +496,8 @@
     if (kind === "t") {
       const secs = timestampToSeconds(id);
       if (secs == null) return null;
+      const noteNative = nearestTimestampTarget(secs);
+      if (noteNative) return noteNative;
       // Prefer the chapter whose [start, end] contains this timestamp;
       // when the LLM emits a ts that falls between two chapters or after
       // the last one, fall back to the chapter with the nearest boundary
@@ -356,13 +535,17 @@
                (document.getElementById("cp-panel") &&
                 document.getElementById("cp-panel").dataset.bv) || "";
 
-    // Time anchors semantically point at a moment in the original video,
-    // so default click → open Bilibili at that timestamp in a new tab.
-    // Shift-click (or Alt-click) keeps the in-page scroll behaviour for
-    // users who want to stay in the lecture and inspect the chapter.
+    // Time anchors first try to return to the nearest in-page note/evidence
+    // context. Modified click keeps the original-video jump behaviour.
     if (kind === "t") {
       const secs = timestampToSeconds(id);
-      if (!evt.shiftKey && !evt.altKey) {
+      const target = findAnchorTarget(kind, id, bv);
+      if (target && !evt.shiftKey && !evt.altKey && !evt.metaKey && !evt.ctrlKey) {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+        flashElement(target);
+        return;
+      }
+      if (evt.shiftKey || evt.altKey || evt.metaKey || evt.ctrlKey || !target) {
         // Local seek wins over the external jump when an inline <video>
         // is present (e.g. future feature where the lecture embeds the
         // BV stream directly).
@@ -379,7 +562,7 @@
           return;
         }
       }
-      // Fall through to in-page scroll on Shift/Alt or when bv is missing.
+      return;
     }
 
     const target = findAnchorTarget(kind, id, bv);
@@ -651,17 +834,25 @@
 
     // ---- Chips ----
     addChipFromHost(host) {
+      const nativeRef = refFromHost(host);
+      if (nativeRef) {
+        if (nativeRef.kind === "selection" && !nativeRef.text) {
+          nativeRef.text = host.textContent.trim().slice(0, 80);
+        }
+        this.addChip(nativeRef);
+        return;
+      }
       const kind = host.dataset.refKind;
       const id   = host.dataset.refId;
       const text = host.dataset.refText || "";
       if (kind === "chapter") {
-        this.addChip({ kind: "chapter", id: parseInt(id, 10), label: `章节 ${id}`, text: hostPreviewText(host) });
+        this.addChip({ kind: "chapter", id: parseInt(id, 10), label: displayRefLabel({ kind: "chapter", id: parseInt(id, 10) }), text: hostPreviewText(host) });
       } else if (kind === "frame") {
         const img = host.querySelector("img");
         this.addChip({
           kind: "frame",
           id: parseInt(id, 10),
-          label: `关键帧 F${id}`,
+          label: displayRefLabel({ kind: "frame", id: parseInt(id, 10) }),
           text: hostPreviewText(host),
           image: img ? (img.currentSrc || img.src) : "",
         });
@@ -671,6 +862,16 @@
       }
     }
     addChip(ref) {
+      const nativeRef = normalizedRef(ref);
+      if (nativeRef) {
+        const nativeKey = chipKey(nativeRef);
+        if (this.chips.some((c) => c._key === nativeKey)) return;
+        nativeRef._key = nativeKey;
+        this.chips.push(nativeRef);
+        this._renderChips();
+        this.open();
+        return;
+      }
       // Dedupe by (kind, id/text).
       const key = ref.kind + "|" + (ref.id != null ? ref.id : (ref.text || ""));
       if (this.chips.some((c) => c._key === key)) return;
@@ -703,7 +904,7 @@
         `;
         const thumb = el.querySelector(".cp-chip-thumb");
         if (thumb) thumb.src = c.image;
-        el.querySelector(".cp-chip-kicker").textContent = `${refKindLabel(c.kind)} · ${c.label || ""}`;
+        el.querySelector(".cp-chip-kicker").textContent = `${displayKindLabel(c.kind)} · ${c.label || ""}`;
         el.querySelector(".cp-chip-text").textContent = refSummary(c);
         el.querySelector(".cp-chip-close").addEventListener("click", () => this.removeChip(c._key));
         this.elChips.appendChild(el);
@@ -737,7 +938,7 @@
           `;
           const thumb = chip.querySelector(".cp-user-ref-thumb");
           if (thumb) thumb.src = ref.image;
-          chip.querySelector(".cp-user-ref-kicker").textContent = `${refKindLabel(ref.kind)} · ${ref.label || ""}`;
+          chip.querySelector(".cp-user-ref-kicker").textContent = `${displayKindLabel(ref.kind)} · ${ref.label || ""}`;
           chip.querySelector(".cp-user-ref-text").textContent = refSummary(ref);
           wrap.appendChild(chip);
         });
@@ -790,9 +991,20 @@
         line.textContent = "✖ " + (payload.name || "") + (payload.error && payload.error.code ? ` · ${payload.error.code}` : "");
       } else {
         const bits = [];
+        if (payload && typeof payload.primary_ref_kind === "string" && typeof payload.primary_ref_id === "string" && payload.primary_ref_kind && payload.primary_ref_id) {
+          if (payload.primary_ref_kind === "note") bits.push(`主引用 讲义节点 ${payload.primary_ref_id}`);
+          else if (payload.primary_ref_kind === "evidence") bits.push(`主引用 证据对象 ${payload.primary_ref_id}`);
+          else bits.push(`主引用 ${payload.primary_ref_kind} ${payload.primary_ref_id}`);
+        }
+        if (payload && typeof payload.note_node_id === "string" && payload.note_node_id) bits.push(`讲义节点 ${payload.note_node_id}`);
+        if (payload && typeof payload.note_unit_id === "string" && payload.note_unit_id) bits.push(`讲义单元 ${payload.note_unit_id}`);
+        if (payload && typeof payload.evidence_id === "string" && payload.evidence_id) bits.push(`证据 ${payload.evidence_id}`);
+        if (payload && typeof payload.note_nodes_count === "number") bits.push(`${payload.note_nodes_count} 节点`);
+        if (payload && typeof payload.evidence_count === "number") bits.push(`${payload.evidence_count} 证据`);
+        if (payload && typeof payload.hits_count === "number") bits.push(`${payload.hits_count} 命中`);
         if (payload && typeof payload.chunks_count === "number") bits.push(`${payload.chunks_count} 片段`);
-        if (payload && typeof payload.chapter_idx === "number")  bits.push(`Ch${payload.chapter_idx}`);
-        if (payload && typeof payload.frame_id === "number")     bits.push(`F${payload.frame_id}`);
+        if (payload && typeof payload.chapter_idx === "number")  bits.push(`兼容章节 Ch${payload.chapter_idx}`);
+        if (payload && typeof payload.frame_id === "number")     bits.push(`兼容关键帧 F${payload.frame_id}`);
         line.textContent = "✓ " + (payload.name || "") + (bits.length ? ` · ${bits.join(", ")}` : "");
       }
       this.currentTraceEl.appendChild(line);
@@ -909,7 +1121,11 @@
         bv: this.bv,
         question,
         references: this.chips.map((c) => ({
-          kind: c.kind, id: c.id, text: c.text || null,
+          kind: c.kind,
+          id: c.id,
+          note_node_id: c.note_node_id || null,
+          evidence_id: c.evidence_id || null,
+          text: c.text || null,
         })),
         use_web: this.useWeb,
         messages: this.history.slice(-MAX_HISTORY_TURNS).map((m) => ({

@@ -2,8 +2,10 @@
 #
 # What it verifies:
 #   1. .gitignore covers .env, .env.*, data/, caches
+#   1b. .dockerignore keeps local-only paths out of the image context
 #   2. .env is NOT tracked by git (warns loudly if it is)
-#   3. DASHSCOPE_API_KEY / BASIC_AUTH_PASSWORD in .env are not the placeholders
+#   3. DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / BASIC_AUTH_PASSWORD in .env
+#      are not the placeholders
 #   4. .env.example exists and contains no real-looking secret
 #   5. data/ is not tracked by git
 #   6. (optional) full automated regression via scripts/qa_full.ps1
@@ -34,7 +36,7 @@ function Add-Ok   { param($Msg) Write-Host "[ok]   $Msg" -ForegroundColor Green 
 # 1. .gitignore covers the dangerous paths
 if (Test-Path .gitignore) {
     $gi = Get-Content .gitignore
-    foreach ($pat in @('.env', 'data/')) {
+    foreach ($pat in @('.env', 'data/', '.tmp/', '.tmp_pytest/', '.tmp_smoke/', 'tmp/')) {
         $needle = [regex]::Escape($pat)
         if ($gi -match "^$needle$") {
             Add-Ok ".gitignore covers $pat"
@@ -46,11 +48,31 @@ if (Test-Path .gitignore) {
     Add-Err '.gitignore missing'
 }
 
+# 1b. .dockerignore should keep local-only paths out of image builds
+if (Test-Path .dockerignore) {
+    $di = Get-Content .dockerignore
+    foreach ($pat in @('.env', 'data/', 'tests/', 'docs/')) {
+        $needle = [regex]::Escape($pat)
+        if ($di -match "^$needle$") {
+            Add-Ok ".dockerignore covers $pat"
+        } else {
+            Add-Warn ".dockerignore does NOT explicitly cover $pat"
+        }
+    }
+} else {
+    Add-Warn '.dockerignore missing'
+}
+
 # 2. .env hygiene
 if (Test-Path .env) {
     $envBody = Get-Content .env -Raw
+    if ($envBody -match 'DEEPSEEK_API_KEY=sk-replace-me') {
+        Add-Warn '.env still has the placeholder DEEPSEEK_API_KEY -- text pipeline / Copilot calls will fail'
+    } else {
+        Add-Ok '.env has a non-placeholder DEEPSEEK_API_KEY'
+    }
     if ($envBody -match 'DASHSCOPE_API_KEY=sk-replace-me') {
-        Add-Warn '.env still has the placeholder DASHSCOPE_API_KEY -- real Copilot/lecturize calls will fail'
+        Add-Warn '.env still has the placeholder DASHSCOPE_API_KEY -- vision / embedding calls will fail'
     } else {
         Add-Ok '.env has a non-placeholder DASHSCOPE_API_KEY'
     }
@@ -64,10 +86,15 @@ if (Test-Path .env) {
 # 3. .env.example must exist and stay placeholder-only
 if (Test-Path .env.example) {
     $exBody = Get-Content .env.example -Raw
+    if ($exBody -match 'DEEPSEEK_API_KEY=sk-(?!replace-me)[A-Za-z0-9]{20,}') {
+        Add-Err '.env.example appears to contain a real DEEPSEEK key -- replace with sk-replace-me'
+    } else {
+        Add-Ok '.env.example uses a placeholder DEEPSEEK key'
+    }
     if ($exBody -match 'DASHSCOPE_API_KEY=sk-(?!replace-me)[A-Za-z0-9]{20,}') {
         Add-Err '.env.example appears to contain a real DASHSCOPE key -- replace with sk-replace-me'
     } else {
-        Add-Ok '.env.example uses placeholder secret values'
+        Add-Ok '.env.example uses a placeholder DASHSCOPE key'
     }
 } else {
     Add-Err '.env.example missing'

@@ -34,7 +34,7 @@ import sqlite3
 import struct
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, Sequence, cast
 
 from app.config import get_settings
 from app.understand.ir import LectureIR
@@ -59,6 +59,17 @@ ChunkKind = Literal[
     "formula_block",
     "study_question",
 ]
+
+_VALID_CHUNK_KINDS = {
+    "teaching_note",
+    "quote",
+    "pitfall",
+    "knowledge_unit",
+    "frame_ocr",
+    "code_block",
+    "formula_block",
+    "study_question",
+}
 
 
 @dataclass
@@ -110,6 +121,9 @@ def chunk_lecture(
     without changing the contract.
     """
     del lecture_ir  # reserved for future use
+    evidence_chunks = _evidence_index_chunks(lecture)
+    if evidence_chunks:
+        return evidence_chunks
     bv_id = lecture.bv_id
     out: list[Chunk] = []
     seen_frame_paths: set[str] = set()
@@ -321,6 +335,50 @@ def chunk_lecture(
         )
 
     return out
+
+
+def _evidence_index_chunks(lecture: LectureJSON) -> list[Chunk]:
+    evidence = lecture.evidence_index
+    if evidence is None or not evidence.evidence_objects:
+        return []
+    out: list[Chunk] = []
+    for obj in evidence.evidence_objects:
+        for rag_chunk in obj.rag_chunks:
+            text = (rag_chunk.text or "").strip()
+            if not text:
+                continue
+            kind = _coerce_chunk_kind(rag_chunk.kind)
+            t_start = int(rag_chunk.t_start) if rag_chunk.t_start is not None else None
+            t_end = int(rag_chunk.t_end) if rag_chunk.t_end is not None else t_start
+            if t_start is not None and (t_end is None or t_end < t_start):
+                t_end = t_start
+            note_node_id = rag_chunk.note_node_id or (obj.note_node_ids[0] if obj.note_node_ids else "")
+            meta = dict(rag_chunk.meta or {})
+            meta.setdefault("evidence_id", obj.evidence_id)
+            meta.setdefault("note_node_id", note_node_id)
+            meta.setdefault("evidence_kind", obj.kind)
+            if obj.quote and "quote" not in meta:
+                meta["quote"] = obj.quote
+            if obj.path and "path" not in meta:
+                meta["path"] = obj.path
+            out.append(
+                Chunk(
+                    bv_id=lecture.bv_id,
+                    kind=kind,
+                    text=text,
+                    chapter_idx=rag_chunk.chapter_idx or obj.chapter_index,
+                    t_start=t_start,
+                    t_end=t_end,
+                    meta=meta,
+                )
+            )
+    return out
+
+
+def _coerce_chunk_kind(kind: str) -> ChunkKind:
+    if kind in _VALID_CHUNK_KINDS:
+        return cast(ChunkKind, kind)
+    return "teaching_note"
 
 
 def _frame_text(caption: str, insight: str, ocr_text: str) -> str:

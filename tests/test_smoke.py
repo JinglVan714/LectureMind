@@ -17,19 +17,38 @@ os.environ.setdefault("BASIC_AUTH_PASSWORD", "test-pwd")
 
 from app.ingest.bilibili import BilibiliIngest  # noqa: E402
 from app.ingest.subtitle import SubtitleSegment, _local_faster_whisper_base_snapshot  # noqa: E402
-from app.render.renderer import Renderer, _global_visual_evidence  # noqa: E402
+from app.render.renderer import (  # noqa: E402
+    Renderer,
+    _format_section_ref_label,
+    _global_visual_evidence,
+    _hero_one_liner,
+    _review_questions_to_render,
+)
+from scripts._verify_note_evidence_real_sample import (  # noqa: E402
+    validate_compatibility_projection_surfaces,
+    validate_copilot_answer_framing,
+    validate_ask_reference_identity,
+    validate_compatibility_empty_canonical_outputs,
+    _make_no_explicit_bridge_lecture,
+    validate_visible_experience_html,
+)
+from scripts._verify_phase4_prep_gates import _report_path as _phase4_report_path  # noqa: E402
 from app.understand.ir import LectureIR, hydrate_lecture_ir_data, infer_primary_type  # noqa: E402
 from app.understand.ir_builder import lecture_ir_to_lecture_json  # noqa: E402
 from app.understand.lecturize import LecturizeContext  # noqa: E402
 from app.understand.schema import (  # noqa: E402
     Chapter,
+    CompositionView,
+    EvidenceIndex,
     Frame,
     Highlight,
     KnowledgeUnitView,
     LectureJSON,
+    LectureNoteIR,
     Point,
 )
 from app.understand._latex_repair import repair_obj, repair_string  # noqa: E402
+from app.understand.composition import compose_from_lecture_json  # noqa: E402
 from app.understand.vlm import FrameDescription  # noqa: E402
 
 
@@ -162,7 +181,7 @@ def _sample_lecture() -> LectureJSON:
         visual_evidence=[
             Frame(
                 ts=50,
-                path="keyframes/BV1xx411c7mD/00050.jpg",
+                path="keyframes/BV1xx411c7mD/00060.jpg",
                 caption="板书",
                 ocr_text="板书文字",
                 insight="全局关键图。",
@@ -226,6 +245,86 @@ def _sample_ir() -> LectureIR:
     return LectureIR.model_validate(data)
 
 
+def _sample_lecture_with_note_evidence() -> LectureJSON:
+    lec = _sample_lecture()
+    lec.lecture_note_ir = LectureNoteIR.model_validate(
+        {
+            "front_matter": {
+                "reader_orientation": "先读正文主线，再按需下钻证据。",
+                "takeaways_top": ["正文主链来自 Lecture Note IR。"],
+            },
+            "body": {
+                "teaching_units": [
+                    {
+                        "unit_id": "unit-1",
+                        "ordinal": "1",
+                        "title": "主论点",
+                        "unit_role": "claim",
+                        "core_message": "先建立教学主判断。",
+                        "source_chapter_refs": [1],
+                        "evidence_refs": ["ev-quote-1"],
+                        "content_blocks": [
+                            {
+                                "block_id": "block-1",
+                                "title": "解释",
+                                "paragraphs": ["正文直接由 teaching unit 展开。"],
+                                "source_timestamps": [120.0],
+                                "source_chapter_refs": [1],
+                                "evidence_refs": ["ev-quote-1"],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "back_matter": {},
+        }
+    )
+    lec.evidence_index = EvidenceIndex.model_validate(
+        {
+            "evidence_objects": [
+                {
+                    "evidence_id": "ev-quote-1",
+                    "kind": "quote_evidence",
+                    "chapter_index": 1,
+                    "quote": "这是字幕里的一段原话",
+                    "note_node_ids": ["block-1"],
+                    "source_payload": {"quote": "这是字幕里的一段原话", "point_text": "P1"},
+                },
+                {
+                    "evidence_id": "ev-frame-1",
+                    "kind": "frame_evidence",
+                    "chapter_index": 1,
+                    "path": "keyframes/BV1xx411c7mD/00050.jpg",
+                    "ts": 50,
+                    "note_node_ids": ["unit-1"],
+                },
+            ],
+            "projection_views": {
+                "source_index_view": [
+                    {
+                        "label": "[t=02:00]",
+                        "supports_text": "支撑主论点",
+                        "video_anchor": "t=120",
+                        "evidence_id": "ev-quote-1",
+                        "page_anchor": "unit-1",
+                    }
+                ],
+                "chapter_map": [
+                    {"chapter_index": 1, "title": "兼容定位", "start": 0, "end": 300}
+                ],
+            },
+        }
+    )
+    return lec
+
+
+def _write_sample_frames() -> None:
+    for name in ("00050.jpg", "00060.jpg"):
+        frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / name
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(b"fake-jpeg")
+
+
 class TestSchema:
     def test_validates(self):
         lec = _sample_lecture()
@@ -258,6 +357,38 @@ class TestSchema:
                 chapters=[Chapter(index=1, title="c", start=0, end=99,
                                    summary="s", points=[])],
             )
+
+
+class TestPhase4GateRunner:
+    def test_phase4_gate_runner_report_path_defaults_under_data(self):
+        import argparse
+
+        out = _phase4_report_path(argparse.Namespace(bv="BV_TEST", out=""))
+        assert out.name == "verify_phase4_prep_gates_BV_TEST.md"
+
+    def test_phase4_gate_runner_lists_current_gate_set_and_legacy_surface_coverage(self):
+        from scripts._verify_phase4_prep_gates import (
+            _EXECUTED_GATES,
+            _LEGACY_SURFACE_COVERAGE,
+            _RETIREMENT_SEQUENCE,
+        )
+
+        gate_names = [name for name, _meaning in _EXECUTED_GATES]
+        assert "Copilot final-answer framing gate" in gate_names
+        assert "Compatibility-projection gate" in gate_names
+
+        surfaces = [surface for surface, _coverage in _LEGACY_SURFACE_COVERAGE]
+        assert "`composition.body_sections`" in surfaces
+        assert "`composition.source_index`" in surfaces
+
+        sequence_surfaces = [surface for surface, _reason in _RETIREMENT_SEQUENCE]
+        assert sequence_surfaces == [
+            "visible chapter/frame compatibility labels in Copilot-facing UX",
+            "chapter/frame-era primary fields inside compatibility shells",
+            "`composition.body_sections`",
+            "`composition.source_index`",
+            "`chapters`",
+        ]
 
 
 class TestLectureIR:
@@ -325,6 +456,21 @@ class TestLectureIR:
         ]
         assert lecture.mainline == lecture.learning_path
 
+    def test_mainline_falls_back_to_chapter_learning_goals_when_empty(self):
+        ir = _sample_ir()
+        ir.mainline = []
+        ir.chapters[0].learning_goal = "理解 QKV 为什么是注意力入口"
+        ir.chapters[1].learning_goal = "掌握权重计算如何改变信息流向"
+
+        lecture = lecture_ir_to_lecture_json(ir)
+
+        assert lecture.learning_path[:2] == [
+            "理解 QKV 为什么是注意力入口",
+            "掌握权重计算如何改变信息流向",
+        ]
+        assert lecture.mainline == lecture.learning_path
+        assert lecture.completeness.mainline_closed is True
+
     def test_short_teaching_notes_fall_back_to_existing_chapter_fields(self):
         ir = _sample_ir()
         ir.chapters[0].teaching_notes = ["太短"]
@@ -342,12 +488,114 @@ class TestLectureIR:
 
 # ---------------- Renderer ----------------
 
+class TestLectureProjection:
+
+    def test_question_lists_dual_fill_both_directions(self):
+        ir = _sample_ir()
+        ir.study_questions = ["What does QKV do?"]
+        ir.review_questions = []
+        lecture = lecture_ir_to_lecture_json(ir)
+        assert lecture.study_questions == ["What does QKV do?"]
+        assert lecture.review_questions == ["What does QKV do?"]
+
+        ir = _sample_ir()
+        ir.study_questions = []
+        ir.review_questions = ["Why does attention need QKV?"]
+        lecture = lecture_ir_to_lecture_json(ir)
+        assert lecture.study_questions == ["Why does attention need QKV?"]
+        assert lecture.review_questions == ["Why does attention need QKV?"]
+
+    def test_glossary_uses_term_short_only(self):
+        from app.understand.ir import KnowledgeUnit
+
+        ir = _sample_ir()
+        ir.knowledge_units = [
+            KnowledgeUnit(
+                id="ku-1",
+                type="mechanism",
+                title="Query Key Value tuple",
+                term_short="QKV",
+                explanation="The input triplet used by attention.",
+                ts=10,
+                chapter_index=1,
+            ),
+            KnowledgeUnit(
+                id="ku-2",
+                type="concept",
+                title="This is a full sentence, not a glossary term",
+                explanation="Should stay out of the glossary.",
+                ts=20,
+                chapter_index=1,
+            ),
+        ]
+
+        lecture = lecture_ir_to_lecture_json(ir)
+
+        assert [item.term for item in lecture.glossary] == ["QKV"]
+        assert lecture.glossary[0].explanation.startswith("Query Key Value tuple")
+
+    def test_glossary_filters_generic_process_terms_and_uses_normal_colon(self):
+        from app.understand.ir import KnowledgeUnit
+
+        ir = _sample_ir()
+        ir.knowledge_units = [
+            KnowledgeUnit(
+                id="ku-1",
+                type="concept",
+                title="开发大纲",
+                term_short="开发大纲",
+                explanation="把口播稿拆成章节和步骤。",
+                ts=10,
+                chapter_index=1,
+            ),
+            KnowledgeUnit(
+                id="ku-2",
+                type="concept",
+                title="Harness工程",
+                term_short="Harness工程",
+                explanation="用于驾驭 Agent 过程的工程框架。",
+                ts=20,
+                chapter_index=1,
+            ),
+        ]
+
+        lecture = lecture_ir_to_lecture_json(ir)
+
+        assert [item.term for item in lecture.glossary] == ["Harness工程"]
+        assert lecture.glossary[0].explanation.startswith("Harness工程：")
+
+    def test_long_video_projection_dedupes_chapter_content(self):
+        ir = _sample_ir()
+        ir.duration = 2400
+        ir.chapters[0].learning_goal = "Define QKV and explain why attention starts here."
+        ir.chapters[0].summary = "Define QKV and explain why attention starts here."
+        ir.chapters[0].teaching_notes = [
+            "Define QKV and explain why attention starts here.",
+            "Define QKV and explain why attention starts here.",
+            "Show how attention weights are computed from the same inputs.",
+            "Show how attention weights are computed from the same inputs.",
+            "Close the chapter by linking QKV to the later output projection.",
+        ]
+        ir.chapters[0].process_steps = ["Inspect inputs", "Project tokens"]
+        ir.chapters[0].key_takeaways = [
+            "Define QKV and explain why attention starts here.",
+            "Show how attention weights are computed from the same inputs.",
+            "Close the chapter by linking QKV to the later output projection.",
+        ]
+
+        lecture = lecture_ir_to_lecture_json(ir)
+        chapter = lecture.chapters[0]
+
+        assert chapter.summary == ""
+        assert len(chapter.teaching_notes) == 3
+        assert chapter.teaching_notes[0] == "Define QKV and explain why attention starts here."
+        assert chapter.process_steps == []
+        assert chapter.key_takeaways == []
+
 class TestRenderer:
     def test_render_writes_html(self):
         lec = _sample_lecture()
-        frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / "00050.jpg"
-        frame_path.parent.mkdir(parents=True, exist_ok=True)
-        frame_path.write_bytes(b"fake-jpeg")
+        _write_sample_frames()
         renderer = Renderer()
         css = renderer.load_inline_css()
         path = renderer.render_lecture(lec, css)
@@ -382,8 +630,12 @@ class TestRenderer:
         assert "完整性检查" not in html
         assert "技术/公式/代码重点" not in html
         assert "操作路线与检查点" not in html
-        assert html.index("技术复盘") < html.index("术语速查") < html.index("最终综合")
-        assert html.index("最终综合") < html.index("复习问题") < html.index("全局关键图解")
+        assert "teaching-notes" in html
+        assert "process-steps" in html
+        assert html.index("teaching-notes") < html.index("process-steps")
+        assert html.index("术语速查") < html.index("最终综合") < html.index("复习问题")
+        assert html.index("复习问题") < html.index("学习闭环检查") < html.index("全局关键图解")
+        assert html.index("全局关键图解") < html.index("技术复盘")
         assert html.count("lecture_ir_v2") == 1
         assert html.index("生成信息") < html.index("lecture_ir_v2")
         assert 'assets/katex/katex.min.css' in html
@@ -401,6 +653,803 @@ class TestRenderer:
         # CSS got inlined
         assert ":root" in html or "{" in html
 
+    def test_render_prefers_composition_body_sections(self):
+        lec = _sample_lecture()
+        lec.composition = CompositionView(
+            summary_mode="handout",
+            body_sections=[
+                {
+                    "id": "core",
+                    "title": "核心结论",
+                    "section_role": "concept",
+                    "summary": "Harness 是可控性工程。",
+                    "paragraphs": ["Harness 的核心是把模型、工具和人工判断组织成稳定流程。"],
+                    "supporting_visuals": [],
+                    "source_chapter_refs": [1],
+                }
+            ],
+            source_index={"chapter_map": [{"chapter_index": 1, "title": "第一章", "start": 0, "end": 300}]},
+        )
+        _write_sample_frames()
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+
+        assert "核心结论" in html
+        assert "Harness 的核心是把模型、工具和人工判断组织成稳定流程。" in html
+        assert "来源索引" in html
+
+    def test_render_handout_overview_hides_generation_info(self):
+        lec = _sample_lecture()
+        lec.composition = CompositionView(
+            summary_mode="handout",
+            key_takeaways_top=["Harness 把模型、工具和人工判断接成稳定流程。"],
+            body_sections=[
+                {
+                    "id": "core",
+                    "title": "核心结论",
+                    "section_role": "concept",
+                    "summary": "Harness 是可控性工程。",
+                    "paragraphs": ["Harness 的核心是把模型、工具和人工判断组织成稳定流程。"],
+                    "supporting_visuals": [
+                        {
+                            "visual_role": "keyframe",
+                            "source_mode": "video_frame",
+                            "path": "keyframes/BV1xx411c7mD/00060.jpg",
+                            "caption": "Harness 架构总览",
+                            "ts": 60,
+                        }
+                    ],
+                    "source_chapter_refs": [1],
+                }
+            ],
+            source_index={"chapter_map": [{"chapter_index": 1, "title": "第一章", "start": 0, "end": 300}]},
+        )
+        _write_sample_frames()
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+
+        assert 'class="handout-overview"' in html
+        assert "如果只读 3 分钟" in html
+        assert 'class="visual-meta"' in html
+        assert "Harness 架构总览" in html
+        assert '<section class="generation-info">' not in html
+
+    def test_render_composition_blocks_show_outline_and_hide_internal_hints(self):
+        lec = _sample_lecture()
+        lec.composition = CompositionView(
+            summary_mode="handout",
+            body_sections=[
+                {
+                    "id": "section-2",
+                    "title": "为什么网页方案更可控",
+                    "section_role": "reason",
+                    "summary": "先解释核心判断，再展开原因。",
+                    "outline_blocks": [
+                        {
+                            "id": "section-2-block-1",
+                            "ordinal": 1,
+                            "title": "先把可控性原则说清",
+                            "lead": "这里先立判断。",
+                            "paragraphs": ["作者先把“可控性”确立为首要原则。"],
+                            "source_chapter_refs": [2],
+                            "source_timestamps": [120.0, 240.0],
+                            "block_role": "reason",
+                            "topic_hint": "INTERNAL_TOPIC_HINT",
+                            "source_hint": "INTERNAL_SOURCE_HINT",
+                        }
+                    ],
+                    "source_chapter_refs": [2],
+                }
+            ],
+        )
+        _write_sample_frames()
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+
+        assert "1.1" in html
+        assert "先把可控性原则说清" in html
+        assert "02:00" in html
+        assert "这里先立判断。" in html
+        assert "topic_hint" not in html
+        assert "source_hint" not in html
+        assert "block_role" not in html
+        assert "INTERNAL_TOPIC_HINT" not in html
+        assert "INTERNAL_SOURCE_HINT" not in html
+
+    def test_render_prefers_lecture_note_ir_over_compatibility_composition(self):
+        lec = _sample_lecture()
+        lec.chapters[0].summary = "legacy chapter summary"
+        lec.composition = CompositionView(
+            summary_mode="handout",
+            body_sections=[
+                {
+                    "id": "legacy-core",
+                    "title": "旧兼容正文",
+                    "section_role": "concept",
+                    "summary": "这还是旧的 compatibility summary。",
+                    "paragraphs": ["旧兼容正文不应该再主导 HTML。"],
+                    "source_chapter_refs": [1],
+                }
+            ],
+            source_index={"chapter_map": [{"chapter_index": 1, "title": "旧章节入口", "start": 0, "end": 300}]},
+        )
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {
+                    "one_sentence_claim": "新的讲义主张",
+                    "reader_orientation": "先理解主线，再下钻证据。",
+                    "takeaways_top": ["讲义主线来自 Lecture Note IR。"],
+                },
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "新的教学单元",
+                            "unit_role": "claim",
+                            "core_message": "这里是新的主稿真源。",
+                            "source_chapter_refs": [1],
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "title": "先立主判断",
+                                    "paragraphs": ["正文来自 Lecture Note IR。"],
+                                    "source_timestamps": [120.0],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+
+        assert "新的教学单元" in html
+        assert "正文来自 Lecture Note IR。" in html
+        assert "先理解主线，再下钻证据。" in html
+        assert "旧兼容正文" not in html
+        assert "legacy chapter summary" not in html
+        assert '<span class="outline-block-ordinal">1.1</span>' not in html
+
+    def test_render_single_block_unit_hides_extra_block_head(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "3",
+                            "title": "自然段落单元",
+                            "unit_role": "claim",
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "title": "",
+                                    "paragraphs": ["这一单元应该直接进入正文，而不是再出现一个 3.1 式的小标题。"],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert "自然段落单元" in html
+        assert "这一单元应该直接进入正文" in html
+        assert '<header class="outline-block-head">' not in html
+        assert 'id="note-block-1"' in html
+        assert 'id="note-block-1" data-ref-kind="note" data-note-node-id="note-block-1">\n          <header' not in html
+        assert '<span class="outline-block-ordinal">3.1</span>' not in html
+
+    def test_render_single_block_unit_uses_unit_level_anchor_for_timestamp(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {"one_sentence_claim": "新的讲义主张"},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "3",
+                            "title": "自然段落单元",
+                            "unit_role": "claim",
+                            "transition_from_previous": "前面先建立背景，这里进入主判断。",
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "title": "",
+                                    "paragraphs": ["这一个单元应该直接进入正文，而不是再出现一个 3.1 式的小标题。"],
+                                    "source_timestamps": [120.0],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {"boundary_and_risks": ["不要把锚点当成主结构。"]},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert "新的讲义主张" in html
+        assert "前面先建立背景，这里进入主判断。" in html
+        assert 'class="body-section-meta"' in html
+        assert "02:00" in html
+        assert '<header class="outline-block-head">' not in html
+        assert 'class="outline-block-topic"' in html
+        assert '<p class="outline-block-topic">核心内容</p>' in html
+        assert 'class="outline-block-meta outline-block-meta-inline"' in html
+        assert "不要把锚点当成主结构。" in html
+
+    def test_render_source_index_uses_evidence_index_projection(self):
+        lec = _sample_lecture()
+        lec.composition = CompositionView(
+            summary_mode="handout",
+            body_sections=[
+                {
+                    "id": "legacy-core",
+                    "title": "旧兼容正文",
+                    "section_role": "concept",
+                    "paragraphs": ["旧兼容正文不应该再主导来源区。"],
+                    "source_chapter_refs": [1],
+                }
+            ],
+            source_index={"chapter_map": [{"chapter_index": 1, "title": "旧章节入口", "start": 0, "end": 300}]},
+        )
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "新的教学单元",
+                            "content_blocks": [{"block_id": "note-block-1", "paragraphs": ["正文来自 Lecture Note IR。"]}],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate(
+            {
+                "projection_views": {
+                    "source_index_view": [
+                        {
+                            "label": "[t=02:00]",
+                            "supports_text": "它在支撑什么：解释主论点",
+                            "video_anchor": "t=120",
+                        }
+                    ],
+                    "chapter_map": [{"chapter_index": 2, "title": "新的章节入口", "start": 120, "end": 300}],
+                }
+            }
+        )
+        _write_sample_frames()
+        renderer = Renderer()
+        css = renderer.load_inline_css()
+        path = renderer.render_lecture(lec, css)
+        html = path.read_text(encoding="utf-8")
+
+        assert "来源索引" in html
+        assert "默认先读正文，核对时再展开" in html
+        assert "它在支撑什么：解释主论点" in html
+        assert "新的章节入口" in html
+        assert "旧章节入口" not in html
+
+        assert "<details open>" not in html
+        assert "只在需要核对时间点、术语原文或证据出处时再展开。" in html
+        assert 'class="source-index-group"' in html
+
+    def test_render_note_visual_evidence_and_reader_appendices(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {"one_sentence_claim": "The note should read cleanly."},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "Main unit",
+                            "source_chapter_refs": [1],
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "paragraphs": ["Read the note first, then inspect the evidence."],
+                                    "source_timestamps": [50.0],
+                                }
+                            ],
+                            "visual_slots": [
+                                {
+                                    "slot_id": "visual-1",
+                                    "visual_role": "concept_map",
+                                    "title": "Key frame",
+                                    "caption": "This frame explains the structure discussed in the note.",
+                                    "source_paths": ["keyframes/BV1xx411c7mD/00050.jpg"],
+                                    "evidence_refs": ["ev-frame-1"],
+                                    "ts": 50.0,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {
+                    "appendices": [
+                        {"title": "Further reading", "kind": "related_material", "summary": "Use this appendix when you want more background after reading the main note."},
+                        {"title": "Boundary review", "kind": "boundary_review"},
+                    ]
+                },
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert 'class="section-visuals-spotlight"' in html
+        assert 'class="frame frame-spotlight"' in html
+        assert 'class="section-visuals-more"' not in html
+        assert 'data-source-chapters="1"' in html
+        assert "Further reading" in html
+        assert "Use this appendix when you want more background after reading the main note." in html
+        assert "????" not in html
+        assert "50" in html
+        assert "· 回到视频" in html
+        assert "??" not in html
+
+    def test_render_note_visuals_fall_back_to_chapter_frames_when_unit_slots_missing(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {"one_sentence_claim": "The image should return to the note body"},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "Unit with chapter-frame fallback",
+                            "source_chapter_refs": [1],
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "paragraphs": ["This unit has no explicit visual slot, but the chapter frame should still appear in the note body."],
+                                    "source_timestamps": [50.0],
+                                }
+                            ],
+                            "visual_slots": [],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert 'class="section-visuals-spotlight"' in html
+        assert "????" not in html
+        assert "This unit has no explicit visual slot, but the chapter frame should still appear in the note body." in html
+        assert "frame at 00:50" in html
+
+    def test_render_visual_slot_text_filters_noisy_ocr_like_captions(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "Clean visual caption",
+                            "content_blocks": [{"block_id": "note-block-1", "paragraphs": ["Body copy."]}],
+                            "visual_slots": [
+                                {
+                                    "slot_id": "visual-1",
+                                    "visual_role": "keyframe_explainer",
+                                    "title": "PPT key page",
+                                    "caption": '{"ocr_text":"lots of noise","items":["a","b"]}',
+                                    "source_paths": ["keyframes/BV1xx411c7mD/00050.jpg"],
+                                    "ts": 50.0,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert "PPT key page" in html
+        assert "ocr_text" not in html
+        assert '["a","b"]' not in html
+
+    def test_render_visual_slot_filters_system_ui_like_captions(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {},
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "System UI filter",
+                            "content_blocks": [{"block_id": "note-block-1", "paragraphs": ["Body copy."]}],
+                            "visual_slots": [
+                                {
+                                    "slot_id": "visual-1",
+                                    "visual_role": "keyframe_explainer",
+                                    "title": "Downloads iCloud Macintosh",
+                                    "caption": "最近使用 应用程序 文稿 Downloads iCloud 云盘 共享位置 Macintosh",
+                                    "source_paths": ["keyframes/BV1xx411c7mD/00050.jpg"],
+                                    "ts": 50.0,
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate({"projection_views": {"source_index_view": []}})
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        assert "Downloads iCloud Macintosh" not in html
+        assert "最近使用 应用程序" not in html
+        assert 'class="frame frame-spotlight"' in html
+
+    def test_visible_experience_validation_accepts_note_first_render(self):
+        lec = _sample_lecture()
+        lec.lecture_note_ir = LectureNoteIR.model_validate(
+            {
+                "front_matter": {
+                    "reader_orientation": "先读正文主线，再按需下钻证据。",
+                    "takeaways_top": ["正文主链路来自 Lecture Note IR。"],
+                },
+                "body": {
+                    "teaching_units": [
+                        {
+                            "unit_id": "teaching-unit-1",
+                            "ordinal": "1",
+                            "title": "主论点",
+                            "unit_role": "claim",
+                            "core_message": "先建立教学主判断。",
+                            "source_chapter_refs": [1],
+                            "evidence_refs": ["ev-quote-1"],
+                            "content_blocks": [
+                                {
+                                    "block_id": "note-block-1",
+                                    "title": "解释",
+                                    "paragraphs": ["正文直接由 teaching unit 展开。"],
+                                    "source_timestamps": [120.0],
+                                    "evidence_refs": ["ev-quote-1"],
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "back_matter": {},
+            }
+        )
+        lec.evidence_index = EvidenceIndex.model_validate(
+            {
+                "projection_views": {
+                    "source_index_view": [
+                        {
+                            "label": "[t=02:00]",
+                            "supports_text": "支撑主论点",
+                            "video_anchor": "t=120",
+                            "evidence_id": "ev-quote-1",
+                            "page_anchor": "teaching-unit-1",
+                        }
+                    ],
+                    "chapter_map": [
+                        {"chapter_index": 1, "title": "兼容定位", "start": 0, "end": 300}
+                    ],
+                }
+            }
+        )
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        result = validate_visible_experience_html(html)
+
+        assert result.ok is True
+        assert result.note_section_ids == ["teaching-unit-1"]
+        assert result.chapter_section_count == 0
+        assert result.chapter_nav_count == 0
+        assert result.note_metadata_count >= 2
+        assert result.evidence_metadata_count >= 2
+        assert result.failures == []
+
+    def test_visible_experience_validation_rejects_chapter_first_render(self):
+        lec = _sample_lecture()
+        _write_sample_frames()
+        renderer = Renderer()
+        html = renderer.render_lecture(lec, renderer.load_inline_css()).read_text(encoding="utf-8")
+
+        result = validate_visible_experience_html(html)
+
+        assert result.ok is False
+        assert result.chapter_section_count > 0
+        assert result.chapter_nav_count > 0
+        assert any("note-first visible structure is missing" in item for item in result.failures)
+        assert any("chapter-first primary sections" in item for item in result.failures)
+
+    def test_visible_experience_validation_rejects_source_index_only_metadata(self):
+        html = """
+        <nav class="chapter-nav" aria-label="章节导航">
+          <ol>
+            <li><a href="#unit-1">主论点</a></li>
+            <li><a href="#source-index">来源索引</a></li>
+          </ol>
+        </nav>
+        <section class="handout-body">
+          <article class="body-section body-section-claim" id="unit-1" data-ref-kind="note">
+            <header class="body-section-head"><span class="chapter-no">1</span><h2>主论点</h2></header>
+            <section class="outline-block" id="block-1" data-ref-kind="note">
+              <h3>解释</h3>
+            </section>
+          </article>
+        </section>
+        <section class="source-index" id="source-index">
+          <li class="source-index-item" data-ref-kind="evidence" data-evidence-id="ev-1" data-note-node-id="unit-1"></li>
+        </section>
+        """
+
+        result = validate_visible_experience_html(html)
+
+        assert result.ok is False
+        assert result.note_metadata_count == 0
+        assert result.evidence_metadata_count == 0
+        assert any("missing note-native metadata" in item for item in result.failures)
+        assert any("missing evidence-native metadata" in item for item in result.failures)
+
+    def test_visible_experience_validation_scopes_nav_to_chapter_nav(self):
+        html = """
+        <ul>
+          <li><a href="#wrong-anchor">无关锚点</a></li>
+        </ul>
+        <nav class="chapter-nav" aria-label="章节导航">
+          <ol>
+            <li><a href="#unit-1">主论点</a></li>
+          </ol>
+        </nav>
+        <section class="handout-body">
+          <article class="body-section body-section-claim" id="unit-1"
+                   data-ref-kind="note" data-note-node-id="unit-1" data-evidence-id="ev-1">
+            <header class="body-section-head"><span class="chapter-no">1</span><h2>主论点</h2></header>
+            <section class="outline-block" id="block-1"
+                     data-ref-kind="note" data-note-node-id="block-1" data-evidence-id="ev-1">
+              <h3>解释</h3>
+            </section>
+          </article>
+        </section>
+        """
+
+        result = validate_visible_experience_html(html)
+
+        assert result.ok is True
+        assert result.note_nav_targets == ["unit-1"]
+        assert result.note_metadata_count == 2
+        assert result.evidence_metadata_count == 2
+        assert result.failures == []
+
+    def test_ask_reference_identity_validation_accepts_native_refs(self):
+        refs = [
+            {"kind": "note", "id": "block-1", "note_node_id": "block-1", "text": "mainline"},
+            {
+                "kind": "evidence",
+                "id": "ev-quote-1",
+                "evidence_id": "ev-quote-1",
+                "text": "proof",
+            },
+        ]
+
+        result = validate_ask_reference_identity(
+            references=refs,
+            rendered_reference_block=(
+                "1. 引用讲义节点 [block-1] 'mainline'\n"
+                "2. 引用证据对象 [ev-quote-1] 'proof'"
+            ),
+            system_prompt=(
+                "Selected references:\n"
+                "1. 引用讲义节点 [block-1] 'mainline'\n"
+                "2. 引用证据对象 [ev-quote-1] 'proof'"
+            ),
+        )
+
+        assert result.ok is True
+        assert result.note_reference_ids == ["block-1"]
+        assert result.evidence_reference_ids == ["ev-quote-1"]
+        assert result.failures == []
+
+    def test_ask_reference_identity_validation_rejects_compatibility_rewrite(self):
+        refs = [
+            {"kind": "note", "id": "block-1", "note_node_id": "block-1", "text": "mainline"},
+            {
+                "kind": "evidence",
+                "id": "ev-quote-1",
+                "evidence_id": "ev-quote-1",
+                "text": "proof",
+            },
+        ]
+
+        result = validate_ask_reference_identity(
+            references=refs,
+            rendered_reference_block="1. 引用兼容章节锚点 [Ch1]\n2. 引用兼容关键帧锚点 [F1]",
+            system_prompt="Selected references:\ncompatibility fallback only",
+        )
+
+        assert result.ok is False
+        assert any("lost native note_node_id `block-1`" in item for item in result.failures)
+        assert any("lost native evidence_id `ev-quote-1`" in item for item in result.failures)
+        assert any("rewritten as chapter/frame compatibility anchors" in item for item in result.failures)
+
+    def test_ask_reference_identity_validation_rejects_generic_id_fallback(self):
+        refs = [
+            {"kind": "note", "id": "block-1", "text": "mainline"},
+            {"kind": "evidence", "id": "ev-quote-1", "text": "proof"},
+        ]
+
+        result = validate_ask_reference_identity(
+            references=refs,
+            rendered_reference_block=(
+                "1. 引用讲义节点 [block-1] 'mainline'\n"
+                "2. 引用证据对象 [ev-quote-1] 'proof'"
+            ),
+            system_prompt=(
+                "Selected references:\n"
+                "1. 引用讲义节点 [block-1] 'mainline'\n"
+                "2. 引用证据对象 [ev-quote-1] 'proof'"
+            ),
+        )
+
+        assert result.ok is False
+        assert any("missing native `note_node_id`" in item for item in result.failures)
+        assert any("missing native `evidence_id`" in item for item in result.failures)
+
+    def test_compatibility_empty_canonical_validator_accepts_empty_primary_fields(self):
+        result = validate_compatibility_empty_canonical_outputs(
+            {
+                "get_chapter": {
+                    "compatibility_anchor_kind": "chapter",
+                    "compatibility_anchor_id": "Ch1",
+                    "related_evidence_ids": ["ev-1"],
+                    "related_note_node_ids": [],
+                    "primary_ref_kind": "",
+                    "primary_ref_id": "",
+                    "primary_evidence_id": "",
+                    "primary_note_node_id": "",
+                    "primary_note_unit_id": "",
+                    "primary_note_node_type": "",
+                    "primary_note_title": "",
+                    "primary_evidence_kind": "",
+                }
+            }
+        )
+
+        assert result.ok is True
+        assert result.checked_shells == ["get_chapter"]
+        assert result.skipped_shells == []
+        assert result.failures == []
+
+    def test_compatibility_empty_canonical_validator_rejects_leaked_primary_fields(self):
+        result = validate_compatibility_empty_canonical_outputs(
+            {
+                "get_frame": {
+                    "compatibility_anchor_kind": "frame",
+                    "compatibility_anchor_id": "F1",
+                    "related_evidence_ids": ["ev-frame-1"],
+                    "related_note_node_ids": ["unit-1"],
+                    "primary_ref_kind": "evidence",
+                    "primary_ref_id": "ev-frame-1",
+                    "primary_evidence_id": "ev-frame-1",
+                    "primary_note_node_id": "unit-1",
+                    "primary_note_unit_id": "unit-1",
+                    "primary_note_node_type": "teaching_unit",
+                    "primary_note_title": "单元一",
+                    "primary_evidence_kind": "frame_evidence",
+                }
+            }
+        )
+
+        assert result.ok is False
+        assert any("should keep `primary_ref_kind` empty" in item for item in result.failures)
+        assert any("SSE summary for get_frame leaked `primary_ref_kind`" in item for item in result.failures)
+
+    def test_copilot_answer_framing_validator_accepts_note_evidence_first_shape(self):
+        result = validate_copilot_answer_framing(warning_reasons=[])
+
+        assert result.ok is True
+        assert result.warning_reasons == []
+        assert result.failures == []
+
+    def test_copilot_answer_framing_validator_rejects_compatibility_forward_shape(self):
+        result = validate_copilot_answer_framing(
+            warning_reasons=[
+                "first_section_not_evidence",
+                "evidence_section_starts_with_compatibility_framing",
+                "evidence_section_chapter_only_anchor",
+            ]
+        )
+
+        assert result.ok is False
+        assert any("starts with `[[evidence]]`" in item for item in result.failures)
+        assert any("compatibility framing" in item for item in result.failures)
+        assert any("chapter-only anchors" in item for item in result.failures)
+
+    def test_compatibility_projection_validator_accepts_note_and_evidence_projection(self):
+        lec = _sample_lecture_with_note_evidence()
+        lec.composition = compose_from_lecture_json(lec)
+
+        result = validate_compatibility_projection_surfaces(lecture=lec)
+
+        assert result.ok is True
+        assert result.body_section_ids == ["unit-1"]
+        assert result.source_index_counts["source_index_view"] == 1
+        assert result.failures == []
+
+    def test_compatibility_projection_validator_rejects_legacy_divergence(self):
+        lec = _sample_lecture_with_note_evidence()
+        lec.composition = compose_from_lecture_json(lec)
+        lec.composition.body_sections[0].id = "legacy-core"
+        lec.composition.source_index["chapter_map"] = [
+            {"chapter_index": 99, "title": "legacy chapter", "start": 0, "end": 1}
+        ]
+
+        result = validate_compatibility_projection_surfaces(lecture=lec)
+
+        assert result.ok is False
+        assert any("clean projection of Lecture Note IR teaching units" in item for item in result.failures)
+        assert any("composition.source_index[chapter_map] diverged" in item for item in result.failures)
+
+    def test_make_no_explicit_bridge_lecture_clears_note_side_explicit_bridges(self):
+        lec = _sample_lecture_with_note_evidence()
+        strict = _make_no_explicit_bridge_lecture(lec)
+
+        assert strict.lecture_note_ir is not None
+        assert all(not unit.source_chapter_refs for unit in strict.lecture_note_ir.body.teaching_units)
+        assert all(not unit.evidence_refs for unit in strict.lecture_note_ir.body.teaching_units)
+        assert all(
+            not block.source_chapter_refs and not block.evidence_refs
+            for unit in strict.lecture_note_ir.body.teaching_units
+            for block in unit.content_blocks
+        )
+
     def test_sparse_procedure_recap_is_hidden(self):
         lec = _sample_lecture()
         lec.profile.primary_type = "procedural_tutorial"
@@ -408,9 +1457,7 @@ class TestRenderer:
             KnowledgeUnitView(id="p1", type="procedure", title="第一步", explanation="先做第一步。", ts=10),
             KnowledgeUnitView(id="p2", type="procedure", title="第二步", explanation="再做第二步。", ts=20),
         ]
-        frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / "00050.jpg"
-        frame_path.parent.mkdir(parents=True, exist_ok=True)
-        frame_path.write_bytes(b"fake-jpeg")
+        _write_sample_frames()
         renderer = Renderer()
         css = renderer.load_inline_css()
         path = renderer.render_lecture(lec, css)
@@ -443,6 +1490,34 @@ class TestRenderer:
 
 
 # ---------------- LaTeX escape repair ----------------
+
+class TestRenderDedupeHelpers:
+    def test_format_section_ref_label_compacts_broad_ranges(self):
+        assert _format_section_ref_label([1, 2, 3, 4, 5, 6], 6) == "综合全片"
+        assert _format_section_ref_label([1, 2, 3, 4], 6) == "对应原视频前 4 章"
+        assert _format_section_ref_label([3, 4, 5], 6) == "对应原视频第 3-5 章"
+
+    def test_hero_one_liner_is_hidden_when_redundant_with_core_question(self):
+        lec = _sample_lecture()
+        lec.one_liner = lec.core_question
+        assert _hero_one_liner(lec) == ""
+
+    def test_review_questions_hide_when_they_match_study_questions(self):
+        lec = _sample_lecture()
+        lec.study_questions = ["What problem does this lecture solve?"]
+        lec.review_questions = ["What problem does this lecture solve?"]
+        assert _review_questions_to_render(lec) == []
+
+    def test_global_visual_evidence_excludes_chapter_frame_paths(self):
+        lec = _sample_lecture()
+        lec.visual_evidence = [
+            Frame(ts=50, path="keyframes/BV1xx411c7mD/00050.jpg", caption="duplicate"),
+            Frame(ts=60, path="keyframes/BV1xx411c7mD/00060.jpg", caption="unique"),
+        ]
+
+        frames = _global_visual_evidence(lec)
+
+        assert [frame.path for frame in frames] == ["keyframes/BV1xx411c7mD/00060.jpg"]
 
 class TestLatexRepair:
     """Reverses ``json.loads`` silently eating LaTeX backslashes inside

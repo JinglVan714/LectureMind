@@ -185,6 +185,242 @@ class RenderPlanView(BaseModel):
     glossary: bool = True
 
 
+class SupportingVisualView(BaseModel):
+    visual_role: str = "keyframe"
+    source_mode: str = "video_frame"
+    path: str = ""
+    caption: str = ""
+    ts: float = Field(default=0.0, ge=0)
+
+
+class OutlineBlockView(BaseModel):
+    id: str = ""
+    ordinal: int = Field(..., ge=1)
+    title: str = ""
+    lead: str = ""
+    paragraphs: list[str] = Field(default_factory=list)
+    source_chapter_refs: list[int] = Field(default_factory=list)
+    source_timestamps: list[float] = Field(default_factory=list)
+    block_role: str = ""
+    topic_hint: str = ""
+    source_hint: str = ""
+
+
+class BodySectionView(BaseModel):
+    id: str
+    title: str
+    section_role: str = "concept"
+    summary: str = ""
+    paragraphs: list[str] = Field(default_factory=list)
+    outline_blocks: list[OutlineBlockView] = Field(default_factory=list)
+    supporting_visuals: list[SupportingVisualView] = Field(default_factory=list)
+    source_chapter_refs: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_outline_blocks(self) -> "BodySectionView":
+        if not self.outline_blocks and self.paragraphs:
+            self.outline_blocks = [
+                OutlineBlockView(
+                    id=f"{self.id}-block-1" if self.id else "block-1",
+                    ordinal=1,
+                    title=self.title,
+                    paragraphs=list(self.paragraphs),
+                    source_chapter_refs=list(self.source_chapter_refs),
+                )
+            ]
+        if not self.paragraphs and self.outline_blocks:
+            flattened: list[str] = []
+            for block in self.outline_blocks:
+                if block.lead:
+                    flattened.append(block.lead)
+                flattened.extend(block.paragraphs)
+            self.paragraphs = flattened
+        for index, block in enumerate(self.outline_blocks, start=1):
+            if not block.id:
+                self.outline_blocks[index - 1] = block.model_copy(
+                    update={"id": f"{self.id}-block-{index}" if self.id else f"block-{index}"}
+                )
+        return self
+
+
+class CompositionView(BaseModel):
+    burden_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    burden_signals: dict[str, Any] = Field(default_factory=dict)
+    summary_mode: str = "note"
+    semantic_profile: str = ""
+    composition_profile: str = "conceptual"
+    reorder_strength: str = "light"
+    reading_goal: str = ""
+    hero_summary: str = ""
+    key_takeaways_top: list[str] = Field(default_factory=list)
+    audience_fit: str = ""
+    body_sections: list[BodySectionView] = Field(default_factory=list)
+    source_index: dict[str, Any] = Field(default_factory=dict)
+    visual_plan: dict[str, Any] = Field(default_factory=dict)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class LectureFrontMatterPlan(BaseModel):
+    one_sentence_claim: str = ""
+    reader_orientation: str = ""
+    takeaways_top: list[str] = Field(default_factory=list)
+    reading_map: list[str] = Field(default_factory=list)
+    reader_prerequisites: list[str] = Field(default_factory=list)
+    suitable_for: list[str] = Field(default_factory=list)
+    not_suitable_for: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class BodyUnitPlan(BaseModel):
+    unit_id: str
+    title: str = ""
+    teaching_goal: str = ""
+    unit_role: str = "claim"
+    core_message: str = ""
+    transition_from_previous: str = ""
+    source_chapter_refs: list[int] = Field(default_factory=list)
+    visual_needs: list[dict[str, Any]] = Field(default_factory=list)
+    appendix_candidates: list[str] = Field(default_factory=list)
+
+
+class LectureBackMatterPlan(BaseModel):
+    boundary_and_risks: list[str] = Field(default_factory=list)
+    source_index_entrypoints: list[str] = Field(default_factory=list)
+    appendices: list[dict[str, Any]] = Field(default_factory=list)
+    transfer_and_next_steps: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class LectureBlueprint(BaseModel):
+    front_matter_plan: LectureFrontMatterPlan = Field(default_factory=LectureFrontMatterPlan)
+    body_unit_plan: list[BodyUnitPlan] = Field(default_factory=list)
+    back_matter_plan: LectureBackMatterPlan = Field(default_factory=LectureBackMatterPlan)
+    reorder_strength: str = "light"
+    visual_needs: list[dict[str, Any]] = Field(default_factory=list)
+    appendix_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    semantic_portrait: str = ""
+    reading_burden: str = ""
+    teaching_center_of_gravity: str = ""
+
+
+class VisualSlot(BaseModel):
+    slot_id: str
+    visual_role: str = "keyframe_explainer"
+    title: str = ""
+    caption: str = ""
+    source_paths: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    ts: float | None = Field(default=None, ge=0)
+
+
+class ContentBlock(BaseModel):
+    block_id: str
+    title: str = ""
+    block_role: str = ""
+    lead: str = ""
+    paragraphs: list[str] = Field(default_factory=list)
+    transition: str = ""
+    source_chapter_refs: list[int] = Field(default_factory=list)
+    source_timestamps: list[float] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class TeachingUnit(BaseModel):
+    unit_id: str
+    ordinal: str = ""
+    title: str = ""
+    teaching_goal: str = ""
+    unit_role: str = "claim"
+    core_message: str = ""
+    transition_from_previous: str = ""
+    content_blocks: list[ContentBlock] = Field(default_factory=list)
+    visual_slots: list[VisualSlot] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    source_chapter_refs: list[int] = Field(default_factory=list)
+
+
+class LectureNoteFrontMatter(BaseModel):
+    one_sentence_claim: str = ""
+    reader_orientation: str = ""
+    takeaways_top: list[str] = Field(default_factory=list)
+    reading_map: list[str] = Field(default_factory=list)
+    reader_prerequisites: list[str] = Field(default_factory=list)
+    suitable_for: list[str] = Field(default_factory=list)
+    not_suitable_for: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class LectureNoteBody(BaseModel):
+    teaching_units: list[TeachingUnit] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class LectureNoteBackMatter(BaseModel):
+    boundary_and_risks: list[str] = Field(default_factory=list)
+    term_quick_ref: list[dict[str, Any]] = Field(default_factory=list)
+    source_index_entrypoints: list[str] = Field(default_factory=list)
+    appendices: list[dict[str, Any]] = Field(default_factory=list)
+    transfer_and_next_steps: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+class LectureNoteIR(BaseModel):
+    front_matter: LectureNoteFrontMatter = Field(default_factory=LectureNoteFrontMatter)
+    body: LectureNoteBody = Field(default_factory=LectureNoteBody)
+    back_matter: LectureNoteBackMatter = Field(default_factory=LectureNoteBackMatter)
+
+
+class RagChunk(BaseModel):
+    kind: str = "teaching_note"
+    chapter_idx: int = Field(default=1, ge=1)
+    t_start: float = Field(default=0.0, ge=0)
+    t_end: float = Field(default=0.0, ge=0)
+    text: str = ""
+    note_node_id: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceObject(BaseModel):
+    evidence_id: str
+    kind: str
+    title: str = ""
+    summary: str = ""
+    chapter_index: int | None = Field(default=None, ge=1)
+    quote: str = ""
+    text: str = ""
+    ts: float | None = Field(default=None, ge=0)
+    t_end: float | None = Field(default=None, ge=0)
+    path: str = ""
+    note_node_ids: list[str] = Field(default_factory=list)
+    anchors: dict[str, Any] = Field(default_factory=dict)
+    rag_chunks: list[RagChunk] = Field(default_factory=list)
+    source_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceRelation(BaseModel):
+    relation: str
+    from_id: str
+    to_id: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceIndex(BaseModel):
+    evidence_objects: list[EvidenceObject] = Field(default_factory=list)
+    evidence_relations: list[EvidenceRelation] = Field(default_factory=list)
+    anchor_map: dict[str, Any] = Field(default_factory=dict)
+    projection_views: dict[str, Any] = Field(default_factory=dict)
+
+
 class KnowledgeUnitView(BaseModel):
     id: str = ""
     type: str = "concept"
@@ -239,6 +475,10 @@ class LectureJSON(BaseModel):
     render_plan: RenderPlanView = Field(default_factory=RenderPlanView)
     knowledge_units: list[KnowledgeUnitView] = Field(default_factory=list)
     visual_evidence: list[Frame] = Field(default_factory=list)
+    composition: CompositionView = Field(default_factory=CompositionView)
+    lecture_blueprint: LectureBlueprint | None = None
+    lecture_note_ir: LectureNoteIR | None = None
+    evidence_index: EvidenceIndex | None = None
     study_questions: list[str] = Field(
         default_factory=list,
         description="Question-Driven 抽取阶段产出的学习问题；驱动结构化抽取并展示在 HTML",

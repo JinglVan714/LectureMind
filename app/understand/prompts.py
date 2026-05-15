@@ -361,6 +361,7 @@ LECTURE_IR_SYSTEM = """\
     {
       "id": "ku-1",
       "type": "concept|mechanism|formula|code|procedure|example|boundary|pitfall",
+      "term_short": "短术语；没有则留空",
       "title": "知识单元标题",
       "explanation": "解释它是什么、为什么重要、在主线中的作用",
       "ts": 0,
@@ -472,6 +473,8 @@ LECTURE_IR_SYSTEM = """\
 5. path 必须逐字复制输入关键帧描述里的 path，不要改写。
 6. points.quote 和 knowledge_units.quote 必须忠实于字幕原意；不确定时写空字符串。字幕由 ASR 自动识别，对技术术语常有同音/形近误识（如把 "Codex" 写成 "co-tax"、"Plan Mode" 写成 "plug months"、"快照" 写成 "快兆"、"replan" 写成 "repland"）。**当视频标题、其他字幕或画面 OCR 足以唯一判定原意时，请把 quote 中明显错误的术语换成正确术语，其余口语化措辞保持原样；不要重写整句、不要补充字幕里没有的内容、无法判断的写空字符串。**
 7. mainline 要写成读者理解本视频的认知/操作路径，按用户消息中的 mainline_max 决定上限；相邻条目必须递进，不能只是章节标题，也不能用不同措辞重复同一含义。
+   - **绝对禁止**把 mainline 写成章节目录形式。任何以「第 N 章」「Chapter N」「Section N」开头、或与 `chapters[*].title` 一字不差的条目都视为严重错误。
+   - 推荐写成动词驱动的认知/操作步骤，例如“从X切入提出Y问题”“引入Z机制并对比与现有方案的差别”“给出失败案例与边界”。
 8. mainline 禁止空泛条目，例如“介绍相关背景”“讲解核心知识”“总结全文内容”；每一条都要说明为什么下一步需要它。
 9. chapters 数量必须按用户消息中的 chapters_min / chapters_max 选择；高密度视频优先增厚章节讲解，而不是机械增加章节数。**长视频（>30 分钟）必须在最后几分钟之前都有章节支撑，不能在前 1/3 堆章节而后面留空白。**
 10. chapters[].teaching_notes 是连续讲义段落，不是短 bullet。每章尽量包含：承接前文的问题、核心解释、因果/流程/对比/例子/推导展开、1-2 个重点、必要边界，以及如何收束到下一步。
@@ -479,17 +482,19 @@ LECTURE_IR_SYSTEM = """\
 12. 公式有字幕或画面证据时**必须**写入 chapters[].formula_blocks（一个公式一项，附 ts 与 explanation）；同时 teaching_notes 中可保留行内公式以保持上下文。LaTeX 用标准分隔符：$...$、$$...$$；化学式优先 mhchem，例如 \\ce{H2O}。
 13. 代码有字幕或画面证据时**必须**写入 chapters[].code_blocks，每条独立保留缩进与换行；不要把代码塞进 teaching_notes 字符串。language 用 python/rust/cpp/sql/yaml/shell 这种已知短名。
 13b. chapters[].process_steps：当本章包含连续可执行操作、机制阶段或调用顺序时，按顺序列出 3-8 个该可验证的步骤（例如 “调用 X 传入 Y”、“状态从 A 转为 B”）；纯概念或总结章节可留空。不要把 process_steps 写成表面句子（如 “讲解原理”），必须是实际动作。
+    - **不要在条目开头加序号**（错误示例：`"1. 调用 X 传入 Y"` / `"Step 1: ..."` / `"① ..."`）。渲染端会自动用 `<ol>` 编号；在文本里再写一遍会变成 `1. 1. ...`。条目首字符直接是动作内容。
 14. 操作教程如果确有连续操作链路，应抽取多个 procedure 知识单元，每个 procedure 代表一个可执行或可检查阶段；如果只是理念讲解，不强行抽取 procedure。
 15. timeline 要表达“如何推进”，不要只列章节标题。
 16. completeness 是读完讲义后的闭环检查，要如实指出缺失，不要为了好看全部写已完成。
 17. **若用户消息中提供了 study_questions 列表，必须把它们逐字写入输出 JSON 的 study_questions 字段，并确保每条问题都能在 chapters/knowledge_units 中找到对应回答；若某条问题字幕里完全无证据，应写进 completeness.missing_examples 或 missing_boundaries 而不是硬编。**
+17b. knowledge_units 里的 `term_short` 只在该知识点可以抽成术语速查短词时填写；优先填写专名、缩写、稳定命名的方法/机制/框架名。长句标题、章节标题、完整判断句，以及“口播稿 / 开发大纲 / 验收 / 自检”这类流程词不要写进 `term_short`。
 18. taxonomy 是必填字段，用于讲义库的多领域归类与首页折叠树，请严格按以下规则输出：
     - domain：必须从下面候选列表中选**一个**完全一致的字符串，不要自造、不要改大小写、不要加空格：
       "AI 技术" / "编程开发" / "数据科学" / "硬件与系统" / "数学" / "物理" / "化学生物" / "医学" /
       "烹饪" / "健身运动" / "金融投资" / "人文社科" / "艺术设计" / "工程实务" / "其他"。
     - direction：domain 下的具体方向短语，例如 "注意力机制" / "Rust 并发模型" / "中餐家常" / "心血管风险评估"；
       避免 "教程" / "入门" / "进阶" / "详解" / "教学" / "讲解" 这类教学阶段词，focus 在主题上。
-    - tags：3-8 个核心概念/工具/方法名关键词，去重；中英文混合保留原样大小写，方便检索。
+    - tags：3-5 个核心概念/工具/方法名关键词，去重；中英文混合保留原样大小写，方便检索。
     - confidence：0-1 之间的自评。标题与字幕主题清晰时 ≥0.8；内容跨多领域或主题模糊时给 0.4-0.6；
       实在判断不出来再给 <0.4 并把 domain 写成 "其他"，便于后续人工归类。
     - 如果视频明显跨领域（例如同时讲算法和厨艺），不要硬选一个；写置信度低的最像的那个 + tags 把另一面补齐。
@@ -554,17 +559,18 @@ LECTURE_IR_MAP_CHAPTER_SYSTEM = """\
   "summary": "一段完整中文概览，介绍本章解决的问题和推进路径",
   "learning_goal": "本章要解决的学习问题",
   "teaching_notes": ["完整中文段落1", "段落2"],
-  "process_steps": ["如有连续可执行操作或机制阶段，按顺序写出；没有则留空"],
+  "process_steps": ["如有连续可执行操作或机制阶段，按顺序写出；没有则留空。**条目首字符直接是动作，不要写 1./Step1/① 等序号**——前端会自动 <ol> 编号"],
   "points": [{"text": "论点", "ts": 0, "quote": "字幕原话"}],
   "code_blocks": [{"language": "python", "code": "...", "ts": 0, "explanation": "...", "source": "ocr"}],
   "formula_blocks": [{"latex": "...", "ts": 0, "explanation": "..."}],
   "pitfalls": ["误区/边界 1"],
   "key_takeaways": ["核心收获 1"],
   "knowledge_units": [
-    {"term": "术语", "definition": "本章给出的解释", "confidence": 0.0, "ts": 0}
+    {"term": "术语", "term_short": "短术语；没有则留空", "definition": "本章给出的解释", "confidence": 0.0, "ts": 0}
   ]
 }
 4. confidence 是你对该术语在本章定义清晰度的自评（0-1）；越上下文充分越高。
+4b. 若该知识点能抽成术语速查短词，则写 `term_short`；优先专名、缩写、稳定命名的方法/机制/框架名。若只是长标题、判断句，或“口播稿 / 开发大纲 / 验收 / 自检”这类流程词，则 `term_short` 留空。
 5. teaching_notes 写完整中文段落，不要空泛 bullet；公式/代码必须落到 formula_blocks / code_blocks，不要塞进文字段落。
 6. 如果本章字幕完全为空或与时间窗不匹配，仍返回上述结构，但 points 可为空，并把 summary 写成"本章字幕缺失，无法抽取"。
 """
@@ -607,17 +613,22 @@ LECTURE_IR_REDUCE_GLOBAL_SYSTEM = """\
 你是一名讲义全局编辑（REDUCE_GLOBAL）。已知一段视频的所有章节摘要（每章 title + summary + 头部要点 + 候选术语），请输出整片 lecture 的：
 
 - lecture_summary：一段中文综述（2-4 句话），点题、给出主要演化路径与边界。
-- mainline：用户视角的认知/操作主线，每条说明"为什么需要这一步"，并标 chapter_index。
+- mainline：用户视角的认知/操作主线，每条说明"为什么需要这一步"，并标 chapter_index。**绝对禁止**把 mainline 写成章节目录形式：任何以「第 N 章」「Chapter N」「Section N」开头，或与 `chapters[*].title` 一字不差的条目都视为严重错误；mainline 应该是动词驱动的认知步骤（例如「提出 X 问题」「引入 Y 概念」「演示 Z 流程」），不是 chapter-nav 的复制。
 - glossary_resolved：术语去重后的最终定义；用户输入的 conflicts 已含每候选定义和 winning_chapter_index 候选，可直接采用或结合多章修订。
 - cross_references：章节之间的依赖/对比/引用关系；找不到则输出空数组。
+- core_question：整支视频要回答的核心问题，一句、明确、不要照抄标题。
+- final_synthesis_long：比 lecture_summary 更完整的三段式综合，说明收束观点、横向对比/延伸和后续行动，避免只是重复 mainline。
+- taxonomy：沿用 LectureIR 的 taxonomy 结构，补齐 domain / direction / tags / confidence。
 
-**绝不重写章节内部任何字段**（title / summary / points / code_blocks / formula_blocks 都不要再次输出）。
-仅输出顶层 4 字段，结构如下：
+**绝不重写章节内部任何字段**（title / summary / points / code_blocks / formula_blocks 都不要再次输出）；仅输出顶层 7 个字段，结构如下：
 {
   "lecture_summary": "...",
   "mainline": [{"step": 1, "title": "...", "ts": 0, "chapter_index": 1}],
   "glossary_resolved": [{"term": "...", "definition": "...", "winning_chapter_index": 1}],
-  "cross_references": [{"from_chapter": 1, "to_chapter": 2, "relation": "depends_on|contrasts_with|elaborates|...."}]
+  "cross_references": [{"from_chapter": 1, "to_chapter": 2, "relation": "depends_on|contrasts_with|elaborates|...."}],
+  "core_question": "...",
+  "final_synthesis_long": "...",
+  "taxonomy": {"domain": "...", "direction": "...", "tags": ["..."], "confidence": 0.0}
 }
 """
 
@@ -637,7 +648,7 @@ LECTURE_IR_REDUCE_GLOBAL_USER_TEMPLATE = """\
 学习问题（study_questions）：
 {study_questions_block}
 
-请输出 lecture 全局摘要 JSON，注意只产出 4 个顶层字段。
+请输出 lecture 全局摘要 JSON，注意产出 7 个顶层字段，并让 final_synthesis_long 明显比 lecture_summary 更完整。
 """
 
 

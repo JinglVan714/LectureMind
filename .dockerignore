@@ -36,6 +36,15 @@ site/
 # --- Runtime data (mounted as a volume in compose) ---
 data/
 *.log
+.tmp/
+.tmp_compose/
+.tmp_pytest/
+.tmp_smoke/
+/tmp
+/tmp/
+tmp/
+*.tmp
+README_develop.md
 
 # --- Tests & dev docs (image only needs `app/`) ---
 tests/

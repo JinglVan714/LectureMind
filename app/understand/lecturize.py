@@ -16,6 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from ..config import get_settings
 from ..ingest.subtitle import SubtitleSegment
 from ._latex_repair import repair_obj as _repair_latex_escapes
+from .ir_sanity import strip_list_prefix
 from .prompts import LECTURIZER_SYSTEM, LECTURIZER_USER_TEMPLATE
 from .schema import LectureJSON
 from .vlm import FrameDescription
@@ -254,11 +255,16 @@ def _hydrate_lecture_data(data: dict[str, Any], ctx: LecturizeContext) -> None:
             or _normalise_string_list(chapter.get("explanations"))
             or [chapter["summary"]]
         )
-        chapter["process_steps"] = _normalise_string_list(
-            chapter.get("process_steps")
-            or chapter.get("steps")
-            or chapter.get("workflow")
-        )
+        chapter["process_steps"] = [
+            _stripped for _stripped, _ in (
+                strip_list_prefix(item)
+                for item in _normalise_string_list(
+                    chapter.get("process_steps")
+                    or chapter.get("steps")
+                    or chapter.get("workflow")
+                )
+            )
+        ]
         chapter["pitfalls"] = _normalise_string_list(
             chapter.get("pitfalls")
             or chapter.get("warnings")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
@@ -21,6 +22,7 @@ from .agents import (
     StudyQuestionsResult,
 )
 from .chapter_cache import make_chapter_cache_from_settings
+from .composition import compose_from_lecture_json
 from .ir import LectureIR, hydrate_lecture_ir_data
 from .lecturize import LecturizeContext, _format_frames, _format_segments
 from .length_adapt import LengthBudget, mainline_max
@@ -39,6 +41,10 @@ _ONE_LINER_MAX_CHARS = 96
 _ONE_LINER_MIN_CUT_CHARS = 40
 _TERMINAL_PUNCTUATION = "。！？!?"
 _MIN_TEACHING_NOTE_CHARS = 24
+_LONG_VIDEO_THRESHOLD_SEC = 20 * 60
+_LONG_VIDEO_NOTE_MAX = 3
+_LONG_VIDEO_KEY_TAKEAWAY_MAX = 2
+_LONG_VIDEO_FRAME_MAX = 2
 _GENERIC_MAINLINE_KEYS = {
     "介绍相关背景",
     "介绍背景",
@@ -49,6 +55,24 @@ _GENERIC_MAINLINE_KEYS = {
     "总结全文",
     "总结内容",
 }
+_GENERIC_GLOSSARY_TERMS = {
+    "可控性",
+    "网页方案",
+    "口播稿",
+    "开发大纲",
+    "视觉演示",
+    "脚本",
+    "人工检查点",
+    "验收",
+    "自检",
+    "状态和记忆",
+    "工具系统",
+    "约束和恢复",
+    "评估和观测",
+}
+
+
+_CRITIC_FAILURE_SUMMARY = "(critic skipped after failure)"
 
 
 def _format_chapter_plan_block(chapter_plan: list[Any] | None) -> str:
@@ -370,6 +394,20 @@ class LectureIRBuilder:
         }
         if reviser_telemetry is not None:
             stats["reviser"] = reviser_telemetry
+        # Surface the post-IR sanity telemetry (process_steps strip,
+        # mainline / core_question degradation, chapter renumber) so
+        # operators can spot prompt regressions in pipeline_stats.
+        sanity_block: dict[str, Any] | None = None
+        if map_reduce_stats is not None:
+            mr_sanity = getattr(map_reduce_stats, "ir_sanity", None)
+            if isinstance(mr_sanity, dict) and mr_sanity:
+                sanity_block = mr_sanity
+        if sanity_block is None:
+            ctx_sanity = getattr(ctx, "ir_sanity", None)
+            if isinstance(ctx_sanity, dict) and ctx_sanity:
+                sanity_block = ctx_sanity
+        if sanity_block is not None:
+            stats["ir_sanity"] = sanity_block
         if map_reduce_stats is not None:
             mr = map_reduce_stats
             stats["map_reduce"] = {
@@ -639,9 +677,23 @@ class LectureIRBuilder:
         reviser_sec = 0.0
         for _ in range(max(1, max_rounds + 1)):
             t_c = time.perf_counter()
-            critique = await self._critic_agent.critique(
-                ctx, latest_ir.model_dump(mode="json"), study_questions
-            )
+            try:
+                critique = await self._critic_agent.critique(
+                    ctx, latest_ir.model_dump(mode="json"), study_questions
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Critic failed for %s; keeping current IR and skipping critique: %s",
+                    getattr(ctx, "bv_id", "<unknown>"),
+                    exc,
+                )
+                latest_critique = CritiqueResult(
+                    verdict="ok",
+                    summary=_CRITIC_FAILURE_SUMMARY,
+                    issues=[],
+                    usage={},
+                )
+                break
             critic_sec += time.perf_counter() - t_c
             usages.append(critique.usage)
             latest_critique = critique
@@ -653,9 +705,17 @@ class LectureIRBuilder:
             ):
                 break
             t_r = time.perf_counter()
-            revised, rev_usage = await self._critic_agent.revise(
-                ctx, latest_ir.model_dump(mode="json"), critique.issues
-            )
+            try:
+                revised, rev_usage = await self._critic_agent.revise(
+                    ctx, latest_ir.model_dump(mode="json"), critique.issues
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Reviser failed for %s; keeping previous IR: %s",
+                    getattr(ctx, "bv_id", "<unknown>"),
+                    exc,
+                )
+                break
             reviser_sec += time.perf_counter() - t_r
             usages.append(rev_usage)
             if not revised:
@@ -763,7 +823,21 @@ class LectureIRBuilder:
                 study_questions=study_questions,
             )
             t_c = time.perf_counter()
-            critique = await self._critic_agent.audit(context)
+            try:
+                critique = await self._critic_agent.audit(context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Critic audit failed for %s; keeping current IR and skipping critique: %s",
+                    ctx.bv_id,
+                    exc,
+                )
+                latest_critique = CritiqueResult(
+                    verdict="ok",
+                    summary=_CRITIC_FAILURE_SUMMARY,
+                    issues=[],
+                    usage={},
+                )
+                break
             critic_sec += time.perf_counter() - t_c
             usages.append(critique.usage or {})
             latest_critique = critique
@@ -778,9 +852,17 @@ class LectureIRBuilder:
 
             if reviser_mode == "patch":
                 t_r = time.perf_counter()
-                result = await self._critic_agent.revise_patch(
-                    context=context, issues=critique.issues
-                )
+                try:
+                    result = await self._critic_agent.revise_patch(
+                        context=context, issues=critique.issues
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Patch reviser failed for %s; keeping previous IR: %s",
+                        ctx.bv_id,
+                        exc,
+                    )
+                    break
                 reviser_sec += time.perf_counter() - t_r
                 usages.append(result.usage or {})
                 proposed = list(result.patches or [])
@@ -818,9 +900,17 @@ class LectureIRBuilder:
 
             if reviser_mode == "full":
                 t_r = time.perf_counter()
-                revised, rev_usage = await self._critic_agent.revise(
-                    ctx, latest_ir.model_dump(mode="json"), critique.issues
-                )
+                try:
+                    revised, rev_usage = await self._critic_agent.revise(
+                        ctx, latest_ir.model_dump(mode="json"), critique.issues
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Full reviser failed for %s; keeping previous IR: %s",
+                        ctx.bv_id,
+                        exc,
+                    )
+                    break
                 reviser_sec += time.perf_counter() - t_r
                 usages.append(rev_usage or {})
                 if not revised:
@@ -1036,8 +1126,38 @@ def _extract_json(raw: str) -> dict[str, Any]:
     return _repair_latex_escapes(obj)
 
 
-def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
+def project_legacy_lecture_json(ir: LectureIR) -> LectureJSON:
+    long_mode = _is_long_lecture(ir.duration)
+    chapters = [
+        _chapter_to_json(
+            ch,
+            duration=ir.duration,
+            primary_type=ir.profile.primary_type,
+            long_mode=long_mode,
+        )
+        for ch in ir.chapters
+    ]
     mainline = _clean_mainline(ir.mainline, ir.duration)
+    mainline_fallback_used = False
+    if not mainline:
+        mainline = _fallback_projection_mainline(chapters, ir.duration)
+        mainline_fallback_used = bool(mainline)
+    study_questions, review_questions = _project_question_lists(ir)
+    visual_evidence = [
+        _visual_to_frame(v) for v in ir.visual_evidence if v.selected and v.path
+    ]
+    if long_mode:
+        chapter_frame_paths = {
+            str(fr.get("path") or "").strip()
+            for ch in chapters
+            for fr in (ch.get("frames") or [])
+            if str(fr.get("path") or "").strip()
+        }
+        visual_evidence = [
+            fr
+            for fr in visual_evidence
+            if str(fr.get("path") or "").strip() not in chapter_frame_paths
+        ]
     # Prefer LLM-supplied taxonomy.tags as domain_tags; fall back to the
     # legacy profile.domain_tags so v1 lectures keep working.  Pipeline
     # later normalises the taxonomy via app.copilot.taxonomy.normalize.
@@ -1053,11 +1173,11 @@ def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
         "category": ir.profile.primary_type,
         "domain_tags": domain_tags,
         "learning_path": mainline,
-        "chapters": [_chapter_to_json(ch) for ch in ir.chapters],
+        "chapters": chapters,
         "final_synthesis": ir.final_synthesis,
         "highlights": [],
         "glossary": _units_to_glossary(ir),
-        "review_questions": ir.review_questions,
+        "review_questions": review_questions,
         "profile": {
             "primary_type": ir.profile.primary_type,
             "density": ir.profile.density,
@@ -1066,15 +1186,19 @@ def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
         },
         "core_question": ir.core_question,
         "mainline": mainline,
-        "timeline": ir.timeline.model_dump(mode="json"),
+        "timeline": _project_timeline(ir, mainline, long_mode=long_mode),
         "completeness": ir.completeness.model_dump(mode="json"),
         "render_plan": ir.render_plan.model_dump(mode="json"),
         "knowledge_units": [u.model_dump(mode="json") for u in ir.knowledge_units],
-        "visual_evidence": [_visual_to_frame(v) for v in ir.visual_evidence if v.selected and v.path],
-        "study_questions": list(getattr(ir, "study_questions", []) or []),
+        "visual_evidence": visual_evidence,
+        "study_questions": study_questions,
         "taxonomy": ir.taxonomy.model_dump(mode="json") if ir.taxonomy else None,
         "generation_mode": "lecture_ir_v2",
     }
+    if mainline_fallback_used:
+        completeness = dict(data["completeness"] or {})
+        completeness["mainline_closed"] = True
+        data["completeness"] = completeness
     # Auto-flip render_plan flags whenever we actually have content for
     # them: otherwise the LLM-supplied flag and the populated lists
     # could disagree (flag false but data present, or vice versa).
@@ -1085,25 +1209,54 @@ def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
         plan["formula_section"] = True
     data["render_plan"] = plan
     lecture = LectureJSON.model_validate(data)
+    lecture.composition = compose_from_lecture_json(lecture)
     if not lecture.review_questions:
         lecture.review_questions = [f"如何用自己的话解释：{item}" for item in lecture.learning_path[:5]]
+    if not lecture.study_questions and lecture.review_questions:
+        lecture.study_questions = list(lecture.review_questions)
     return lecture
 
 
-def _chapter_to_json(ch: Any) -> dict[str, Any]:
+def lecture_ir_to_lecture_json(ir: LectureIR) -> LectureJSON:
+    from .lecture_compiler import compile_lecture
+
+    return compile_lecture(ir)
+
+
+def _chapter_to_json(
+    ch: Any,
+    *,
+    duration: float,
+    primary_type: str,
+    long_mode: bool,
+) -> dict[str, Any]:
+    teaching_notes = _teaching_notes(ch, duration=duration)
+    summary = _chapter_summary(ch, teaching_notes, long_mode=long_mode)
+    key_takeaways = _chapter_key_takeaways(
+        ch,
+        teaching_notes=teaching_notes,
+        summary=summary,
+        duration=duration,
+    )
+    process_steps = _chapter_process_steps(
+        ch,
+        teaching_notes=teaching_notes,
+        primary_type=primary_type,
+        duration=duration,
+    )
     return {
         "index": ch.index,
         "title": ch.title,
         "start": ch.start,
         "end": ch.end,
-        "summary": ch.summary,
+        "summary": summary,
         "learning_goal": ch.learning_goal,
-        "teaching_notes": _teaching_notes(ch),
-        "process_steps": ch.process_steps,
+        "teaching_notes": teaching_notes,
+        "process_steps": process_steps,
         "points": [p.model_dump(mode="json") for p in ch.points],
-        "frames": [f.model_dump(mode="json") for f in ch.frames if f.path],
+        "frames": _chapter_frames(ch, duration=duration),
         "pitfalls": ch.pitfalls,
-        "key_takeaways": ch.key_takeaways,
+        "key_takeaways": key_takeaways,
         "code_blocks": [
             cb.model_dump(mode="json")
             for cb in getattr(ch, "code_blocks", []) or []
@@ -1153,14 +1306,17 @@ def _is_generic_mainline(key: str) -> bool:
     return any(generic in key and len(key) <= len(generic) + 4 for generic in generic_keys)
 
 
-def _teaching_notes(ch: Any) -> list[str]:
+def _teaching_notes(ch: Any, *, duration: float) -> list[str]:
     notes = [str(note).strip() for note in ch.teaching_notes if str(note).strip()]
     if sum(len(note) for note in notes) >= _MIN_TEACHING_NOTE_CHARS:
-        return notes
-    fallback = _chapter_fallback_note(ch, notes)
-    if fallback:
-        return [fallback]
-    return notes
+        cleaned = notes
+    else:
+        fallback = _chapter_fallback_note(ch, notes)
+        cleaned = [fallback] if fallback else notes
+    cleaned = _dedupe_texts(cleaned)
+    if _is_long_lecture(duration):
+        return cleaned[:_LONG_VIDEO_NOTE_MAX]
+    return cleaned
 
 
 def _chapter_fallback_note(ch: Any, notes: list[str]) -> str:
@@ -1174,6 +1330,159 @@ def _chapter_fallback_note(ch: Any, notes: list[str]) -> str:
         seen.add(key)
         parts.append(text)
     return " ".join(part for part in parts if part).strip()
+
+
+def _is_long_lecture(duration: float | int) -> bool:
+    return float(duration or 0.0) >= _LONG_VIDEO_THRESHOLD_SEC
+
+
+def _text_similarity(left: str, right: str) -> float:
+    left_key = _mainline_key(left)
+    right_key = _mainline_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    if left_key == right_key:
+        return 1.0
+    shorter = min(len(left_key), len(right_key))
+    longer = max(len(left_key), len(right_key))
+    if shorter and (left_key in right_key or right_key in left_key):
+        if shorter / max(longer, 1) >= 0.72:
+            return 0.92
+    return difflib.SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _is_redundant_text(text: str, existing: list[str], *, threshold: float = 0.82) -> bool:
+    return any(_text_similarity(text, candidate) >= threshold for candidate in existing if candidate)
+
+
+def _dedupe_texts(
+    items: list[str],
+    *,
+    max_items: int | None = None,
+    threshold: float = 0.82,
+) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        if not text or _is_redundant_text(text, out, threshold=threshold):
+            continue
+        out.append(text)
+        if max_items is not None and len(out) >= max_items:
+            break
+    return out
+
+
+def _fallback_projection_mainline(
+    chapters: list[dict[str, Any]],
+    duration: float,
+) -> list[str]:
+    seeds: list[str] = []
+    for ch in chapters:
+        goal = str(ch.get("learning_goal") or "").strip()
+        summary = str(ch.get("summary") or "").strip()
+        if goal:
+            seeds.append(goal)
+        elif summary:
+            seeds.append(summary)
+    return _clean_mainline(seeds, duration)
+
+
+def _chapter_summary(ch: Any, teaching_notes: list[str], *, long_mode: bool) -> str:
+    summary = str(getattr(ch, "summary", "") or "").strip()
+    if not summary:
+        return ""
+    if not long_mode:
+        return summary
+    anchors = [str(getattr(ch, "learning_goal", "") or "").strip()]
+    if teaching_notes:
+        anchors.append(teaching_notes[0])
+    if _is_redundant_text(summary, anchors, threshold=0.8):
+        return ""
+    return summary
+
+
+def _chapter_key_takeaways(
+    ch: Any,
+    *,
+    teaching_notes: list[str],
+    summary: str,
+    duration: float,
+) -> list[str]:
+    raw = [str(item).strip() for item in getattr(ch, "key_takeaways", []) if str(item).strip()]
+    anchors = [summary, *teaching_notes]
+    anchors.extend(str(getattr(point, "text", "") or "").strip() for point in getattr(ch, "points", []))
+    out: list[str] = []
+    for item in raw:
+        if _is_redundant_text(item, anchors + out, threshold=0.8):
+            continue
+        out.append(item)
+    if _is_long_lecture(duration):
+        return out[:_LONG_VIDEO_KEY_TAKEAWAY_MAX]
+    return out
+
+
+def _chapter_process_steps(
+    ch: Any,
+    *,
+    teaching_notes: list[str],
+    primary_type: str,
+    duration: float,
+) -> list[str]:
+    steps = _dedupe_texts([str(step).strip() for step in getattr(ch, "process_steps", []) if str(step).strip()])
+    if not steps:
+        return []
+    if all(_is_redundant_text(step, teaching_notes, threshold=0.88) for step in steps):
+        return []
+    if _is_long_lecture(duration) and primary_type != "procedural_tutorial" and len(steps) < 3:
+        return []
+    return steps
+
+
+def _chapter_frames(ch: Any, *, duration: float) -> list[dict[str, Any]]:
+    frames = [f.model_dump(mode="json") for f in ch.frames if f.path]
+    if not frames:
+        return []
+    if not _is_long_lecture(duration):
+        return frames
+    preferred = {"diagram", "formula", "code", "table", "slide_text"}
+    ranked = sorted(
+        frames,
+        key=lambda fr: (
+            float(fr.get("importance_score") or 0.0),
+            1 if str(fr.get("visual_type") or "") in preferred else 0,
+            1 if str(fr.get("caption") or "").strip() or str(fr.get("ocr_text") or "").strip() else 0,
+        ),
+        reverse=True,
+    )[:_LONG_VIDEO_FRAME_MAX]
+    return sorted(ranked, key=lambda fr: float(fr.get("ts") or 0.0))
+
+
+def _project_question_lists(ir: LectureIR) -> tuple[list[str], list[str]]:
+    study = _dedupe_texts([str(item).strip() for item in (getattr(ir, "study_questions", []) or []) if str(item).strip()])
+    review = _dedupe_texts([str(item).strip() for item in (ir.review_questions or []) if str(item).strip()])
+    if study and not review:
+        review = list(study)
+    elif review and not study:
+        study = list(review)
+    return study, review
+
+
+def _project_timeline(
+    ir: LectureIR,
+    mainline: list[str],
+    *,
+    long_mode: bool,
+) -> dict[str, Any]:
+    payload = ir.timeline.model_dump(mode="json")
+    if not long_mode:
+        return payload
+    payload["turning_points"] = [
+        item for item in payload.get("turning_points", []) if not _is_redundant_text(str(item), mainline, threshold=0.78)
+    ][:4]
+    payload["state_evolution"] = [
+        item for item in payload.get("state_evolution", []) if not _is_redundant_text(str(item), mainline, threshold=0.78)
+    ][:4]
+    return payload
 
 
 def _visual_to_frame(v: Any) -> dict[str, Any]:
@@ -1202,14 +1511,35 @@ def _units_to_glossary(ir: LectureIR) -> list[dict[str, Any]]:
     seen: set[str] = set()
     cap = glossary_max(ir.duration)
     for unit in ir.knowledge_units:
-        title = unit.title.strip()
-        if not title or title in seen:
+        term = str(getattr(unit, "term_short", "") or "").strip()
+        if not term or term in seen or not _is_glossary_term_like(term, unit.title):
             continue
-        seen.add(title)
-        out.append({"term": title[:40], "ts": unit.ts, "explanation": unit.explanation[:160]})
+        seen.add(term)
+        title = unit.title.strip()
+        explanation = unit.explanation.strip()
+        if title and explanation and not explanation.startswith(title):
+            explanation = f"{title}：{explanation}"
+        out.append({"term": term[:12], "ts": unit.ts, "explanation": explanation[:160]})
         if len(out) >= cap:
             break
     return out
+
+
+def _is_glossary_term_like(term: str, title: str) -> bool:
+    term = re.sub(r"\s+", " ", str(term)).strip()
+    if not term:
+        return False
+    if len(term) > 12:
+        return False
+    if re.search(r"[A-Za-z0-9]", term):
+        return True
+    if any(ch in term for ch in "()[]{}._-/"):
+        return True
+    if " " in term:
+        return True
+    if term != str(title).strip():
+        return True
+    return term not in _GENERIC_GLOSSARY_TERMS
 
 
 def _one_liner(ir: LectureIR) -> str:

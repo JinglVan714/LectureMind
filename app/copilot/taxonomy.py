@@ -8,7 +8,7 @@ from a fixed white-list, a free-form ``direction`` phrase, ``tags`` and a
   back to ``"其他"`` with confidence clamped to ``0.3``).
 * ``direction`` has stage suffixes (``教程`` / ``入门`` / ``详解`` / ...)
   stripped and inner whitespace collapsed.
-* ``tags`` are deduplicated case-insensitively and capped at 8 entries
+* ``tags`` are deduplicated case-insensitively and capped at 5 entries
   while preserving the LLM's original casing for display.
 * ``confidence`` is clamped to ``[0, 1]``.
 
@@ -55,8 +55,8 @@ _DIRECTION_SUFFIX_RE = re.compile(
 )
 _WHITESPACE_RE = re.compile(r"\s+")
 
-# Maximum tag count; mirrors prompt rule 16 "3-8 个".
-_MAX_TAGS = 8
+# Maximum tag count; mirrors prompt rule 18 "3-5 个".
+_MAX_TAGS = 5
 
 # Anything below this confidence (or domain == "其他") is surfaced as
 # *needs_review* on the index page.

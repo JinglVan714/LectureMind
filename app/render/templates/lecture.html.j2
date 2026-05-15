@@ -34,11 +34,12 @@
         <span>UP {{ lecture.author }}</span>
         <span>·</span>
         <span>时长 {{ lecture.duration | fmt_dur }}</span>
+        {% if summary_mode %}<span>·</span><span>{{ summary_mode }}</span>{% endif %}
         <span>·</span>
         <a href="{{ bili_link(lecture.bv_id, 0) }}" target="_blank" rel="noopener">原视频 ↗</a>
       </div>
-      {% if lecture.one_liner %}
-      <p class="one-liner">{{ lecture.one_liner | rich_text }}</p>
+      {% if cover_one_liner %}
+      <p class="one-liner">{{ cover_one_liner | rich_text }}</p>
       {% endif %}
       {% if lecture.core_question %}
       <div class="hero-question">
@@ -54,16 +55,23 @@
     </div>
   </header>
 
-  <nav class="chapter-nav" aria-label="章节导航">
+  <nav class="chapter-nav" aria-label="讲义导航">
     <ol>
+      {% if note_projection.has_units %}
+      {% for unit in note_projection.teaching_units %}
+      <li><a href="#{{ unit.id }}">{{ unit.title | rich_text }}</a></li>
+      {% endfor %}
+      {% if evidence_projection.has_items %}<li><a href="#source-index">来源索引</a></li>{% endif %}
+      {% else %}
       {% for ch in lecture.chapters %}
       <li><a href="#chapter-{{ ch.index }}"><span class="num">{{ ch.index }}</span>{{ ch.title | rich_text }}</a></li>
       {% endfor %}
+      {% endif %}
     </ol>
   </nav>
 
   <main class="content">
-    {% if mainline_items %}
+    {% if mainline_items and not note_projection.has_units %}
     <section class="mainline-section">
       <h2>主线推进路径</h2>
       <div class="mainline-steps">
@@ -108,7 +116,7 @@
     </section>
     {% endif %}
 
-    {% if lecture.study_questions %}
+    {% if lecture.study_questions and not note_projection.has_units %}
     <section class="study-questions">
       <h2>读完后你应当能回答</h2>
       <ol>
@@ -119,6 +127,228 @@
     </section>
     {% endif %}
 
+    {% if note_projection.has_units %}
+    <section class="handout-overview">
+      <div class="handout-overview-head">
+        <div>
+          <span class="section-kicker">先读这里</span>
+          <h2>这份讲义该怎么读</h2>
+        </div>
+        {% if note_projection.audience_fit %}
+        <p class="overview-fit">{{ note_projection.audience_fit | rich_text }}</p>
+        {% endif %}
+      </div>
+      {% if note_projection.front_matter.reader_orientation %}
+      <div class="body-section-summary rich-text">{{ note_projection.front_matter.reader_orientation | rich_text }}</div>
+      {% endif %}
+      <div class="overview-grid">
+        {% if note_projection.front_matter.takeaways_top %}
+        <article class="overview-card">
+          <h3>最值得带走的几点</h3>
+          <ol>
+            {% for item in note_projection.front_matter.takeaways_top %}
+            <li>{{ item | rich_text }}</li>
+            {% endfor %}
+          </ol>
+        </article>
+        {% endif %}
+        <article class="overview-card">
+          <h3>如果只读 3 分钟</h3>
+          <ul>
+            {% for unit in note_projection.teaching_units[:3] %}
+            <li><a href="#{{ unit.id }}">{{ unit.title | rich_text }}</a></li>
+            {% endfor %}
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="handout-body">
+      <div class="handout-phase">
+        <span>正文展开</span>
+      </div>
+      {% for unit in note_projection.teaching_units %}
+      <article class="body-section body-section-{{ unit.unit_role }}" id="{{ unit.id }}"
+               data-ref-kind="note" data-note-node-id="{{ unit.id }}"
+               {% if unit.source_chapter_refs %}data-source-chapters="{{ unit.source_chapter_refs | join(',') }}"{% endif %}
+               {% if unit.evidence_refs %}data-evidence-id="{{ unit.evidence_refs[0] }}"{% endif %}>
+        <header class="body-section-head">
+          <div class="body-section-heading">
+            {% if unit.transition_from_previous %}
+            <p class="section-ref">{{ unit.transition_from_previous | rich_text }}</p>
+            {% endif %}
+            <div class="body-section-title-row">
+              <span class="chapter-no">{{ unit.ordinal }}</span>
+              <div class="body-section-title-copy">
+                <h2>{{ unit.title | rich_text }}</h2>
+              </div>
+            </div>
+          </div>
+          {% if unit.evidence_refs or unit.primary_timestamp %}
+          <div class="body-section-meta" aria-label="引用与时间锚点">
+            {% if unit.evidence_refs %}<span class="meta-chip meta-chip-ref">引用 {{ unit.evidence_refs | length }}</span>{% endif %}
+            {% if unit.primary_timestamp %}
+            <a class="meta-chip meta-chip-link" href="{{ bili_link(lecture.bv_id, unit.primary_timestamp) }}" target="_blank" rel="noopener">
+              {{ unit.primary_timestamp | fmt_ts }} · 回到视频
+            </a>
+            {% endif %}
+          </div>
+          {% endif %}
+        </header>
+        {% if unit.core_message %}
+        <div class="body-section-summary rich-text">{{ unit.core_message | rich_text }}</div>
+        {% endif %}
+        {% for block in unit.content_blocks %}
+        <section class="outline-block" id="{{ block.id }}"
+                 data-ref-kind="note" data-note-node-id="{{ block.id }}"
+                 {% if block.evidence_refs %}data-evidence-id="{{ block.evidence_refs[0] }}"{% endif %}>
+          {% if block.show_head %}
+          <header class="outline-block-head">
+            <div class="outline-block-title-row">
+              {% if block.show_ordinal %}
+              <span class="outline-block-ordinal">{{ block.ordinal }}</span>
+              {% endif %}
+              {% if block.title %}
+              <h3>{{ block.title | rich_text }}</h3>
+              {% endif %}
+            </div>
+            {% if block.source_timestamps or block.evidence_refs %}
+            <div class="outline-block-meta" aria-label="引用与时间锚点">
+              {% if block.evidence_refs %}<span class="meta-chip meta-chip-ref">引用 {{ block.evidence_refs | length }}</span>{% endif %}
+              {% if block.source_timestamps %}
+              <div class="outline-block-timestamps" aria-label="时间锚点">
+                {% for ts in block.source_timestamps %}
+                <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, ts) }}" target="_blank" rel="noopener">{{ ts | fmt_ts }}</a>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
+            {% endif %}
+          </header>
+          {% endif %}
+          {% if not block.show_head and block.title %}
+          <p class="outline-block-topic">{{ block.title | rich_text }}</p>
+          {% endif %}
+          {% if block.lead %}
+          <p class="outline-block-lead">{{ block.lead | rich_text }}</p>
+          {% endif %}
+          {% for paragraph in block.paragraphs %}
+          <div class="rich-paragraph outline-block-paragraph">{{ paragraph | rich_text }}</div>
+          {% endfor %}
+          {% if not block.show_head and (block.source_timestamps or block.evidence_refs) %}
+          <div class="outline-block-meta outline-block-meta-inline" aria-label="引用与时间锚点">
+            {% if block.evidence_refs %}<span class="meta-chip meta-chip-ref">引用 {{ block.evidence_refs | length }}</span>{% endif %}
+            {% if block.source_timestamps %}
+            <div class="outline-block-timestamps" aria-label="时间锚点">
+              {% for ts in block.source_timestamps %}
+              <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, ts) }}" target="_blank" rel="noopener">{{ ts | fmt_ts }}</a>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+          {% endif %}
+        </section>
+        {% endfor %}
+        {% if unit.visual_slots %}
+        <section class="section-visuals-spotlight">
+          {% set primary_visual = unit.visual_slots[0] %}
+          <figure class="frame frame-spotlight"
+                  data-ref-kind="evidence"
+                  {% if primary_visual.evidence_refs %}data-evidence-id="{{ primary_visual.evidence_refs[0] }}"{% endif %}
+                  data-note-node-id="{{ unit.id }}">
+            <img src="{{ frame_url(primary_visual.path) }}" alt="frame at {{ primary_visual.ts | fmt_ts }}" loading="lazy" />
+            <figcaption>
+              <div class="visual-meta">
+                <span class="visual-eyebrow">关键画面</span>
+                <a class="visual-time" href="{{ bili_link(lecture.bv_id, primary_visual.ts) }}" target="_blank" rel="noopener">{{ primary_visual.ts | fmt_ts }}</a>
+              </div>
+              <div class="visual-copy">
+                {% if primary_visual.title %}<h4>{{ primary_visual.title | rich_text }}</h4>{% endif %}
+                {% if primary_visual.caption %}<p>{{ primary_visual.caption | rich_text }}</p>{% endif %}
+              </div>
+            </figcaption>
+          </figure>
+          {% if unit.visual_slots | length > 1 %}
+          <details class="section-visuals-more">
+            <summary>需要时展开更多画面</summary>
+            <div class="frame-strip section-visuals section-visuals-secondary">
+              {% for visual in unit.visual_slots[1:] %}
+              <figure class="frame frame-compact"
+                      data-ref-kind="evidence"
+                      {% if visual.evidence_refs %}data-evidence-id="{{ visual.evidence_refs[0] }}"{% endif %}
+                      data-note-node-id="{{ unit.id }}">
+                <img src="{{ frame_url(visual.path) }}" alt="frame at {{ visual.ts | fmt_ts }}" loading="lazy" />
+                <figcaption>
+                  <div class="visual-meta">
+                    <span class="visual-eyebrow">补充画面</span>
+                    <a class="visual-time" href="{{ bili_link(lecture.bv_id, visual.ts) }}" target="_blank" rel="noopener">{{ visual.ts | fmt_ts }}</a>
+                  </div>
+                  <div class="visual-copy">
+                    {% if visual.title %}<h4>{{ visual.title | rich_text }}</h4>{% endif %}
+                    {% if visual.caption %}<p>{{ visual.caption | rich_text }}</p>{% endif %}
+                  </div>
+                </figcaption>
+              </figure>
+              {% endfor %}
+            </div>
+          </details>
+          {% endif %}
+        </section>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </section>
+    {% if note_projection.back_matter.boundary_and_risks %}
+    <section class="study-questions">
+      <h2>边界与风险</h2>
+      <ul>
+        {% for item in note_projection.back_matter.boundary_and_risks %}
+        <li>{{ item | rich_text }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if note_projection.back_matter.term_quick_ref %}
+    <section class="study-questions">
+      <h2>术语速查</h2>
+      <ul>
+        {% for item in note_projection.back_matter.term_quick_ref %}
+        <li>
+          <strong>{{ item.term }}</strong>：{{ item.explanation | rich_text }}
+          {% if item.ts %}<a class="ts-anchor" href="{{ bili_link(lecture.bv_id, item.ts) }}" target="_blank" rel="noopener">{{ item.ts | fmt_ts }}</a>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if note_projection.back_matter.appendices %}
+    <section class="study-questions">
+      <h2>补充说明</h2>
+      <ul class="appendix-list">
+        {% for item in note_projection.back_matter.appendices %}
+        <li class="appendix-item">
+          {% if item.title %}<strong>{{ item.title | rich_text }}</strong>{% endif %}
+          {% if item.kind_label %}<span class="appendix-kind">{{ item.kind_label }}</span>{% endif %}
+          <p>{{ item.summary | rich_text }}</p>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if note_projection.back_matter.transfer_and_next_steps %}
+    <section class="study-questions">
+      <h2>迁移与下一步</h2>
+      <ol>
+        {% for item in note_projection.back_matter.transfer_and_next_steps %}
+        <li>{{ item | rich_text }}</li>
+        {% endfor %}
+      </ol>
+    </section>
+    {% endif %}
+    {% else %}
     {% for ch in lecture.chapters %}
     <section class="chapter" id="chapter-{{ ch.index }}"
              data-ref-kind="chapter" data-ref-id="{{ ch.index }}"
@@ -144,6 +374,15 @@
       <div class="chapter-summary rich-text">{{ ch.summary | rich_text }}</div>
       {% endif %}
 
+      {% if ch.teaching_notes %}
+      <div class="teaching-notes">
+        <h3>讲解</h3>
+        {% for note in ch.teaching_notes %}
+        <div class="rich-paragraph">{{ note | rich_text }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
       {% if ch.process_steps %}
       <div class="process-steps">
         <h3>过程拆解</h3>
@@ -152,15 +391,6 @@
           <li>{{ step | rich_text }}</li>
           {% endfor %}
         </ol>
-      </div>
-      {% endif %}
-
-      {% if ch.teaching_notes %}
-      <div class="teaching-notes">
-        <h3>讲解</h3>
-        {% for note in ch.teaching_notes %}
-        <div class="rich-paragraph">{{ note | rich_text }}</div>
-        {% endfor %}
       </div>
       {% endif %}
 
@@ -289,24 +519,104 @@
       {% endif %}
     </section>
     {% endfor %}
+    {% endif %}
 
-    {% if type_recap %}
-    <section class="adaptive-section {{ type_recap.style }}">
-      <h2>{{ type_recap.title }}</h2>
-      <div class="unit-grid">
-        {% for unit in type_recap.units %}
-        <article class="unit-card">
-          <span class="unit-type">{{ unit.type }}</span>
-          <h3>{{ unit.title | rich_text }}</h3>
-          {% if unit.explanation %}<p>{{ unit.explanation | rich_text }}</p>{% endif %}
-          <a href="{{ bili_link(lecture.bv_id, unit.ts) }}" target="_blank" rel="noopener">⚓ {{ unit.ts | fmt_ts }}</a>
-        </article>
-        {% endfor %}
+    {% if evidence_projection.has_items %}
+    <section class="source-index" id="source-index">
+      <div class="source-index-head">
+        <div>
+          <span class="section-kicker">证据与来源</span>
+          <h2>默认先读正文，核对时再展开</h2>
+        </div>
+        <p class="source-index-intro">
+          {% if note_projection.back_matter.source_index_entrypoints %}
+          证据回到这些单元：{{ note_projection.back_matter.source_index_entrypoints[:3] | join('、') }}
+          {% else %}
+          只在需要核对时间点、术语原文或证据出处时再展开。
+          {% endif %}
+        </p>
       </div>
+      {% if evidence_projection.source_index_view %}
+      <details class="source-index-group">
+        <summary>证据如何回到讲义主线</summary>
+        <ul>
+          {% for item in evidence_projection.source_index_view %}
+          <li class="source-index-item"
+              data-ref-kind="evidence"
+              {% if item.evidence_id %}data-evidence-id="{{ item.evidence_id }}"{% endif %}
+              {% if item.page_anchor %}data-note-node-id="{{ item.page_anchor }}"{% endif %}>
+            {% if item.video_anchor %}
+            <a href="{{ bili_link(lecture.bv_id, item.video_anchor | replace('t=', '') | int) }}" target="_blank" rel="noopener">{{ item.label }}</a>
+            {% else %}
+            <span class="source-label">{{ item.label }}</span>
+            {% endif %}
+            {% if item.supports_text %}<span class="source-support"> · {{ item.supports_text | rich_text }}</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+      {% if evidence_projection.chapter_map %}
+      <details class="source-index-group">
+        <summary>章节定位</summary>
+        <ul>
+          {% for item in evidence_projection.chapter_map %}
+          <li>
+            <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, item.start) }}" target="_blank" rel="noopener">{{ item.start | fmt_ts }}</a>
+            第 {{ item.chapter_index }} 章 · {{ item.title | rich_text }}
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+      {% if evidence_projection.evidence_quotes %}
+      <details class="source-index-group">
+        <summary>关键证据</summary>
+        <ul class="points">
+          {% for item in evidence_projection.evidence_quotes %}
+          <li class="point point-compact">
+            <div class="point-row">
+              <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, item.ts) }}" target="_blank" rel="noopener">{{ item.ts | fmt_ts }}</a>
+              {% if item.chapter_index %}<span class="point-text">第 {{ item.chapter_index }} 章</span>{% endif %}
+            </div>
+            {% if item.label %}<p>{{ item.label | rich_text }}</p>{% endif %}
+            <blockquote>{{ item.quote | rich_text }}</blockquote>
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+      {% if evidence_projection.term_index %}
+      <details class="source-index-group">
+        <summary>术语速查</summary>
+        <dl>
+          {% for item in evidence_projection.term_index %}
+          <dt>
+            <a class="ts-anchor" href="{{ bili_link(lecture.bv_id, item.ts) }}" target="_blank" rel="noopener">{{ item.ts | fmt_ts }}</a>
+            <strong>{{ item.term | rich_text }}</strong>
+          </dt>
+          {% if item.explanation %}<dd>{{ item.explanation | rich_text }}</dd>{% endif %}
+          {% endfor %}
+        </dl>
+      </details>
+      {% endif %}
+      {% if evidence_projection.appendix_view %}
+      <details class="source-index-group">
+        <summary>补充材料</summary>
+        <ul>
+          {% for item in evidence_projection.appendix_view %}
+          <li>
+            {% if item.title %}<strong>{{ item.title | rich_text }}</strong>{% endif %}
+            {% if item.kind %}<span> · {{ item.kind }}</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
     </section>
     {% endif %}
 
-    {% if lecture.glossary %}
+    {% if lecture.glossary and not evidence_projection.term_index %}
     <section class="glossary">
       <h2>术语速查</h2>
       <dl>
@@ -321,56 +631,25 @@
     </section>
     {% endif %}
 
-    {% if lecture.final_synthesis %}
+    {% if lecture.final_synthesis and not note_projection.has_units %}
     <section class="final-synthesis">
       <h2>最终综合</h2>
       <div class="synthesis-body">{{ lecture.final_synthesis | rich_text }}</div>
     </section>
     {% endif %}
 
-    {% if lecture.review_questions %}
+    {% if review_questions_to_render and not note_projection.has_units %}
     <section class="review-questions">
       <h2>复习问题</h2>
       <ul>
-        {% for q in lecture.review_questions %}
+        {% for q in review_questions_to_render %}
         <li>{{ q | rich_text }}</li>
         {% endfor %}
       </ul>
     </section>
     {% endif %}
 
-    {% if lecture.render_plan.visual_evidence_section and global_visual_evidence %}
-    <section class="global-visual-evidence">
-      <h2>全局关键图解</h2>
-      {% for fr in global_visual_evidence %}
-      <figure class="frame evidence-card"
-              {% if frame_id_map and fr.path in frame_id_map %}id="frame-{{ frame_id_map[fr.path] }}" data-ref-kind="frame" data-ref-id="{{ frame_id_map[fr.path] }}"{% endif %}>
-        <img src="{{ frame_url(fr.path) }}" alt="frame at {{ fr.ts | fmt_ts }}" loading="lazy" />
-        <figcaption>
-          <a href="{{ bili_link(lecture.bv_id, fr.ts) }}" target="_blank" rel="noopener">⚓ {{ fr.ts | fmt_ts }}</a>
-          {% if fr.visual_type %}<span class="visual-type">{{ fr.visual_type }}</span>{% endif %}
-          {% if fr.caption %} · {{ fr.caption | rich_text }}{% endif %}
-        </figcaption>
-        {% if fr.selected_reason or fr.insight or fr.ocr_text %}
-        <details class="evidence-details">
-          <summary>展开图像说明</summary>
-          {% if fr.selected_reason or fr.insight %}
-          <p>{{ (fr.selected_reason or fr.insight) | rich_text }}</p>
-          {% endif %}
-          {% if fr.ocr_text %}
-          <details class="frame-ocr">
-            <summary>画面 OCR</summary>
-            <pre>{{ fr.ocr_text }}</pre>
-          </details>
-          {% endif %}
-        </details>
-        {% endif %}
-      </figure>
-      {% endfor %}
-    </section>
-    {% endif %}
-
-    {% if lecture.render_plan.completeness_card %}
+    {% if lecture.render_plan.completeness_card and not note_projection.has_units %}
     <section class="completeness-card">
       <div>
         <h2>学习闭环检查</h2>
@@ -404,6 +683,54 @@
     </section>
     {% endif %}
 
+    {% if lecture.render_plan.visual_evidence_section and global_visual_evidence and not note_projection.has_units %}
+    <section class="global-visual-evidence">
+      <h2>全局关键图解</h2>
+      {% for fr in global_visual_evidence %}
+      <figure class="frame evidence-card"
+              {% if frame_id_map and fr.path in frame_id_map %}id="frame-{{ frame_id_map[fr.path] }}" data-ref-kind="frame" data-ref-id="{{ frame_id_map[fr.path] }}"{% endif %}>
+        <img src="{{ frame_url(fr.path) }}" alt="frame at {{ fr.ts | fmt_ts }}" loading="lazy" />
+        <figcaption>
+          <a href="{{ bili_link(lecture.bv_id, fr.ts) }}" target="_blank" rel="noopener">⚓ {{ fr.ts | fmt_ts }}</a>
+          {% if fr.visual_type %}<span class="visual-type">{{ fr.visual_type }}</span>{% endif %}
+          {% if fr.caption %} · {{ fr.caption | rich_text }}{% endif %}
+        </figcaption>
+        {% if fr.selected_reason or fr.insight or fr.ocr_text %}
+        <details class="evidence-details">
+          <summary>展开图像说明</summary>
+          {% if fr.selected_reason or fr.insight %}
+          <p>{{ (fr.selected_reason or fr.insight) | rich_text }}</p>
+          {% endif %}
+          {% if fr.ocr_text %}
+          <details class="frame-ocr">
+            <summary>画面 OCR</summary>
+            <pre>{{ fr.ocr_text }}</pre>
+          </details>
+          {% endif %}
+        </details>
+        {% endif %}
+      </figure>
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    {% if type_recap and not note_projection.has_units %}
+    <section class="adaptive-section {{ type_recap.style }}">
+      <h2>{{ type_recap.title }}</h2>
+      <div class="unit-grid">
+        {% for unit in type_recap.units %}
+        <article class="unit-card">
+          <span class="unit-type">{{ unit.type }}</span>
+          <h3>{{ unit.title | rich_text }}</h3>
+          {% if unit.explanation %}<p>{{ unit.explanation | rich_text }}</p>{% endif %}
+          <a href="{{ bili_link(lecture.bv_id, unit.ts) }}" target="_blank" rel="noopener">⚓ {{ unit.ts | fmt_ts }}</a>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    {% if not note_projection.has_units %}
     <section class="generation-info">
       <h2>生成信息</h2>
       <dl>
@@ -421,6 +748,7 @@
         </div>
       </dl>
     </section>
+    {% endif %}
   </main>
 
   <footer class="footer">

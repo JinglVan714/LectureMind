@@ -58,8 +58,10 @@ router = APIRouter(prefix="/api/copilot", dependencies=[Depends(require_auth)])
 
 class Reference(BaseModel):
     kind: str
-    id: int | None = None
+    id: int | str | None = None
     text: str | None = None
+    note_node_id: str | None = None
+    evidence_id: str | None = None
 
 
 class HistoryTurn(BaseModel):
@@ -265,7 +267,8 @@ def _summarise_tool_output(name: str, output: Any) -> dict[str, Any]:
     We never stream the full tool response over SSE — it can be large
     (e.g. a full chapter) and the front-end does not need it for the
     progress UI.  The payload below is just enough to say "search_lecture
-    found 3 chunks" or "get_chapter found chapter 2".
+    found 3 chunks" or "get_chapter resolved to note unit X via
+    compatibility anchor Ch2".
     """
     base: dict[str, Any] = {"name": name}
     if isinstance(output, dict):
@@ -274,14 +277,84 @@ def _summarise_tool_output(name: str, output: Any) -> dict[str, Any]:
             return base
         if "chunks" in output and isinstance(output["chunks"], list):
             base["chunks_count"] = len(output["chunks"])
+        if "hits" in output and isinstance(output["hits"], list):
+            base["hits_count"] = len(output["hits"])
+        if output.get("primary_ref_kind"):
+            base["primary_ref_kind"] = output["primary_ref_kind"]
+        if output.get("primary_ref_id"):
+            base["primary_ref_id"] = output["primary_ref_id"]
+        if output.get("primary_evidence_id"):
+            base["primary_evidence_id"] = output["primary_evidence_id"]
+        if output.get("primary_note_node_id"):
+            base["primary_note_node_id"] = output["primary_note_node_id"]
+        if output.get("primary_note_unit_id"):
+            base["primary_note_unit_id"] = output["primary_note_unit_id"]
+        if output.get("primary_note_node_type"):
+            base["primary_note_node_type"] = output["primary_note_node_type"]
+        if output.get("primary_note_title"):
+            base["primary_note_title"] = output["primary_note_title"]
+        if output.get("primary_evidence_kind"):
+            base["primary_evidence_kind"] = output["primary_evidence_kind"]
+        if output.get("compatibility_anchor_kind"):
+            base["compatibility_anchor_kind"] = output["compatibility_anchor_kind"]
+        if output.get("compatibility_anchor_id"):
+            base["compatibility_anchor_id"] = output["compatibility_anchor_id"]
+        if output.get("title"):
+            base["title"] = output["title"]
+        if output.get("caption"):
+            base["caption"] = output["caption"]
+        if output.get("path"):
+            base["path"] = output["path"]
+        if output.get("matched_quote"):
+            base["matched_quote"] = output["matched_quote"]
+        if output.get("why_useful"):
+            base["why_useful"] = output["why_useful"]
         if "chapter_idx" in output:
             base["chapter_idx"] = output["chapter_idx"]
         if "frame_id" in output:
             base["frame_id"] = output["frame_id"]
         if "units" in output and isinstance(output["units"], list):
             base["units_count"] = len(output["units"])
+        if "requested_node_id" in output:
+            base["note_node_id"] = output["requested_node_id"]
+        if "evidence" in output and isinstance(output["evidence"], dict):
+            base["evidence_id"] = output["evidence"].get("evidence_id")
+        if output.get("note_unit_id"):
+            base["note_unit_id"] = output["note_unit_id"]
+        if "related_evidence_ids" in output and isinstance(output["related_evidence_ids"], list):
+            base["evidence_count"] = len(output["related_evidence_ids"])
+        if "related_note_node_ids" in output and isinstance(output["related_note_node_ids"], list):
+            base["note_nodes_count"] = len(output["related_note_node_ids"])
+        if not base.get("note_node_id") and isinstance(base.get("primary_note_node_id"), str):
+            base["note_node_id"] = base["primary_note_node_id"]
+        if not base.get("evidence_id") and isinstance(base.get("primary_evidence_id"), str):
+            base["evidence_id"] = base["primary_evidence_id"]
     base.setdefault("ok", True)
     return base
+
+
+async def _done_context_payload(ctx: ToolContext, bv: str) -> dict[str, Any]:
+    try:
+        lecture = await tool_registry._load_lecture(ctx, bv)
+    except tool_registry.ToolError:
+        return {}
+
+    payload: dict[str, Any] = {}
+    note = lecture.lecture_note_ir
+    if note is not None and note.body.teaching_units:
+        payload["note_context"] = {
+            "source": "lecture_note_ir",
+            "unit_count": len(note.body.teaching_units),
+            "unit_ids": [unit.unit_id for unit in note.body.teaching_units[:3]],
+        }
+    evidence = lecture.evidence_index
+    if evidence is not None and evidence.evidence_objects:
+        payload["evidence_context"] = {
+            "source": "evidence_index",
+            "evidence_count": len(evidence.evidence_objects),
+            "evidence_ids": [obj.evidence_id for obj in evidence.evidence_objects[:3]],
+        }
+    return payload
 
 
 async def run_agent_sse(
@@ -343,12 +416,14 @@ async def run_agent_sse(
         logger.warning("validate_anchors failed for bv=%s: %s", bv, exc)
         patched, warnings = answer, []
 
+    done_context = await _done_context_payload(ctx, bv)
     yield _sse_frame(
         "done",
         {
             "anchors_validated": True,
             "warnings": warnings,
             "patched_answer": patched if patched != answer else None,
+            **done_context,
         },
     )
 
@@ -396,7 +471,13 @@ async def copilot_ask(
     async def _gen() -> AsyncIterator[bytes]:
         async with sem:
             async with bv_lock:
-                graph = agent_mod.build_graph(ctx, enable_web=body.use_web)
+                graph = agent_mod.build_graph(
+                    ctx,
+                    enable_web=body.use_web,
+                    question=body.question,
+                    references=[r.model_dump() for r in body.references],
+                    history=[m.model_dump() for m in (body.messages or [])][-10:],
+                )
                 async for frame in run_agent_sse(graph, state, ctx, body.bv):
                     yield frame
 

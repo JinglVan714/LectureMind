@@ -32,6 +32,7 @@ selection, telemetry, ``ir_builder.build()`` dispatch) lands in P7.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -42,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Sequence
 from .chapter_cache import ChapterCache, compute_prompt_hash
 from .chapter_planner import ChapterAnchor
 from .ir import LectureIR
+from .ir_sanity import sanitize_ir_data
 from .prompts import (
     LECTURE_IR_MAP_CHAPTER_SYSTEM,
     LECTURE_IR_MAP_CHAPTER_USER_TEMPLATE,
@@ -53,6 +55,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .profile import LectureProfile
 
 logger = logging.getLogger(__name__)
+
+
+def _normalise_text_key(text: str) -> str:
+    return re.sub(r"[\s锛屻€傦紒锛??銆侊紱;锛?,.銆娿€嬧€溾€漒\"'锛堬級()\[\]銆愩€慭-鈥擾]+", "", str(text or "")).lower()
+
+
+def _texts_heavily_overlap(left: str, right: str, *, threshold: float = 0.82) -> bool:
+    left_key = _normalise_text_key(left)
+    right_key = _normalise_text_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter = min(len(left_key), len(right_key))
+    longer = max(len(left_key), len(right_key))
+    if shorter and (left_key in right_key or right_key in left_key):
+        if shorter / max(longer, 1) >= 0.72:
+            return True
+    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= threshold
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +150,10 @@ class MapReduceStats:
     reduce_local_sec: float = 0.0
     reduce_global_sec: float = 0.0
     reduce_global_attempts: int = 0
+    # Q1-Q4 post-IR sanity (see app.understand.ir_sanity). Populated by
+    # the builder after reduce_global so callers can surface mainline /
+    # core_question / chapter-index regressions without re-parsing IR.
+    ir_sanity: dict[str, Any] = field(default_factory=dict)
 
     @property
     def failure_indices(self) -> tuple[int, ...]:
@@ -328,6 +353,23 @@ class MapReduceIRBuilder:
         local_ir["cover"] = getattr(meta, "cover_url", local_ir.get("cover", ""))
         local_ir["study_questions"] = list(study_questions or [])
 
+        # Q1-Q4 post-IR sanity net: strip ``process_steps`` list-number
+        # prefixes, clear chapter-title-echoing ``mainline`` /
+        # ``core_question``, renumber non-contiguous chapter indices.
+        # Mirrors the single-call path's call inside
+        # ``hydrate_lecture_ir_data`` (see ``app/understand/ir_sanity.py``).
+        sanity = sanitize_ir_data(local_ir)
+        if not (local_ir.get("mainline") or []):
+            local_ir["mainline"] = self._fallback_mainline_from_chapters(
+                local_ir.get("chapters") or []
+            )
+            if local_ir["mainline"]:
+                completeness = local_ir.get("completeness")
+                if not isinstance(completeness, dict):
+                    completeness = {}
+                completeness["mainline_closed"] = True
+                local_ir["completeness"] = completeness
+
         ir = LectureIR.model_validate(local_ir)
         return ir, MapReduceStats(
             map_calls=int(stats["map_calls"]),
@@ -338,6 +380,7 @@ class MapReduceIRBuilder:
             reduce_local_sec=round(float(stats["reduce_local_sec"]), 3),
             reduce_global_sec=round(float(stats["reduce_global_sec"]), 3),
             reduce_global_attempts=int(stats["reduce_global_attempts"]),
+            ir_sanity=sanity,
         )
 
     # ------------------------------------------------------------------
@@ -872,21 +915,45 @@ class MapReduceIRBuilder:
     def _apply_global_pass(
         self, local_ir: dict[str, Any], obj: dict[str, Any]
     ) -> None:
-        """Overwrite the 4 lecture-level fields. Chapters stay frozen.
+        """Overwrite the lecture-level fields. Chapters stay frozen.
 
         ``glossary_resolved`` is projected into ``LectureIR.knowledge_units``
         by replacing the prior ``explanation`` with the global definition
         (when present) while preserving each unit's ``chapter_index``.
         """
-        lecture_summary = obj.get("lecture_summary")
-        if isinstance(lecture_summary, str) and lecture_summary.strip():
-            local_ir["final_synthesis"] = lecture_summary.strip()
-
         mainline = obj.get("mainline")
         if isinstance(mainline, list) and mainline:
             local_ir["mainline"] = [
                 self._format_mainline_step(step) for step in mainline if step
             ]
+
+        core_question = obj.get("core_question")
+        if isinstance(core_question, str) and core_question.strip():
+            local_ir["core_question"] = core_question.strip()
+
+        lecture_summary = obj.get("lecture_summary")
+        lecture_summary_text = (
+            lecture_summary.strip()
+            if isinstance(lecture_summary, str) and lecture_summary.strip()
+            else ""
+        )
+        final_synthesis_long = obj.get("final_synthesis_long")
+        if (
+            isinstance(final_synthesis_long, str)
+            and len(final_synthesis_long.strip()) >= 200
+            and not _texts_heavily_overlap(
+                final_synthesis_long,
+                " ".join(local_ir.get("mainline") or []),
+                threshold=0.78,
+            )
+        ):
+            local_ir["final_synthesis"] = final_synthesis_long.strip()
+        elif lecture_summary_text:
+            local_ir["final_synthesis"] = lecture_summary_text
+
+        taxonomy = obj.get("taxonomy")
+        if isinstance(taxonomy, dict):
+            local_ir["taxonomy"] = dict(taxonomy)
 
         glossary = obj.get("glossary_resolved")
         if isinstance(glossary, list):
@@ -908,11 +975,25 @@ class MapReduceIRBuilder:
             return step.strip()
         if isinstance(step, dict):
             title = str(step.get("title") or "").strip()
-            chap = step.get("chapter_index")
-            if chap is not None and title:
-                return f"第 {int(chap)} 章 · {title}"
             return title or json.dumps(step, ensure_ascii=False)
         return str(step).strip()
+
+    @staticmethod
+    def _fallback_mainline_from_chapters(chapters: list[dict[str, Any]]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for ch in chapters:
+            text = str(ch.get("learning_goal") or ch.get("summary") or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"[\s，。！？!?、；;：:,.《》“”\"'（）()\[\]【】\-—_]+", "", text).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= 6:
+                break
+        return out
 
     @staticmethod
     def _merge_global_glossary(
@@ -921,7 +1002,7 @@ class MapReduceIRBuilder:
     ) -> list[dict[str, Any]]:
         by_term: dict[str, dict[str, Any]] = {}
         for ku in existing:
-            term = str(ku.get("title") or "").strip()
+            term = str(ku.get("term_short") or ku.get("title") or "").strip()
             if term:
                 by_term[term] = dict(ku)
 
@@ -935,11 +1016,24 @@ class MapReduceIRBuilder:
             definition = str(item.get("definition") or "").strip()
             chap = item.get("winning_chapter_index") or item.get("chapter_index")
             base = by_term.get(term)
+            if base is None and chap is not None:
+                for ku in existing:
+                    try:
+                        same_chapter = int(ku.get("chapter_index") or 0) == int(chap)
+                    except (TypeError, ValueError):
+                        same_chapter = False
+                    if not same_chapter:
+                        continue
+                    haystack = f"{ku.get('title', '')} {ku.get('explanation', '')}"
+                    if term and term in haystack:
+                        base = dict(ku)
+                        break
             if base is None:
                 base = {
                     "id": f"ku-{next_id}",
                     "type": "concept",
                     "title": term,
+                    "term_short": term,
                     "explanation": definition,
                     "ts": 0.0,
                     "quote": "",
@@ -947,6 +1041,7 @@ class MapReduceIRBuilder:
                 }
                 next_id += 1
             else:
+                base["term_short"] = term
                 if definition:
                     base["explanation"] = definition
                 if chap is not None:

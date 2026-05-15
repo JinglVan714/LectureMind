@@ -12,10 +12,12 @@ import json
 import logging
 import sqlite3
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import get_settings
+from app.copilot.taxonomy import normalize as normalize_taxonomy
 from app.render.renderer import Renderer
 from app.understand._latex_repair import repair_obj as _repair_latex_escapes
 from app.understand.ir import LectureIR
@@ -97,16 +99,65 @@ def _lecture_from_source(bv_id: str, ir_files: dict[str, Path], db_summaries: di
     raise ValueError("No LectureIR debug JSON or SQLite summary_json available for HTML-only rerender")
 
 
+def _merge_visuals_from_summary(lecture: LectureJSON, summary_data: dict | None) -> LectureJSON:
+    """Backfill visuals from persisted LectureJSON when IR projection is sparse.
+
+    ``lecture_ir_to_lecture_json()`` intentionally focuses on projection logic
+    and does not reproduce pipeline-time hydration such as chapter frame
+    injection. The SQLite ``summary_json`` already contains those hydrated
+    chapter frames, so rerender should reuse them instead of dropping images.
+    """
+    if not summary_data:
+        return lecture
+    merged = lecture.model_dump(mode="json")
+    chapters = merged.get("chapters") or []
+    summary_chapters = (summary_data or {}).get("chapters") or []
+    summary_by_index = {
+        int(ch.get("index")): ch
+        for ch in summary_chapters
+        if isinstance(ch, dict) and ch.get("index") is not None
+    }
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        idx = chapter.get("index")
+        persisted = summary_by_index.get(int(idx)) if idx is not None else None
+        if not isinstance(persisted, dict):
+            continue
+        if not (chapter.get("frames") or []):
+            chapter["frames"] = deepcopy(persisted.get("frames") or [])
+    if not (merged.get("visual_evidence") or []):
+        merged["visual_evidence"] = deepcopy((summary_data or {}).get("visual_evidence") or [])
+    if not merged.get("cover_url"):
+        merged["cover_url"] = str((summary_data or {}).get("cover_url") or "")
+    return LectureJSON.model_validate(merged)
+
+
+def _discover_cover_path(data_dir: Path, bv_id: str) -> Path | None:
+    covers_dir = data_dir / "covers"
+    for suffix in (".jpg", ".jpeg", ".png", ".webp"):
+        candidate = covers_dir / f"{bv_id}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _render_one(
     renderer: Renderer,
     css_inline: str,
+    data_dir: Path,
     bv_id: str,
     ir_files: dict[str, Path],
     db_summaries: dict[str, dict],
 ) -> RerenderResult:
     try:
         lecture, source = _lecture_from_source(bv_id, ir_files, db_summaries)
-        report = renderer.render_lecture(lecture, css_inline)
+        lecture = _merge_visuals_from_summary(lecture, db_summaries.get(bv_id))
+        lecture.taxonomy = normalize_taxonomy(lecture.taxonomy)
+        if lecture.taxonomy and lecture.taxonomy.tags:
+            lecture.domain_tags = list(lecture.taxonomy.tags)
+        cover_path = _discover_cover_path(data_dir, bv_id)
+        report = renderer.render_lecture(lecture, css_inline, cover_path=cover_path)
         return RerenderResult(bv_id=bv_id, status="ok", source=source, report=report)
     except Exception as exc:  # noqa: BLE001
         logging.exception("HTML-only rerender failed: %s", bv_id)
@@ -159,7 +210,7 @@ def main() -> None:
     for index, bv_id in enumerate(targets, start=1):
         source_label = "LectureIR" if bv_id in ir_files else "SQLite"
         print(f"[{index}/{len(targets)}] {bv_id} · HTML-only rerender · {source_label}", file=sys.stderr)
-        result = _render_one(renderer, css_inline, bv_id, ir_files, db_summaries)
+        result = _render_one(renderer, css_inline, settings.data_dir, bv_id, ir_files, db_summaries)
         results.append(result)
         if result.status != "ok" and args.fail_fast:
             break

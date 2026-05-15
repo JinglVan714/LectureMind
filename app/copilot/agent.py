@@ -20,6 +20,7 @@ Design choices (see ``handoff_copilot.md`` decisions D32-D37):
 """
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import re
 from typing import Any, Awaitable, Callable
@@ -39,6 +40,7 @@ from typing_extensions import Annotated, TypedDict
 
 from app.config import get_settings
 from app.storage.db import Database
+from app.understand.schema import LectureJSON
 
 from . import tools as tool_registry
 from .prompts import ANCHOR_PATTERNS, COPILOT_SYSTEM, format_references_block
@@ -46,9 +48,12 @@ from .rag import RAGStore
 from .sections import SECTION_LINE_RE, SECTION_TYPES, normalise_section_type
 from .tools import (
     ExplainFrameInput,
+    GetEvidenceObjectInput,
     GetChapterInput,
     GetFrameInput,
+    GetNoteUnitInput,
     GetQuoteContextInput,
+    SearchEvidenceInput,
     SearchLectureInput,
     SearchLecturesInput,
     ToolContext,
@@ -69,7 +74,8 @@ FINAL_RESPONSE_PROMPT = (
     "一般答案 1-2 段，复杂答案 3 段，4 段是硬上限；严禁固定输出 4 段，严禁同时列出 "
     "[[background]]、[[deep_dive]]、[[application]]。每段首行使用 [[evidence]]、[[background]]、"
     "[[extension]]、[[deep_dive]]、[[application]]、[[boundary]] 或 [[offtopic]]。"
-    "[[evidence]] 只写当前讲义直接支持的内容，并尽量为关键事实附上 [t=05:46]、[F7] 或 [Ch3]；"
+    "[[evidence]] 只写当前讲义直接支持的内容，并优先为关键事实附上 [t=05:46] 或 [F7]；[Ch3] 只能作为兼容补充，不应单独充当证据锚点；"
+    "回答组织应以讲义主线节点为先、以证据锚点为后，不要把章节编号当作主要结构；"
     "若讲义未直接展开但问题与讲义主题相关，请在 [[background]] 或 [[deep_dive]] 中二选一做学习向补全，"
     "并明确它不是讲义原话。时间必须写成分钟:秒，章节和关键帧编号不要加尖括号。"
 )
@@ -112,7 +118,158 @@ def _describe(fn: Callable[..., Any]) -> str:
     return doc[0] if doc else fn.__name__
 
 
-def make_copilot_tools(ctx: ToolContext, *, enable_web: bool = False) -> list[BaseTool]:
+_TOOL_GUIDANCE: dict[str, str] = {
+    "search_lecture": "Default first step: locate the relevant Lecture Note IR mainline before drilling down.",
+    "get_note_unit": "Default second step: read the reader-source note unit or block returned by search_lecture.",
+    "search_evidence": "Use after the note path is clear to find Evidence Index proof for the claim.",
+    "get_evidence_object": "Use after search_evidence when a specific evidence object needs exact quote/frame/source details.",
+    "search_lectures": "Cross-lecture extension only; do not use for the current lecture default path.",
+    "get_chapter": "Compatibility fallback for explicit chapter anchors or legacy chapter inspection.",
+    "get_frame": "Compatibility fallback for explicit frame anchors.",
+    "get_quote_context": "Compatibility fallback for explicit subtitle quote or timestamp context.",
+    "explain_frame": "Compatibility fallback for explicit frame explanation requests.",
+    "web_search": "External background only; never use as current-lecture evidence.",
+}
+
+_COMPATIBILITY_KEYWORD_PATTERNS: tuple[re.Pattern[str], ...] = (
+    ANCHOR_PATTERNS["t"],
+    ANCHOR_PATTERNS["F"],
+    ANCHOR_PATTERNS["Ch"],
+    re.compile(r"\b\d{1,2}:\d{2}\b"),
+    re.compile(r"\b(?:chapter|ch)\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\bframe\s*\d+\b", re.IGNORECASE),
+    re.compile(r"第\s*\d+\s*章"),
+)
+_COMPATIBILITY_KEYWORDS: tuple[str, ...] = (
+    "关键帧",
+    "字幕",
+    "原话",
+    "逐字",
+    "时间戳",
+    "时间点",
+    "timestamp",
+    "quote",
+)
+
+
+def _guided_description(name: str, fn: Callable[..., Any]) -> str:
+    base = _describe(fn)
+    guidance = _TOOL_GUIDANCE.get(name)
+    if not guidance:
+        return base
+    return f"{guidance} {base}"
+
+
+def _trim_prompt_line(text: str, limit: int = 120) -> str:
+    line = " ".join((text or "").strip().split())
+    if len(line) <= limit:
+        return line
+    return line[: limit - 3].rstrip() + "..."
+
+
+def _render_note_outline_block(lecture: LectureJSON) -> str:
+    note = lecture.lecture_note_ir
+    if note is None or not note.body.teaching_units:
+        return ""
+    lines = ["当前讲义主线（Lecture Note IR，读者真源）："]
+    claim = _trim_prompt_line(note.front_matter.one_sentence_claim, limit=160)
+    if claim:
+        lines.append(f"- 一句话主张：{claim}")
+    takeaways = [
+        _trim_prompt_line(item, limit=60)
+        for item in note.front_matter.takeaways_top
+        if item.strip()
+    ]
+    if takeaways:
+        lines.append(f"- 核心要点：{'；'.join(takeaways[:3])}")
+    for idx, unit in enumerate(note.body.teaching_units[:4], start=1):
+        title = _trim_prompt_line(unit.title or unit.core_message or unit.unit_id, limit=70)
+        message = _trim_prompt_line(unit.core_message or unit.teaching_goal, limit=90)
+        if message and message != title:
+            lines.append(f"{idx}. [{unit.unit_id}] {title}：{message}")
+        else:
+            lines.append(f"{idx}. [{unit.unit_id}] {title}")
+    remaining = len(note.body.teaching_units) - 4
+    if remaining > 0:
+        lines.append(f"- 其余 {remaining} 个 teaching unit 按同一主线继续展开。")
+    return "\n".join(lines)
+
+
+def _render_evidence_index_block(lecture: LectureJSON) -> str:
+    evidence = lecture.evidence_index
+    if evidence is None or not evidence.evidence_objects:
+        return ""
+    lines = ["当前证据索引（Evidence Index，系统真源）："]
+    kind_counts = Counter(obj.kind for obj in evidence.evidence_objects if obj.kind)
+    if kind_counts:
+        counts = ", ".join(f"{kind} x{count}" for kind, count in kind_counts.most_common(4))
+        lines.append(f"- 证据对象 {len(evidence.evidence_objects)} 个；主要类型：{counts}")
+    anchored = 0
+    for obj in evidence.evidence_objects:
+        desc = _trim_prompt_line(obj.summary or obj.text or obj.quote or obj.title, limit=90)
+        if not desc:
+            continue
+        note_targets = [node for node in obj.note_node_ids if node]
+        target_text = ",".join(note_targets[:2]) if note_targets else "未映射 note node"
+        lines.append(f"- [{obj.evidence_id}] -> {target_text}：{desc}")
+        anchored += 1
+        if anchored >= 3:
+            break
+    if evidence.evidence_relations:
+        lines.append(f"- 支撑关系 {len(evidence.evidence_relations)} 条，可继续下钻到具体证据对象。")
+    return "\n".join(lines)
+
+
+def _render_note_evidence_context(lecture: LectureJSON) -> str:
+    blocks = [
+        block
+        for block in (
+            _render_note_outline_block(lecture),
+            _render_evidence_index_block(lecture),
+        )
+        if block
+    ]
+    if not blocks:
+        return ""
+    blocks.append("回答策略：先按 Lecture Note IR 组织讲义主线，再用 Evidence Index / tool 调用下钻证据。")
+    return "\n\n".join(blocks)
+
+
+def _text_requests_compatibility_tools(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if any(pattern.search(text) for pattern in _COMPATIBILITY_KEYWORD_PATTERNS):
+        return True
+    return any(keyword in lowered for keyword in _COMPATIBILITY_KEYWORDS)
+
+
+def _should_include_compatibility_tools(
+    *,
+    question: str = "",
+    references: list[dict] | None = None,
+    history: list[dict] | None = None,
+) -> bool:
+    if _text_requests_compatibility_tools(question):
+        return True
+    for ref in references or []:
+        kind = str(ref.get("kind", "")).strip().lower()
+        if kind in {"chapter", "frame"}:
+            return True
+        if kind == "selection" and _text_requests_compatibility_tools(str(ref.get("text", "") or "")):
+            return True
+    for turn in history or []:
+        if _text_requests_compatibility_tools(str(turn.get("content", "") or "")):
+            return True
+    return False
+
+
+def make_copilot_tools(
+    ctx: ToolContext,
+    *,
+    enable_web: bool = False,
+    include_compatibility_tools: bool = True,
+) -> list[BaseTool]:
     """Five Copilot tools bound to a captured ``ToolContext``.
 
     The returned ``BaseTool`` list is consumable by
@@ -127,6 +284,15 @@ def make_copilot_tools(ctx: ToolContext, *, enable_web: bool = False) -> list[Ba
     async def _search_lecture(bv: str, query: str, top_k: int = 5) -> dict:
         try:
             out = await tool_registry.search_lecture(
+                ctx, bv=bv, query=query, top_k=top_k
+            )
+            return out.model_dump(mode="json")
+        except ToolError as exc:
+            return {"error": exc.to_dict()}
+
+    async def _search_evidence(bv: str, query: str, top_k: int = 5) -> dict:
+        try:
+            out = await tool_registry.search_evidence(
                 ctx, bv=bv, query=query, top_k=top_k
             )
             return out.model_dump(mode="json")
@@ -150,6 +316,22 @@ def make_copilot_tools(ctx: ToolContext, *, enable_web: bool = False) -> list[Ba
     async def _web_search(query: str, count: int = 5) -> dict:
         out = await tool_registry.web_search(ctx, query=query, count=count)
         return out.model_dump(mode="json")
+
+    async def _get_note_unit(bv: str, unit_id: str) -> dict:
+        try:
+            out = await tool_registry.get_note_unit(ctx, bv=bv, unit_id=unit_id)
+            return out.model_dump(mode="json")
+        except ToolError as exc:
+            return {"error": exc.to_dict()}
+
+    async def _get_evidence_object(bv: str, evidence_id: str) -> dict:
+        try:
+            out = await tool_registry.get_evidence_object(
+                ctx, bv=bv, evidence_id=evidence_id
+            )
+            return out.model_dump(mode="json")
+        except ToolError as exc:
+            return {"error": exc.to_dict()}
 
     async def _get_chapter(bv: str, chapter_idx: int) -> dict:
         try:
@@ -184,46 +366,69 @@ def make_copilot_tools(ctx: ToolContext, *, enable_web: bool = False) -> list[Ba
     tools = [
         _wrap_async(
             "search_lecture",
-            _describe(tool_registry.search_lecture),
+            _guided_description("search_lecture", tool_registry.search_lecture),
             SearchLectureInput,
             _search_lecture,
         ),
         _wrap_async(
+            "get_note_unit",
+            _guided_description("get_note_unit", tool_registry.get_note_unit),
+            GetNoteUnitInput,
+            _get_note_unit,
+        ),
+        _wrap_async(
+            "search_evidence",
+            _guided_description("search_evidence", tool_registry.search_evidence),
+            SearchEvidenceInput,
+            _search_evidence,
+        ),
+        _wrap_async(
+            "get_evidence_object",
+            _guided_description("get_evidence_object", tool_registry.get_evidence_object),
+            GetEvidenceObjectInput,
+            _get_evidence_object,
+        ),
+        _wrap_async(
             "search_lectures",
-            _describe(tool_registry.search_lectures),
+            _guided_description("search_lectures", tool_registry.search_lectures),
             SearchLecturesInput,
             _search_lectures,
         ),
-        _wrap_async(
-            "get_chapter",
-            _describe(tool_registry.get_chapter),
-            GetChapterInput,
-            _get_chapter,
-        ),
-        _wrap_async(
-            "get_frame",
-            _describe(tool_registry.get_frame),
-            GetFrameInput,
-            _get_frame,
-        ),
-        _wrap_async(
-            "get_quote_context",
-            _describe(tool_registry.get_quote_context),
-            GetQuoteContextInput,
-            _get_quote_context,
-        ),
-        _wrap_async(
-            "explain_frame",
-            _describe(tool_registry.explain_frame),
-            ExplainFrameInput,
-            _explain_frame,
-        ),
     ]
+    if include_compatibility_tools:
+        tools.extend(
+            [
+                _wrap_async(
+                    "get_chapter",
+                    _guided_description("get_chapter", tool_registry.get_chapter),
+                    GetChapterInput,
+                    _get_chapter,
+                ),
+                _wrap_async(
+                    "get_frame",
+                    _guided_description("get_frame", tool_registry.get_frame),
+                    GetFrameInput,
+                    _get_frame,
+                ),
+                _wrap_async(
+                    "get_quote_context",
+                    _guided_description("get_quote_context", tool_registry.get_quote_context),
+                    GetQuoteContextInput,
+                    _get_quote_context,
+                ),
+                _wrap_async(
+                    "explain_frame",
+                    _guided_description("explain_frame", tool_registry.explain_frame),
+                    ExplainFrameInput,
+                    _explain_frame,
+                ),
+            ]
+        )
     if enable_web:
         tools.append(
             _wrap_async(
                 "web_search",
-                _describe(tool_registry.web_search),
+                _guided_description("web_search", tool_registry.web_search),
                 WebSearchInput,
                 _web_search,
             )
@@ -276,7 +481,15 @@ def _build_model() -> Any:
 # ---------------------------------------------------------------------------
 
 
-def build_graph(ctx: ToolContext, *, model: Any | None = None, enable_web: bool = False):
+def build_graph(
+    ctx: ToolContext,
+    *,
+    model: Any | None = None,
+    enable_web: bool = False,
+    question: str = "",
+    references: list[dict] | None = None,
+    history: list[dict] | None = None,
+):
     """Compile a fresh ReAct graph bound to ``ctx``.
 
     ``model`` is an escape hatch for tests — passing a stub avoids the
@@ -286,7 +499,15 @@ def build_graph(ctx: ToolContext, *, model: Any | None = None, enable_web: bool 
     """
     settings = get_settings()
     max_tool_calls = settings.copilot_max_tool_calls
-    tools = make_copilot_tools(ctx, enable_web=enable_web)
+    tools = make_copilot_tools(
+        ctx,
+        enable_web=enable_web,
+        include_compatibility_tools=_should_include_compatibility_tools(
+            question=question,
+            references=references,
+            history=history,
+        ),
+    )
     llm = model if model is not None else _build_model()
     llm_with_tools = llm.bind_tools(tools)
 
@@ -378,6 +599,9 @@ async def build_initial_state(
         max_tool_calls=settings.copilot_max_tool_calls,
     )
     msgs: list[BaseMessage] = [SystemMessage(content=system_text)]
+    note_evidence_context = _render_note_evidence_context(lecture)
+    if note_evidence_context:
+        msgs.append(SystemMessage(content=note_evidence_context))
     for turn in history or []:
         role = str(turn.get("role", "")).strip().lower()
         content = str(turn.get("content", "") or "").strip()
@@ -404,16 +628,37 @@ async def build_initial_state(
 # ---------------------------------------------------------------------------
 
 
-def _ts_to_seconds(mm: str, ss: str) -> int:
-    return int(mm) * 60 + int(ss)
+def _normalise_anchor_timestamp(token: str) -> tuple[int, int, int]:
+    token = str(token or "").strip()
+    if token.isdigit():
+        secs = int(token)
+        mm, ss = divmod(secs, 60)
+        return secs, mm, ss
+    mm_text, ss_text = token.split(":", 1)
+    mm = int(mm_text)
+    ss = int(ss_text)
+    secs = mm * 60 + ss
+    return secs, mm, ss
 
 
 _MALFORMED_TS_SECONDS = re.compile(r"\[t=(\d{3,})\]")
 _MALFORMED_FRAME = re.compile(r"\[F<(\d+)>\]")
-_MALFORMED_CHAPTER = re.compile(r"\[Ch<(\d+)>\]")
+_MALFORMED_CHAPTER = re.compile(r"\[(?:Ch|CH)<(\d+)>\]")
 _WEB_ANCHOR = re.compile(r"\[web\s*·\s*([^\]\s]+)\]")
 _MALFORMED_WEB_ANCHOR = re.compile(r"\[web\s*[\-:：]\s*([^\]\s]+)\]")
-_CROSS_BV_ANCHOR = re.compile(r"\[(BV[0-9A-Za-z]+)\s*·\s*Ch(\d+)\]")
+_CROSS_BV_ANCHOR = re.compile(r"\[(BV[0-9A-Za-z]+)\s*·\s*(?:Ch|CH)(\d+)\]")
+_LEADING_COMPATIBILITY_FRAMING = re.compile(
+    r"^(?:[-*]\s*)?(?:\[(?:Ch|CH)\d+\]|\[F\d+\]|\b(?:chapter|ch|frame)\s*\d+\b|第\s*\d+\s*章)",
+    re.IGNORECASE,
+)
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 async def validate_anchors(
@@ -448,6 +693,14 @@ async def validate_anchors(
         warnings.append(
             {"kind": "section", "value": "", "reason": "missing_section_label"}
         )
+    elif not (section_types[0] == "evidence" or section_types == ["offtopic"]):
+        warnings.append(
+            {
+                "kind": "section",
+                "value": f"[[{section_types[0]}]]",
+                "reason": "first_section_not_evidence",
+            }
+        )
     if len(section_types) > 4:
         warnings.append(
             {
@@ -462,6 +715,14 @@ async def validate_anchors(
     for kind in duplicated_section_types:
         warnings.append(
             {"kind": "section", "value": f"[[{kind}]]", "reason": "duplicated_section_type"}
+        )
+    if {"background", "deep_dive", "application"}.issubset(set(section_types)):
+        warnings.append(
+            {
+                "kind": "section",
+                "value": "[[background]],[[deep_dive]],[[application]]",
+                "reason": "support_section_triple_combo",
+            }
         )
     if "offtopic" in section_types and len(section_types) > 1:
         warnings.append(
@@ -509,8 +770,8 @@ async def validate_anchors(
         return f"[t={mm:02d}:{ss:02d}]"
 
     def _sub_ts(match: re.Match[str]) -> str:
-        mm, ss = match.group(1), match.group(2)
-        return _validate_ts(match.group(0), _ts_to_seconds(mm, ss), int(mm), int(ss))
+        secs, mm, ss = _normalise_anchor_timestamp(match.group(1))
+        return _validate_ts(match.group(0), secs, mm, ss)
 
     def _sub_malformed_ts_seconds(match: re.Match[str]) -> str:
         secs = int(match.group(1))
@@ -533,7 +794,7 @@ async def validate_anchors(
                 {"kind": "F", "value": match.group(0), "reason": f"out of 1..{frame_count}"}
             )
             return f"[⚠ F{fid}]"
-        return match.group(0)
+        return f"[F{fid}]"
 
     def _sub_malformed_frame(match: re.Match[str]) -> str:
         fid = int(match.group(1))
@@ -556,7 +817,7 @@ async def validate_anchors(
                 {"kind": "Ch", "value": match.group(0), "reason": f"out of 1..{chapter_count}"}
             )
             return f"[⚠ Ch{cid}]"
-        return match.group(0)
+        return f"[Ch{cid}]"
 
     def _sub_malformed_chapter(match: re.Match[str]) -> str:
         cid = int(match.group(1))
@@ -593,18 +854,34 @@ async def validate_anchors(
     patched = ANCHOR_PATTERNS["Ch"].sub(_sub_chapter, patched)
     for i, match in enumerate(section_matches):
         kind = normalise_section_type(match.group(1))
-        if kind != "evidence":
-            continue
         start = match.end()
         end = section_matches[i + 1].start() if i + 1 < len(section_matches) else len(patched)
         body = patched[start:end]
-        if not (
-            ANCHOR_PATTERNS["t"].search(body)
-            or ANCHOR_PATTERNS["F"].search(body)
-            or ANCHOR_PATTERNS["Ch"].search(body)
-        ):
+        if kind != "evidence":
+            continue
+        first_line = _first_nonempty_line(body)
+        if first_line and _LEADING_COMPATIBILITY_FRAMING.match(first_line):
+            warnings.append(
+                {
+                    "kind": "section",
+                    "value": first_line,
+                    "reason": "evidence_section_starts_with_compatibility_framing",
+                }
+            )
+        has_time_anchor = ANCHOR_PATTERNS["t"].search(body) is not None
+        has_frame_anchor = ANCHOR_PATTERNS["F"].search(body) is not None
+        has_chapter_anchor = ANCHOR_PATTERNS["Ch"].search(body) is not None
+        if not (has_time_anchor or has_frame_anchor or has_chapter_anchor):
             warnings.append(
                 {"kind": "section", "value": "[[evidence]]", "reason": "evidence_section_no_anchor"}
+            )
+        elif not (has_time_anchor or has_frame_anchor) and has_chapter_anchor:
+            warnings.append(
+                {
+                    "kind": "section",
+                    "value": "[[evidence]]",
+                    "reason": "evidence_section_chapter_only_anchor",
+                }
             )
     return patched, warnings
 
@@ -628,7 +905,7 @@ async def quick_ask(
     ``None``.  Returns ``(answer, warnings)`` so integration tests can
     assert on both the content and the anchor-validation signal.
     """
-    graph = build_graph(ctx, model=model)
+    graph = build_graph(ctx, model=model, question=question, references=references)
     state = await build_initial_state(ctx, bv, question, references)
     final: AgentState = await graph.ainvoke(state)
     last = final["messages"][-1] if final.get("messages") else None
