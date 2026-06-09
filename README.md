@@ -1,388 +1,301 @@
 # LectureMind
 
-面向长视频学习场景的“视频总结 + Copilot”系统。
+把一条 B 站视频链接变成一份**可阅读、可追溯、可对话**的结构化讲义，配合 Copilot 围绕讲义做问答，并通过 MCP 协议暴露给外部 Agent。
 
-LectureMind 不是把视频粗暴压缩成几条摘要，而是把一条 B 站课程或技术讲座链接，转换成一份可阅读、可追溯、可对话的学习讲义：你会得到一份独立 HTML 讲义、带证据锚点的内容结构，以及一个围绕讲义工作的 Copilot。
+## 它解决什么问题
 
-它适合这样的场景：
+长视频的审阅/学习有一个根本矛盾：视频是线性的、不可跳读的、不可搜索的。一个 30 分钟的技术视频，你要花 30 分钟看完才知道它讲了什么。
 
-- 你想把长视频变成更适合复习、检索和二次学习的文字材料。
-- 你不满足于“总结一下这视频讲了什么”，而是希望答案能回到原视频的时间点、关键帧和原文证据。
-- 你希望把处理后的内容继续开放给外部 Agent，例如 Cursor、Claude Desktop 或其他支持 MCP 的客户端。
+LectureMind 的做法是把视频的**信息结构**提取出来，变成一份独立于视频的讲义。用户看完讲义就能判断"这段视频值不值得看"、"核心知识点是什么"、"关键证据在哪"。
 
-## 立意
+和市面产品的本质区别：
+- 市面产品：视频 → 摘要（maybe读完即弃）
+- LectureMind：视频 → 讲义（可阅读、可追溯、可对话）
 
-大多数“视频总结”产品只解决了压缩问题，没有解决学习问题。
+## 它能做什么
 
-LectureMind 的目标不是生成一份好看的摘要，而是构建一个更适合学习和继续提问的知识表面：
+### 1. 视频 → 结构化讲义
 
-- 对读者来说，核心产物是一份结构清楚的讲义。
-- 对系统来说，核心产物是一套能追溯回原视频的证据索引。
-- 对 Copilot 来说，回答应当优先基于讲义，再回到证据，而不是直接围绕 HTML 或零散片段胡乱检索。
+输入一个 B 站视频链接或 BV 号，Pipeline 自动完成：
 
-这个项目的几个核心原则已经写进代码里：
-
-- `Lecture Note IR` 是面向读者的事实来源。
-- `Evidence Index` 是面向系统的事实来源。
-- Copilot 采用 `note-first / evidence-second`。
-- HTML 只是投影结果，不是源数据。
-
-## 这个项目能做什么
-
-### 1. 把 B 站视频变成结构化讲义
-
-输入一个 B 站视频链接或 `BV` 号，系统会自动完成：
-
-- 抓取视频元数据
-- 抽取字幕
-- 抽取关键帧和封面
-- 用视觉模型描述关键帧内容
-- 生成结构化讲义
-- 渲染为可直接打开的独立 HTML
-
-### 2. 保留证据链，而不是只给结论
-
-生成结果不仅有总结文本，还会尽量保留这些证据入口：
-
-- 时间戳
-- 关键帧
-- 字幕引用
-- 章节边界
-- 术语与知识单元
-
-这让讲义不只是“读完即弃”的摘要，而是可以继续回溯、校验和提问的学习材料。
-
-### 3. 提供讲义内 Copilot
-
-项目内置了一个围绕讲义工作的 Copilot，支持：
-
-- 基于讲义问答
-- 基于证据补充说明
-- 在答案中保留锚点与上下文
-- 通过 SSE 流式返回结果
-
-### 4. 对外暴露 MCP 服务
-
-除了网页里的 Copilot，LectureMind 还提供独立的 MCP Server，让外部 Agent 能访问同一套讲义与证据数据。
-
-默认提供的是只读知识访问能力，例如：
-
-- 搜索讲义
-- 搜索证据
-- 读取章节
-- 读取知识单元
-- 读取关键帧说明
-
-## 大致架构
-
-项目当前主链路可以概括成：
-
-```text
-Raw Material Layer
-  -> Lecture Compiler / IR Builder
-  -> Lecture Note IR
-  -> Evidence Index
-  -> Consumers (HTML / Copilot / MCP)
+```
+元数据 → 字幕 + 关键帧 + 封面（并行）→ VLM 视觉理解 → 多 Agent 协作生成 IR
+→ 双投影编译（Note IR + Evidence Index）→ HTML 渲染 → RAG 索引
 ```
 
-展开一点看，大概是这样：
+### 2. 多 Agent 协作
 
-### 1. 原始材料层
+讲义生成不是单次 LLM 调用，而是 4 个 Agent 分工协作：
 
-对应 `app/ingest/`，负责把视频变成后续可处理的原料：
+| Agent | 职责 | 失败策略 |
+|-------|------|----------|
+| StudyQuestionAgent | 生成学习问题驱动抽取 | 失败→跳过 |
+| LectureIRBuilder | 结构化抽取（单次 / Map-Reduce） | 截断→自动降级 |
+| Critic | 质量审查（覆盖度/引用/代码公式） | 失败→跳过 |
+| Reviser | 定向修复（patch / full 两种模式） | 失败→保留原 IR |
 
-- `bilibili.py`：解析 B 站链接、抓取元数据
-- `subtitle.py`：抽取字幕，必要时走 Whisper 回退
-- `keyframe.py`：抽取关键帧
-- `cover.py`：抓取封面
-- `cookies.py`：处理 B 站抓取时可能需要的 cookie
+### 3. 长度感知路由
 
-### 2. 理解与编排层
+按视频时长自动选择处理策略：
 
-对应 `app/pipeline.py` 和 `app/understand/`，负责把“原始材料”变成“讲义结构”。
+| Profile | 时长 | IR Build | Critic | Reviser |
+|---------|------|----------|--------|---------|
+| tiny | < 3min | 单次调用 | off | off |
+| standard | 3-15min | 单次调用 | full | off |
+| long | 15-60min | Map-Reduce | projected | patch |
+| epic | 60min+ | Map-Reduce | projected | patch |
 
-这一层不是一次性硬拼 prompt，而是包含一组明确的处理阶段：
+### 4. 讲义内 Copilot
 
-- `FrameDescriber`：给关键帧做视觉描述和 OCR
-- `ChapterPlanner`：推断更合理的章节边界
-- `Length-aware routing`：按视频时长选择不同生成策略
-- `LectureIRBuilder`：构建讲义中间表示 `LectureIR`
-- `Critic / Reviser`：对结构化结果做审查与修补
+基于 LangGraph ReAct 的讲义问答 Agent：
+- RAG 混合检索（向量 + FTS5 → RRF 融合）
+- 8 种 Chunk 类型（teaching_note / quote / pitfall / knowledge_unit / frame_ocr / code_block / formula_block / study_question）
+- 锚点验证（自动校验时间戳/帧号/章节号有效性）
+- 回答分段标签（`[[evidence]]` / `[[background]]` / `[[deep_dive]]`）
 
-这里还有一个很重要的现实设计：模型是分栈使用的。
+### 5. MCP Server
 
-- 文本生成与 Copilot：默认走 DeepSeek 兼容接口
-- 视觉理解与 Embedding：默认走 DashScope / Qwen
+通过 MCP 协议暴露 11 个只读工具给外部 Agent（Cursor / Claude Desktop / ChatGPT Apps）：
+- stdio 模式（本地）/ HTTP+SSE 模式（远程）
+- `summarize_video` 默认隐藏，需显式开启
 
-这样做的目的很直接：在成本、速度和视觉质量之间取一个更实用的平衡。
+## 核心架构
 
-### 3. 读者视角与系统视角的双投影
-
-生成出的中间结果不会直接等同于最终 HTML，而是继续被整理成两个方向：
-
-- `Lecture Note IR`
-  - 面向读者
-  - 强调教学单元、阅读顺序、核心结论和讲义组织
-- `Evidence Index`
-  - 面向系统
-  - 强调证据对象、锚点关系、RAG chunk 和可检索结构
-
-这是这个项目和普通“总结网页”最不同的地方：它把“可读”和“可检索”拆开建模了。
-
-### 4. 消费层
-
-最终有 3 类主要消费方式：
-
-- `app/render/`
-  - 把结构化讲义渲染成独立 HTML
-- `app/copilot/`
-  - 提供讲义内 Copilot、RAG 检索和 SSE 接口
-- `app/copilot/mcp_server.py`
-  - 对外提供 MCP Server
-
-### 5. 存储层
-
-对应 `app/storage/`，默认使用本地 SQLite：
-
-- `summaries`：讲义主记录
-- `assets`：字幕、关键帧等资源
-- `jobs`：异步任务状态
-- `lecture_chunks` + `FTS`：Copilot 检索所需 chunk
-
-运行期数据默认都落在本地 `data/` 下，便于自托管和迁移。
-
-## 项目目录
-
-```text
-app/
-  api.py              Web API
-  main.py             FastAPI 入口
-  pipeline.py         端到端处理主链路
-  ingest/             视频抓取、字幕、关键帧、封面
-  understand/         讲义理解、IR 构建、章节规划、视觉理解
-  render/             HTML 渲染
-  copilot/            Copilot、RAG、MCP Server
-  storage/            SQLite 持久化
-scripts/
-  dev_up.ps1/.sh      本地一键启动
-  run_pipeline.py     单条视频命令行处理
-  run_mcp_server.py   MCP Server 启动
-  rerender_reports.py 重新渲染历史讲义
-tests/                单测、烟测、集成验证
-docs/                 部署与设计文档
-data/                 运行期数据目录
 ```
+┌─────────────────────────────────────────────────────────┐
+│                    用户入口                              │
+│  Web UI · API · Copilot SSE · MCP                       │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│              Pipeline 编排层 (app/pipeline.py)           │
+│  8 阶段 · 并发控制 · 进度回调 · 阶段计时 · 容错降级     │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────────┐
+        │                  │                      │
+┌───────▼───────┐ ┌────────▼────────┐ ┌──────────▼──────────┐
+│  Ingest       │ │  Understand     │ │  Render             │
+│  字幕/帧/封面  │ │  IR/Agent/VLM   │ │  HTML + KaTeX       │
+└───────────────┘ └─────────────────┘ └─────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────────┐
+        │                  │                      │
+┌───────▼───────┐ ┌────────▼────────┐ ┌──────────▼──────────┐
+│  Storage      │ │  Copilot        │ │  Runtime Harness    │
+│  SQLite       │ │  Agent/RAG/MCP  │ │  Run/Verdict/Policy │
+└───────────────┘ └─────────────────┘ └─────────────────────┘
+```
+
+### 双投影设计
+
+LectureIR 编译为两个独立投影：
+- **Lecture Note IR**：面向读者（teaching_units / content_blocks / visual_slots）
+- **Evidence Index**：面向系统（evidence_objects / evidence_relations / anchor_map）
+- 两者通过 `note_node_ids` 双向关联
+- HTML 只是投影结果，不是数据源
+
+### Runtime Harness
+
+每次运行都有统一的运行契约：
+
+```
+RunContract（要做什么）
+  + PolicySnapshot（允许什么）
+  = RunRecord（运行记录）
+    ├── artifacts[]（产出物）
+    ├── warnings[]（警告）
+    └── verdict（accept / revise / block + 原因 + 证据引用）
+```
+
+三种 RunType：
+- `lecture_compile`（S1 可写）：Pipeline 完整讲义生成
+- `copilot_answer`（S0 只读）：Copilot 问答
+- `mcp_tool_request`（S0 只读）：MCP 工具调用
+
+### Workplace Harness
+
+仓库即规范——Agent 冷启动只需读根目录入口文件：
+
+| 文件 | 作用 |
+|------|------|
+| `AGENTS.md` | Agent 入口：启动顺序、工作规则、完成定义 |
+| `CLAUDE.md` | Claude Code 入口：项目概述、验证命令、架构约束 |
+| `ARCHITECTURE.md` | 分层依赖方向、禁止的依赖、不变式 |
+| `feature_list.json` | 机器可读功能清单（id / status / verification / evidence） |
+| `claude-progress.md` | 当前进度、活跃任务、阻塞 |
+| `clean-state-checklist.md` | Session 收官检查清单 |
+| `init.ps1` / `init.sh` | 标准化启动脚本（环境检查 + 编译检查 + 基线测试） |
+
+## 容错设计
+
+系统有 10+ 层容错链，设计哲学是"假设 LLM 的每一次输出都可能出问题"：
+
+| 层级 | 容错策略 |
+|------|----------|
+| Ingest | httpx→curl 回退、CC→Whisper 回退、场景检测→均匀采样 |
+| IR Build | 单次截断→Map-Reduce 自动降级、章节失败→placeholder |
+| Agent | StudyQuestion/Critic/Reviser 各自失败→no-op |
+| Reviser | Patch 白名单 + Schema 校验 + 整批回滚 + _restore_dropped_content |
+| Copilot | max_tool_calls 限制、锚点无效→`[⚠ t=MM:SS]` 标记 |
+| Runtime | RunRecord 一致性校验、PolicySnapshot 能力约束 |
+
+## 技术栈
+
+| 层 | 技术 |
+|----|------|
+| 文本生成 + Copilot | DeepSeek V4（OpenAI 兼容） |
+| 视觉理解 | DashScope / Qwen 3.5 Omni Plus |
+| Embedding | DashScope / tongyi-embedding-vision-flash |
+| Agent 框架 | LangGraph（ReAct） |
+| MCP | FastMCP |
+| RAG | sqlite-vec（向量）+ FTS5（全文）→ RRF 融合 |
+| 存储 | SQLite + aiosqlite |
+| Web | FastAPI + Uvicorn |
+| 渲染 | Jinja2 + KaTeX + highlight.js |
+| 关键帧 | PySceneDetect + ffmpeg |
+| 字幕回退 | faster-whisper |
 
 ## 快速开始
 
 ### 环境要求
 
-- Python `3.10` 或 `3.11`
-- `ffmpeg`
-- 默认模型栈所需的 API Key
-  - `DEEPSEEK_API_KEY`
-  - `DASHSCOPE_API_KEY`
-- 可选：Docker `24+`
-- 可选：Node `18+`（主要用于前端语法检查）
+- Python 3.10+
+- ffmpeg
+- API Key：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`
 
-### 1. 准备配置
+### Agent Quick Start
 
-先复制环境变量模板：
+如果你是进入这个仓库的 coding agent：
 
-```powershell
-copy .env.example .env
+```bash
+# 1. 读 AGENTS.md 了解工作规则
+# 2. 读 claude-progress.md 了解当前状态
+# 3. 读 feature_list.json 了解功能清单
+# 4. 运行标准化启动
+./init.sh          # Linux/macOS/WSL
+# 或
+.\init.ps1         # Windows
 ```
 
-或：
+### 本地启动
 
 ```bash
 cp .env.example .env
-```
+# 编辑 .env 填写 API Key
 
-至少建议填写这些项：
+# 方式一：一键启动
+./scripts/dev_up.sh        # Linux/macOS/WSL
+.\scripts\dev_up.ps1       # Windows
 
-```env
-DEEPSEEK_API_KEY=...
-DASHSCOPE_API_KEY=...
-BASIC_AUTH_USER=admin
-BASIC_AUTH_PASSWORD=change-me
-```
-
-常见可选项：
-
-- `BILIBILI_COOKIE_FILE`
-  - 当公开抓取不稳定、需要登录态或需要规避 `403` 时使用
-- `MCP_SERVER_TOKEN`
-  - 只在 MCP 的 `SSE` 模式下需要
-- `DATA_DIR`
-  - 自定义运行数据目录
-
-### 2. 本地启动
-
-Windows PowerShell：
-
-```powershell
-.\scripts\dev_up.ps1
-```
-
-Linux / macOS / WSL：
-
-```bash
-./scripts/dev_up.sh
-```
-
-如果你想手动启动，也可以这样：
-
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
+# 方式二：手动
 pip install -e ".[whisper]"
 python -m scripts.init_db
 python -m app.main
 ```
 
-启动后访问：
+启动后访问 `http://127.0.0.1:8000/`（HTTP Basic Auth 保护）。
 
-```text
-http://127.0.0.1:8000/
-```
-
-首页受 HTTP Basic Auth 保护，使用 `.env` 中的 `BASIC_AUTH_USER` 和 `BASIC_AUTH_PASSWORD` 登录。
-
-### 3. Docker 启动
+### Docker 启动
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-默认会把本地 `./data` 挂进容器内的 `/app/data`，所以讲义、数据库和缓存都会持久化。
+`./data` 挂载进容器，讲义和数据库持久化。健康检查：`GET /healthz`。
 
-健康检查接口：
-
-```text
-GET /healthz
-```
-
-## 怎么用
-
-### Web 界面
-
-最常见的使用方式就是网页入口：
-
-1. 打开首页。
-2. 提交一个 B 站视频链接或 `BV` 号。
-3. 等待后台任务完成。
-4. 打开生成的讲义 HTML。
-5. 在讲义页面内继续用 Copilot 追问。
-
-任务接口的核心入口大致是：
-
-- `POST /api/summarize`
-- `GET /api/jobs/{job_id}`
-- `GET /api/summaries`
-
-### 命令行单独跑一条视频
-
-如果你不想经过网页，可以直接走 CLI：
+### 命令行处理单条视频
 
 ```bash
 python -m scripts.run_pipeline https://www.bilibili.com/video/BVxxxxxxxxxx
-```
-
-强制忽略缓存：
-
-```bash
-python -m scripts.run_pipeline https://www.bilibili.com/video/BVxxxxxxxxxx --force
+python -m scripts.run_pipeline https://www.bilibili.com/video/BVxxxxxxxxxx --force  # 忽略缓存
 ```
 
 ### 启动 MCP Server
 
-本地 `stdio` 模式：
-
 ```bash
-python -m scripts.run_mcp_server
+python -m scripts.run_mcp_server                          # stdio 模式
+python -m scripts.run_mcp_server --sse --port 8111        # HTTP+SSE 模式
 ```
 
-远程 `SSE` 模式：
+## 项目目录
 
-```bash
-python -m scripts.run_mcp_server --sse --host 0.0.0.0 --port 8111
+```
+app/
+  main.py              FastAPI 入口
+  api.py               Web API 路由
+  pipeline.py          端到端编排（8 阶段）
+  config.py            配置中心（200+ 配置项）
+  auth.py              HTTP Basic Auth
+  ingest/              原料采集（bilibili/subtitle/keyframe/cover）
+  understand/          理解层（ir/agents/vlm/compiler/evidence_index）
+  render/              渲染层（HTML + KaTeX）
+  copilot/             消费层（agent/rag/tools/indexer/mcp_server）
+  storage/             存储层（SQLite）
+  runtime/             运行时 Harness（contracts/policy/observe）
+  static/              前端资源（CSS/JS/KaTeX）
+scripts/               CLI 工具（25+ 脚本）
+tests/                 测试套件（28 文件）
+docs/                  设计文档（36+ spec/plan）
 ```
 
-如果使用 `SSE` 模式，请先设置：
+## 配置
 
-```env
-MCP_SERVER_TOKEN=your-token
-```
+所有配置通过 `.env` 加载（见 `.env.example`），核心配置域：
 
-默认 MCP 主要暴露只读检索能力；`summarize_video` 默认不会公开，除非显式打开 `MCP_EXPOSE_SUMMARIZE=true`。
+| 域 | 关键配置 |
+|----|----------|
+| 模型栈 | `DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY` / `QWEN_VL_MODEL` |
+| Agent | `LECTURE_QUESTION_DRIVEN` / `LECTURE_CRITIC_ENABLED` / `LECTURE_REVISER_MODE` |
+| 路由 | `LECTURE_PROFILE_THRESHOLDS_SEC` / `LECTURE_CHAPTER_MAX_DURATION_SEC` |
+| 容错 | `LECTURE_IR_MAX_TOKENS` / `LECTURE_IR_AUTO_FALLBACK_TO_MAP_REDUCE` |
+| VLM | `VLM_TIERING_ENABLED` / `VLM_CACHE_ENABLED` |
+| Copilot | `QWEN_COPILOT_MODEL` / `COPILOT_MAX_TOOL_CALLS` |
+| MCP | `MCP_SERVER_TOKEN` / `MCP_EXPOSE_SUMMARIZE` |
 
-## 输出与数据
-
-项目运行后，核心数据通常会出现在 `data/` 下：
-
-- `data/app.db`
-  - SQLite 主数据库
-- `data/reports/`
-  - 生成后的讲义 HTML
-- `data/keyframes/`
-  - 抽取出的关键帧
-- `data/subtitles/`
-  - 字幕结果
-- `data/audio/`
-  - 中间音频文件
-- `data/debug/`
-  - 调试用 `LectureIR` 导出
-
-这意味着你可以把它理解成一个本地知识仓库，而不只是一次性的“生成页面”。
-
-## 常用维护命令
-
-初始化数据库：
+## 验证
 
 ```bash
-python -m scripts.init_db
-```
+# 标准化启动检查
+./init.sh
 
-重新渲染已有讲义：
-
-```bash
-python -m scripts.rerender_reports
-```
-
-启动 MCP Server：
-
-```bash
-python -m scripts.run_mcp_server
-```
-
-做一轮轻量验证：
-
-```bash
-python -m compileall app tests scripts
+# 单测
 pytest tests/test_smoke.py -v
+
+# Harness 验证
+pytest tests/test_harness_workspace.py -v
+pytest tests/test_runtime_harness.py -v
+
+# Copilot 验证
+pytest tests/test_copilot.py -v
 pytest tests/test_mcp_server.py -v
+
+# 编译检查
+python -m compileall app tests scripts
 ```
 
-如果前端资源有改动，还可以补一条：
+## 输出数据
 
-```bash
-node --check app/static/copilot.js
+```
+data/
+  app.db               SQLite 主数据库
+  reports/             讲义 HTML
+  keyframes/           关键帧
+  subtitles/           字幕
+  audio/               中间音频
+  covers/              封面
+  debug/               LectureIR 导出 + timing.json + RunRecord
+  chapter_cache.sqlite 章节级缓存
+  vlm_cache.sqlite     帧级缓存
 ```
 
-## 当前边界
+## 边界说明
 
-在当前代码形态下，README 里最值得提前说明的边界有 3 个：
-
-- 主要输入源是 B 站视频，不是一个通用视频平台聚合器。
-- 认证目前以 HTTP Basic Auth 为主，更适合内网、自托管或反向代理之后使用。
-- Copilot 与 MCP 的效果依赖本地已处理好的讲义与索引，它不是“拿到任意 URL 就即时联网深度研究”的系统。
-
-## 相关文档
-
-- [README_develop.md](./README_develop.md)：开发补充说明
-- [docs/deploy.md](./docs/deploy.md)：部署说明
+- 主要输入源是 B 站视频，不是通用视频平台聚合器
+- 认证以 HTTP Basic Auth 为主，适合内网/自托管
+- Copilot 依赖已处理好的讲义索引，不是即时联网研究系统
+- 首版 Runtime Harness 用逻辑沙盒（S0/S1），没有进程级隔离
 
 ## License
 

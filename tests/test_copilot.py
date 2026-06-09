@@ -2344,6 +2344,11 @@ class TestRunAgentSse:
             await rag.close()
 
     async def test_done_payload_carries_framing_contract_warnings(self, tmp_path):
+        from app.config import get_settings
+
+        settings = get_settings()
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(settings, "data_dir", tmp_path)
         lec = _attach_note_and_evidence(_lecture_with_taxonomy("BV_SSE_FRAME"))
         ctx, rag = await _build_ctx(tmp_path, [lec])
         try:
@@ -2370,7 +2375,19 @@ class TestRunAgentSse:
             reasons = {w["reason"] for w in payload["warnings"]}
             assert "first_section_not_evidence" in reasons
             assert "evidence_section_starts_with_compatibility_framing" in reasons
+            assert payload["trace_id"].startswith("rt-")
+            assert payload["run_contract"]["run_type"] == "copilot_answer"
+            assert payload["policy_snapshot"]["sandbox_level"] == "S0"
+            assert payload["verdict"]["status"] in {"accept", "revise"}
+            debug_files = sorted((tmp_path / "debug").glob("*.run.json"))
+            assert len(debug_files) == 1
+            record = _json.loads(debug_files[0].read_text(encoding="utf-8"))
+            assert [a["artifact_type"] for a in record["artifacts"]] == [
+                "copilot_answer",
+                "anchor_validation_report",
+            ]
         finally:
+            monkeypatch.undo()
             await rag.close()
 
     async def test_surfaces_internal_error(self, tmp_path):

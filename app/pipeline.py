@@ -21,6 +21,13 @@ from .ingest.cover import CoverCache
 from .ingest.keyframe import KeyframeExtractor
 from .ingest.subtitle import SubtitleExtractor
 from .render.renderer import Renderer
+from .runtime.contracts import RunRecord
+from .runtime.observe import (
+    create_run_record,
+    emit_artifact,
+    issue_verdict,
+    write_run_record,
+)
 from .storage.db import Database
 from .understand.chapter_cache import make_chapter_cache_from_settings
 from .understand.chapter_planner import plan_chapters
@@ -56,6 +63,7 @@ class Pipeline:
         self.last_run_timing: dict[str, Any] = {}
         self.last_run_stats: dict[str, Any] = {}
         self.last_run_rag_task: asyncio.Task[Any] | None = None
+        self.last_run_record: RunRecord | None = None
 
     async def run(
         self,
@@ -82,12 +90,25 @@ class Pipeline:
         self.last_run_timing = timing
         self.last_run_stats = {}
         self.last_run_rag_task = None
+        self.last_run_record = None
 
         # --- 1. metadata ---
         await _progress(5, "fetching metadata")
         t_meta = time.perf_counter()
         meta: VideoMeta = await self.bili.fetch_meta(url)
         timing["metadata_sec"] = round(time.perf_counter() - t_meta, 3)
+        record = create_run_record(
+            run_type="lecture_compile",
+            entrypoint="pipeline",
+            target_ref=meta.bv_id,
+            expected_artifacts=["lecture_ir", "report_html", "timing_record"],
+            expected_profile=None,
+            writeback_allowed=True,
+            minimum_acceptance=["report_rendered", "summary_persisted"],
+        )
+        timing["trace_id"] = record.trace_id
+        timing["run_contract"] = record.run_contract
+        timing["policy_snapshot"] = record.policy_snapshot
 
         # cache check
         if not force_refresh:
@@ -96,6 +117,23 @@ class Pipeline:
                 report_path = self.settings.data_dir / existing.report_path
                 if report_path.exists():
                     timing["cache_hit"] = True
+                    emit_artifact(
+                        record,
+                        artifact_type="report_html",
+                        path_or_ref=str(report_path),
+                        producer="renderer",
+                    )
+                    record.verdict = issue_verdict(
+                        status="accept",
+                        reasons=["cache_hit"],
+                        warnings=[],
+                        next_actions=[],
+                        evidence_refs=[str(report_path)],
+                    )
+                    record.status = "finished"
+                    timing["verdict"] = record.verdict
+                    self.last_run_record = record
+                    write_run_record(record, self.settings.data_dir / "debug")
                     await _progress(100, "cache hit")
                     return report_path
 
@@ -180,6 +218,7 @@ class Pipeline:
             "study_question_mode": profile.study_question_mode,
             "chapter_planner_mode": profile.chapter_planner_mode,
         }
+        record.run_contract.expected_profile = profile.name
 
         # Chapter planner — always runs (per spec) but the profile picks
         # `hint` vs `structural` which only differs in how the anchors
@@ -242,7 +281,13 @@ class Pipeline:
                 )
             else:
                 lecture_ir, stats = await self.ir_builder.build(ctx)
-            self._dump_ir(meta.bv_id, lecture_ir.model_dump(mode="json"))
+            debug_ir_path = self._dump_ir(meta.bv_id, lecture_ir.model_dump(mode="json"))
+            emit_artifact(
+                record,
+                artifact_type="lecture_ir",
+                path_or_ref=str(debug_ir_path),
+                producer="ir_builder",
+            )
             lecture = lecture_ir_to_lecture_json(lecture_ir)
             transcript = " ".join(s.text for s in sub_result.segments)
             marked = lecture.mark_unverified_points(transcript)
@@ -318,6 +363,12 @@ class Pipeline:
         css_inline = self.renderer.load_inline_css()
         report_path = self.renderer.render_lecture(lecture, css_inline, cover_path=cover_path)
         timing["render_sec"] = round(time.perf_counter() - t_render, 3)
+        emit_artifact(
+            record,
+            artifact_type="report_html",
+            path_or_ref=str(report_path),
+            producer="renderer",
+        )
 
         # --- 7. persist ---
         t_persist = time.perf_counter()
@@ -378,10 +429,22 @@ class Pipeline:
             self.last_run_rag_task = asyncio.create_task(_bg_rag())
 
         await _progress(100, "done")
+        record.verdict = issue_verdict(
+            status="revise" if lecture.generation_mode == "v1_fallback" else "accept",
+            reasons=["report_rendered", "summary_persisted"],
+            warnings=["used_v1_fallback"] if lecture.generation_mode == "v1_fallback" else [],
+            next_actions=[] if wait_rag else ["check_background_rag_index"],
+            evidence_refs=[str(report_path)],
+        )
+        record.status = "finished"
+        timing["verdict"] = record.verdict
+        self.last_run_record = record
+        write_run_record(record, self.settings.data_dir / "debug")
         return report_path
 
-    def _dump_ir(self, bv_id: str, data: dict) -> None:
+    def _dump_ir(self, bv_id: str, data: dict) -> Path:
         debug_dir = self.settings.data_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         path = debug_dir / f"{bv_id}.lecture_ir.json"
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path

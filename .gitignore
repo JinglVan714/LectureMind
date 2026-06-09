@@ -51,6 +51,10 @@ README_develop.md
 /docs/*
 !/docs/deploy.md
 
+# Internship writeups
+!/Internship/
+!/Internship/**
+
 .vscode/
 .idea/
 .history/
@@ -59,6 +63,12 @@ README_develop.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Learning / reference materials (not part of the project)
+learn-harness-engineering/
+learn-harness-engineering-main.zip
+带教文档/
+Harness带教文档/
 
 # Build artefacts
 dist/

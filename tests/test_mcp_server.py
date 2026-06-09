@@ -16,7 +16,7 @@ from fastmcp import Client
 
 from app.copilot.mcp_server import build_mcp
 from app.copilot.rag import RAGStore
-from app.copilot.tools import ToolContext
+from app.copilot.tools import TOOL_RUNTIME_METADATA, ToolContext
 from app.storage.db import Database
 from tests.test_copilot import (  # noqa: E402  reuse helpers
     _attach_note_and_evidence,
@@ -56,6 +56,14 @@ async def _seed_ctx(tmp_path: Path, lectures, rows_meta=None) -> tuple[ToolConte
 
 
 class TestMcpServerShape:
+    def test_tool_runtime_metadata_registry_marks_read_and_write_tools(self):
+        assert TOOL_RUNTIME_METADATA["search_lectures"]["access"] == "read"
+        assert TOOL_RUNTIME_METADATA["search_evidence"]["access"] == "read"
+        assert TOOL_RUNTIME_METADATA["get_note_unit"]["access"] == "read"
+        assert TOOL_RUNTIME_METADATA["get_evidence_object"]["access"] == "read"
+        assert TOOL_RUNTIME_METADATA["summarize_video"]["access"] == "write"
+        assert "mcp" in TOOL_RUNTIME_METADATA["search_lectures"]["entrypoints"]
+
     async def test_default_tool_listing_has_note_and_evidence_tools(self, tmp_path):
         ctx, rag = await _seed_ctx(tmp_path, [_make_lecture("BV_MCP1")])
         try:
@@ -103,6 +111,28 @@ class TestMcpServerShape:
 
 
 class TestMcpToolCalls:
+    async def test_mcp_tool_request_writes_runtime_debug_record(self, tmp_path, monkeypatch):
+        from app.config import get_settings
+
+        ctx, rag = await _seed_ctx(tmp_path, [_make_lecture("BV_DEBUG_MCP")])
+        try:
+            monkeypatch.setattr(get_settings(), "data_dir", tmp_path)
+            mcp = build_mcp(ctx)
+            async with Client(mcp) as client:
+                result = await client.call_tool("list_lectures", {"limit": 5})
+            assert result.is_error is False
+
+            debug_dir = tmp_path / "debug"
+            records = sorted(debug_dir.glob("*.run.json"))
+            assert records
+
+            payload = json.loads(records[-1].read_text(encoding="utf-8"))
+            assert payload["run_type"] == "mcp_tool_request"
+            assert payload["entrypoint"] == "mcp"
+            assert payload["verdict"]["status"] == "accept"
+        finally:
+            await rag.close()
+
     async def test_list_lectures_returns_metadata(self, tmp_path):
         ctx, rag = await _seed_ctx(
             tmp_path,

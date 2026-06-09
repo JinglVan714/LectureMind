@@ -3,9 +3,11 @@ LLM API keys: BV parsing, schema validation, quote verification, renderer.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -323,6 +325,121 @@ def _write_sample_frames() -> None:
         frame_path = Path(os.environ["DATA_DIR"]) / "keyframes" / "BV1xx411c7mD" / name
         frame_path.parent.mkdir(parents=True, exist_ok=True)
         frame_path.write_bytes(b"fake-jpeg")
+
+
+def test_pipeline_timing_exposes_runtime_harness_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from app.ingest.bilibili import VideoMeta
+    from app.ingest.keyframe import Keyframe
+    from app.ingest.subtitle import SubtitleResult, SubtitleSegment
+    from app.pipeline import Pipeline
+    from app.storage.db import Database
+    from app.understand.vlm import FrameDescription
+    import app.pipeline as pipeline_module
+
+    async def _run() -> Pipeline:
+        db = Database(tmp_path / "smoke.sqlite3")
+        await db.init()
+        pipeline = Pipeline(db)
+        pipeline.settings.data_dir = tmp_path
+        pipeline.settings.pipeline_wait_rag = True
+
+        bv_id = "BV1xx411c7mD"
+        frame_path = tmp_path / "keyframes" / bv_id / "00050.jpg"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_bytes(b"fake-jpeg")
+        subtitle_path = tmp_path / "subtitles" / f"{bv_id}.json"
+        subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+        subtitle_path.write_text("{}", encoding="utf-8")
+        cover_path = tmp_path / "covers" / f"{bv_id}.jpg"
+        cover_path.parent.mkdir(parents=True, exist_ok=True)
+        cover_path.write_bytes(b"fake-cover")
+
+        async def _fetch_meta(_url: str) -> VideoMeta:
+            return VideoMeta(
+                bv_id=bv_id,
+                aid=1,
+                title="runtime harness smoke",
+                author="test-up",
+                duration=600,
+                cover_url="https://example.com/cover.jpg",
+                description="",
+                pages=[{"cid": 10}],
+            )
+
+        async def _extract_subtitle(_bv_id: str, _aid: int, _cid: int) -> SubtitleResult:
+            return SubtitleResult(
+                source="cc",
+                language="zh-CN",
+                segments=[SubtitleSegment(start=0.0, end=2.0, text="hello runtime harness")],
+                raw_path=subtitle_path,
+            )
+
+        async def _extract_keyframes(_bv_id: str, _duration: int) -> list[Keyframe]:
+            return [Keyframe(timestamp=50.0, path=frame_path)]
+
+        async def _fetch_cover(_bv_id: str, _cover_url: str) -> Path:
+            return cover_path
+
+        async def _describe_all(_frames: list[Keyframe]) -> list[FrameDescription]:
+            return [
+                FrameDescription(
+                    timestamp=50.0,
+                    path=frame_path,
+                    caption="board",
+                    ocr_text="runtime harness",
+                    visual_type="diagram",
+                    importance_score=0.9,
+                )
+            ]
+
+        async def _build_with_agents(_ctx, profile=None, chapter_plan=None, chapter_cache=None):
+            return _sample_ir(), {"model": "stub-model", "tokens": {"total_tokens": 7}}
+
+        def _render_lecture(lecture, css_inline: str, cover_path: Path | None = None) -> Path:
+            report_path = tmp_path / "reports" / f"{lecture.bv_id}.html"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text("<html>ok</html>", encoding="utf-8")
+            return report_path
+
+        async def _index_lecture(_rag, _bv_id: str, _lecture, _lecture_ir) -> int:
+            return 1
+
+        monkeypatch.setattr(pipeline.bili, "fetch_meta", _fetch_meta)
+        monkeypatch.setattr(pipeline.subtitles, "extract", _extract_subtitle)
+        monkeypatch.setattr(pipeline.keyframes, "extract", _extract_keyframes)
+        monkeypatch.setattr(pipeline.covers, "fetch", _fetch_cover)
+        monkeypatch.setattr(pipeline.vlm, "describe_all", _describe_all)
+        monkeypatch.setattr(pipeline.ir_builder, "build_with_agents", _build_with_agents)
+        monkeypatch.setattr(pipeline.renderer, "load_inline_css", lambda: "body{}")
+        monkeypatch.setattr(pipeline.renderer, "render_lecture", _render_lecture)
+        monkeypatch.setattr(
+            pipeline_module,
+            "select_profile",
+            lambda duration, settings: SimpleNamespace(
+                name="smoke",
+                duration_sec=float(duration),
+                use_chapter_planner=False,
+                use_map_reduce=False,
+                use_chapter_cache=False,
+                critic_mode="off",
+                reviser_mode="off",
+                study_question_mode="off",
+                chapter_planner_mode="off",
+            ),
+        )
+        monkeypatch.setattr(pipeline_module, "index_lecture", _index_lecture)
+
+        report_path = await pipeline.run(f"https://www.bilibili.com/video/{bv_id}", force_refresh=True)
+        assert report_path.exists()
+        return pipeline
+
+    pipeline = asyncio.run(_run())
+
+    assert pipeline.last_run_timing["trace_id"].startswith("rt-")
+    assert pipeline.last_run_timing["run_contract"].run_type == "lecture_compile"
+    assert pipeline.last_run_timing["policy_snapshot"].sandbox_level == "S1"
+    assert pipeline.last_run_timing["verdict"].status in {"accept", "revise"}
+    assert pipeline.last_run_record is not None
 
 
 class TestSchema:
