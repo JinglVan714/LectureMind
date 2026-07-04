@@ -9,6 +9,7 @@ This repository expects a coding agent to cold-start from a small, stable entry 
 3. Run `init.ps1` on Windows or `init.sh` on Linux/macOS/WSL.
 4. If `feature_list.json` contains one `in_progress` item, pick that single active task. If none are active, choose the highest-priority non-passing item or stop and ask for the next task.
 5. Work only within the chosen task until it is verified, explicitly marked blocked, or deliberately handed off.
+6. For evidence-grounded media skill tasks, read `skill-harness.md` after the active task is selected.
 
 ## Working Rules
 
@@ -19,6 +20,7 @@ This repository expects a coding agent to cold-start from a small, stable entry 
 - Use deeper docs only when the entry layer is insufficient:
   - `CLAUDE.md` for quick project pointers
   - `ARCHITECTURE.md` for stable boundaries and invariants
+  - `skill-harness.md` for media skill planning, implementation, artifact, and demo work
 
 ## Validation
 

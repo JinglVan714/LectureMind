@@ -5,6 +5,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+$tmpRoot = Join-Path $root ".tmp\pytest"
+New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
+$env:TEMP = $tmpRoot
+$env:TMP = $tmpRoot
+
 function Resolve-Python {
     $candidates = @()
     if (Get-Command python -ErrorAction SilentlyContinue) {
@@ -36,6 +41,7 @@ $python = Resolve-Python
 
 Write-Host "==> LectureMind agent init" -ForegroundColor Cyan
 Write-Host "==> repo root: $root" -ForegroundColor DarkGray
+Write-Host "==> temp root: $tmpRoot" -ForegroundColor DarkGray
 Write-Host "==> python executable: $python" -ForegroundColor DarkGray
 Write-Host "==> python version: $(& $python --version)" -ForegroundColor DarkGray
 
@@ -61,6 +67,12 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "==> python -m pytest tests/test_harness_workspace.py -q" -ForegroundColor Cyan
 & $python -m pytest tests/test_harness_workspace.py -q
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+Write-Host "==> python -m pytest tests/test_skill_harness.py -q" -ForegroundColor Cyan
+& $python -m pytest tests/test_skill_harness.py -q
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
