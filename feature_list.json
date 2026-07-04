@@ -1,6 +1,6 @@
 {
   "project": "LectureMind",
-  "last_updated": "2026-06-09",
+  "last_updated": "2026-07-04",
   "rules": {
     "single_active_feature": true,
     "passing_requires_evidence": true,
@@ -14,8 +14,27 @@
   },
   "features": [
     {
-      "id": "harness-001",
+      "id": "skill-001",
       "priority": 1,
+      "area": "skill",
+      "title": "Evidence-grounded media understanding skill design",
+      "user_visible_behavior": "The project has a replacement specification that reframes LectureMind as an evidence-grounded, agent-callable media understanding skill while preserving existing IR, evidence, MCP, and runtime harness boundaries.",
+      "status": "passing",
+      "verification": [
+        "New spec self-check completed in docs/superpowers/specs/2026-07-04-evidence-grounded-media-understanding-skill-design.md",
+        "powershell -ExecutionPolicy Bypass -File .\\init.ps1 with TEMP/TMP redirected to .tmp\\pytest"
+      ],
+      "evidence": [
+        "2026-07-04: Created docs/superpowers/specs/2026-07-04-evidence-grounded-media-understanding-skill-design.md.",
+        "2026-07-04: Marked docs/superpowers/specs/2026-07-04-media-understanding-skill-suite-design.md as a superseded historical draft.",
+        "2026-07-04: init.ps1 initially hit PermissionError under the default Windows Temp path; rerun with TEMP/TMP=.tmp\\pytest passed compileall, tests/test_harness_workspace.py 10 passed, and tests/test_smoke.py 107 passed.",
+        "2026-07-04: ffmpeg and yt-dlp still not found on PATH and are recorded as real-video readiness risks."
+      ],
+      "notes": "Design-only task. Next implementation should start with the skill skeleton and artifact schema, not backend expansion or new scene modes."
+    },
+    {
+      "id": "harness-001",
+      "priority": 2,
       "area": "harness",
       "title": "Agent workspace harness entry layer",
       "user_visible_behavior": "A new coding agent can cold-start from root entry files, run the standard init command, and understand the active task without reading long handoff notes first.",
@@ -36,7 +55,7 @@
     },
     {
       "id": "harness-002",
-      "priority": 2,
+      "priority": 3,
       "area": "harness",
       "title": "Workspace state source files",
       "user_visible_behavior": "The repo exposes a machine-readable feature list and a lightweight progress file so one active task is unambiguous.",
@@ -52,7 +71,7 @@
     },
     {
       "id": "harness-003",
-      "priority": 3,
+      "priority": 4,
       "area": "harness",
       "title": "Agent startup scripts",
       "user_visible_behavior": "The repo offers init.ps1 and init.sh for startup checks and smoke validation without booting the web server.",
@@ -71,7 +90,7 @@
     },
     {
       "id": "harness-004",
-      "priority": 4,
+      "priority": 5,
       "area": "harness",
       "title": "Runtime harness unified shell v1",
       "user_visible_behavior": "Lecture compile, copilot answer, and MCP tool request runs emit a shared runtime envelope with trace_id, run_contract, policy_snapshot, artifacts, and verdict without rewriting the existing business pipelines.",

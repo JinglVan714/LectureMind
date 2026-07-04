@@ -8,12 +8,14 @@
 - `D:\anaconda\envs\myagent\python.exe -m pytest tests/test_harness_workspace.py -v` 已通过 10/10。
 - `powershell -ExecutionPolicy Bypass -File .\init.ps1` 已通过：`compileall` 通过，`tests/test_harness_workspace.py` 10 passed，`tests/test_smoke.py` 107 passed。
 - `wsl.exe bash -lc 'cd /mnt/d/Diet_Agent_NEW && ./init.sh'` 已通过：`compileall` 通过，`tests/test_harness_workspace.py` 10 passed，`tests/test_smoke.py` 106 passed。
+- 2026-07-04：默认 Windows Temp 路径权限异常会导致 `init.ps1` 内的 pytest `tmp_path` fixture 报 `PermissionError`；将 `TEMP`/`TMP` 指向仓库内 `.tmp/pytest` 后，`powershell -ExecutionPolicy Bypass -File .\init.ps1` 已通过：`compileall` 通过，`tests/test_harness_workspace.py` 10 passed，`tests/test_smoke.py` 107 passed。仍警告 `ffmpeg` 与 `yt-dlp` 不在 PATH。
 
 ## 当前唯一 Active Task
 - No active implementation task. `harness-004` 已完成验证并进入可交接状态。
 - Git 安全基线：当前执行分支为 `runtime-harness-v1`；最近可回到的 2026-05-14 前基线已标记为 `runtime-baseline-pre-2026-05-14` -> `aab3437`（仓库内无 2026-05-14 提交）。
 
 ## 最近完成
+- 新增 evidence-grounded media understanding skill 替代规格：`docs/superpowers/specs/2026-07-04-evidence-grounded-media-understanding-skill-design.md`；旧 `docs/superpowers/specs/2026-07-04-media-understanding-skill-suite-design.md` 已标记为 historical draft。
 - 新增 runtime harness 设计规格：`docs/superpowers/specs/2026-06-09-lecturemind-runtime-harness-design-v2.md`
 - 新增 runtime harness 实现计划：`docs/superpowers/plans/2026-06-09-lecturemind-runtime-harness-implementation-plan.md`
 - 新增 `app/runtime/` 最小壳层：`contracts.py`、`policy.py`、`observe.py`
