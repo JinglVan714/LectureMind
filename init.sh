@@ -4,11 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-mkdir -p "$ROOT/.tmp/pytest"
-export TMPDIR="$ROOT/.tmp/pytest"
-export TEMP="$TMPDIR"
-export TMP="$TMPDIR"
-
 PYTHON_BIN=""
 for candidate in python python3 /mnt/d/anaconda/envs/myagent/python.exe; do
   if command -v "$candidate" >/dev/null 2>&1; then
@@ -31,7 +26,6 @@ fi
 
 echo "==> LectureMind agent init"
 echo "==> repo root: $ROOT"
-echo "==> temp root: $TMPDIR"
 echo "==> python executable: $PYTHON_BIN"
 echo "==> python version: $("$PYTHON_BIN" --version 2>&1)"
 
@@ -52,9 +46,6 @@ echo "==> python -m compileall app tests scripts"
 
 echo "==> python -m pytest tests/test_harness_workspace.py -q"
 "$PYTHON_BIN" -m pytest tests/test_harness_workspace.py -q
-
-echo "==> python -m pytest tests/test_skill_harness.py -q"
-"$PYTHON_BIN" -m pytest tests/test_skill_harness.py -q
 
 echo "==> python -m pytest tests/test_smoke.py -q"
 "$PYTHON_BIN" -m pytest tests/test_smoke.py -q

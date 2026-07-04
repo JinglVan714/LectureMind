@@ -14,30 +14,8 @@
   },
   "features": [
     {
-      "id": "skill-harness-001",
-      "priority": 1,
-      "area": "harness",
-      "title": "Media skill development harness",
-      "user_visible_behavior": "A future agent can start evidence-grounded media skill planning or implementation from a dedicated harness with scope gates, progress state, handoff prompt, and validation commands.",
-      "status": "passing",
-      "verification": [
-        "D:\\anaconda\\envs\\myagent\\python.exe -m pytest tests/test_skill_harness.py -q",
-        "powershell -ExecutionPolicy Bypass -File .\\scripts\\skill_harness_init.ps1",
-        "powershell -ExecutionPolicy Bypass -File .\\init.ps1"
-      ],
-      "evidence": [
-        "2026-07-04: Added skill-harness.md, skill-progress.md, and skill-session-handoff.md for evidence-grounded media skill work.",
-        "2026-07-04: Added scripts/skill_harness_check.py plus Windows and shell initializers that compose the root init path with skill harness validation.",
-        "2026-07-04: Updated init.ps1 and init.sh to use repository-local .tmp/pytest temp storage and run tests/test_skill_harness.py.",
-        "2026-07-04: D:\\anaconda\\envs\\myagent\\python.exe -m pytest tests/test_skill_harness.py -q -> 4 passed.",
-        "2026-07-04: powershell -ExecutionPolicy Bypass -File .\\scripts\\skill_harness_init.ps1 -> compileall passed; tests/test_harness_workspace.py 10 passed; tests/test_skill_harness.py 4 passed; tests/test_smoke.py 107 passed; skill_harness_check.py passed with expected media-understanding/ not-yet-created warning.",
-        "2026-07-04: powershell -ExecutionPolicy Bypass -File .\\init.ps1 -> compileall passed; tests/test_harness_workspace.py 10 passed; tests/test_skill_harness.py 4 passed; tests/test_smoke.py 107 passed."
-      ],
-      "notes": "This is a development harness only. The next task should be a Phase 1 plan for the media-understanding skill skeleton and artifact schema."
-    },
-    {
       "id": "skill-001",
-      "priority": 2,
+      "priority": 1,
       "area": "skill",
       "title": "Evidence-grounded media understanding skill design",
       "user_visible_behavior": "The project has a replacement specification that reframes LectureMind as an evidence-grounded, agent-callable media understanding skill while preserving existing IR, evidence, MCP, and runtime harness boundaries.",
@@ -56,7 +34,7 @@
     },
     {
       "id": "harness-001",
-      "priority": 3,
+      "priority": 2,
       "area": "harness",
       "title": "Agent workspace harness entry layer",
       "user_visible_behavior": "A new coding agent can cold-start from root entry files, run the standard init command, and understand the active task without reading long handoff notes first.",
@@ -77,7 +55,7 @@
     },
     {
       "id": "harness-002",
-      "priority": 4,
+      "priority": 3,
       "area": "harness",
       "title": "Workspace state source files",
       "user_visible_behavior": "The repo exposes a machine-readable feature list and a lightweight progress file so one active task is unambiguous.",
@@ -93,7 +71,7 @@
     },
     {
       "id": "harness-003",
-      "priority": 5,
+      "priority": 4,
       "area": "harness",
       "title": "Agent startup scripts",
       "user_visible_behavior": "The repo offers init.ps1 and init.sh for startup checks and smoke validation without booting the web server.",
@@ -112,7 +90,7 @@
     },
     {
       "id": "harness-004",
-      "priority": 6,
+      "priority": 5,
       "area": "harness",
       "title": "Runtime harness unified shell v1",
       "user_visible_behavior": "Lecture compile, copilot answer, and MCP tool request runs emit a shared runtime envelope with trace_id, run_contract, policy_snapshot, artifacts, and verdict without rewriting the existing business pipelines.",
