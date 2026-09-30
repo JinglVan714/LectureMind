@@ -51,9 +51,12 @@ README_develop.md
 /docs/*
 !/docs/deploy.md
 
-# Internship writeups
-!/Internship/
-!/Internship/**
+# Internship writeups（个人求职材料，不公开）
+Internship/
+
+# Dev-only
+claude-progress.md
+feature_list.json
 
 .vscode/
 .idea/
