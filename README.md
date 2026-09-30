@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](./pyproject.toml)
 [![Tests](https://img.shields.io/badge/tests-28_files-green)](#工程质量)
-[![Stars](https://img.shields.io/github/stars/2772658778-ctrl/LectureMind)](#)
+[![Stars](https://img.shields.io/github/stars/JinglVan714/LectureMind)](#)
 
 ---
 
