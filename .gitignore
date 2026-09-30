@@ -50,6 +50,8 @@ README_develop.md
 /scripts/_verify_*.py
 /docs/*
 !/docs/deploy.md
+!/docs/cover.png
+!/docs/copilot.png
 
 # Internship writeups（个人求职材料，不公开）
 Internship/
