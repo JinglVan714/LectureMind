@@ -38,6 +38,12 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.auth import require_auth
 from app.config import get_settings
+from app.runtime.observe import (
+    create_run_record,
+    emit_artifact,
+    issue_verdict,
+    write_run_record,
+)
 from app.storage.db import Database
 
 from . import agent as agent_mod
@@ -369,6 +375,15 @@ async def run_agent_sse(
     a stub ``graph`` directly and so Stage 7's MCP server can reuse the
     same stream-to-event transformation if we ever need an HTTP bridge.
     """
+    record = create_run_record(
+        run_type="copilot_answer",
+        entrypoint="copilot_sse",
+        target_ref=bv,
+        expected_artifacts=["copilot_answer", "anchor_validation_report"],
+        expected_profile=None,
+        writeback_allowed=False,
+        minimum_acceptance=["answer_emitted"],
+    )
     full_text: list[str] = []
     try:
         async for ev in graph.astream_events(state, version="v2"):
@@ -408,6 +423,12 @@ async def run_agent_sse(
         return
 
     answer = "".join(full_text)
+    emit_artifact(
+        record,
+        artifact_type="copilot_answer",
+        path_or_ref=f"copilot://{bv}/answer",
+        producer="copilot_sse",
+    )
     try:
         patched, warnings = await agent_mod.validate_anchors(
             answer, bv, ctx.db, ctx.rag
@@ -415,6 +436,25 @@ async def run_agent_sse(
     except Exception as exc:  # noqa: BLE001
         logger.warning("validate_anchors failed for bv=%s: %s", bv, exc)
         patched, warnings = answer, []
+    emit_artifact(
+        record,
+        artifact_type="anchor_validation_report",
+        path_or_ref=f"copilot://{bv}/anchor_validation",
+        producer="copilot_sse",
+    )
+    record.warnings = [str(w.get("reason") or w.get("kind") or "warning") for w in warnings]
+    record.verdict = issue_verdict(
+        status="revise" if warnings else "accept",
+        reasons=["answer_emitted"],
+        warnings=record.warnings,
+        next_actions=["repair_anchors"] if warnings else [],
+        evidence_refs=["anchor_validation_report"],
+    )
+    record.status = "finished"
+    try:
+        write_run_record(record, get_settings().data_dir / "debug")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("write_run_record failed for bv=%s: %s", bv, exc)
 
     done_context = await _done_context_payload(ctx, bv)
     yield _sse_frame(
@@ -423,6 +463,10 @@ async def run_agent_sse(
             "anchors_validated": True,
             "warnings": warnings,
             "patched_answer": patched if patched != answer else None,
+            "trace_id": record.trace_id,
+            "run_contract": record.run_contract.model_dump(mode="json"),
+            "policy_snapshot": record.policy_snapshot.model_dump(mode="json"),
+            "verdict": record.verdict.model_dump(mode="json"),
             **done_context,
         },
     )

@@ -106,6 +106,82 @@ class ToolContext:
     pipeline: "Pipeline | None" = None
 
 
+TOOL_RUNTIME_METADATA: dict[str, dict[str, Any]] = {
+    "search_lectures": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "medium",
+        "access": "read",
+    },
+    "search_evidence": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "medium",
+        "access": "read",
+    },
+    "get_note_unit": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "get_evidence_object": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "get_chapter": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "get_frame": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "get_quote_context": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "medium",
+        "access": "read",
+    },
+    "explain_frame": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "medium",
+        "access": "read",
+    },
+    "get_knowledge_units": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "get_frame_description": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "list_lectures": {
+        "entrypoints": ["copilot", "mcp"],
+        "risk": "low",
+        "cost": "low",
+        "access": "read",
+    },
+    "summarize_video": {
+        "entrypoints": ["mcp"],
+        "risk": "high",
+        "cost": "high",
+        "access": "write",
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Input / Output models (Pydantic)
 # ---------------------------------------------------------------------------

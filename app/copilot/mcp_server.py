@@ -37,6 +37,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from app.config import get_settings
+from app.runtime.observe import create_run_record, emit_artifact, issue_verdict, write_run_record
 from app.storage.db import Database
 
 from . import tools as tool_registry
@@ -114,6 +115,14 @@ def _dump(obj: Any) -> dict[str, Any]:
     raise TypeError(f"cannot serialise {type(obj).__name__} for MCP")
 
 
+def _target_ref(tool_name: str, kwargs: dict[str, Any]) -> str:
+    for key in ("bv", "url", "query", "unit_id", "evidence_id", "frame_id", "chapter_idx"):
+        value = kwargs.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return tool_name
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -181,6 +190,63 @@ def build_mcp(
             )
         return c
 
+    async def _run_tool(tool_name: str, fn: Any, **kwargs: Any) -> dict[str, Any]:
+        record = create_run_record(
+            run_type="mcp_tool_request",
+            entrypoint="mcp",
+            target_ref=_target_ref(tool_name, kwargs),
+            expected_artifacts=["mcp_result"],
+            expected_profile=None,
+            writeback_allowed=False,
+            minimum_acceptance=["tool_schema_returned"],
+        )
+        try:
+            out = await fn(_ctx(), **kwargs)
+            payload = _dump(out)
+            emit_artifact(
+                record,
+                artifact_type="mcp_result",
+                path_or_ref=f"mcp://{tool_name}/response",
+                producer=tool_name,
+            )
+            record.verdict = issue_verdict(
+                status="accept",
+                reasons=["tool_schema_returned"],
+                warnings=[],
+                next_actions=[],
+                evidence_refs=[f"mcp://{tool_name}/response"],
+            )
+            record.status = "finished"
+            return payload
+        except ToolError as exc:
+            record.verdict = issue_verdict(
+                status="block",
+                reasons=[f"{exc.code}: {exc.message}"],
+                warnings=[],
+                next_actions=[],
+                evidence_refs=[],
+            )
+            record.status = "blocked"
+            _handle_tool_error(exc)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            record.verdict = issue_verdict(
+                status="block",
+                reasons=[type(exc).__name__],
+                warnings=[],
+                next_actions=[],
+                evidence_refs=[],
+            )
+            record.status = "blocked"
+            raise
+        finally:
+            try:
+                write_run_record(record, get_settings().data_dir / "debug")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "write_run_record failed for mcp tool=%s: %s", tool_name, exc
+                )
+
     # ---- Tool wrappers ---------------------------------------------------
 
     @mcp.tool(
@@ -193,13 +259,14 @@ def build_mcp(
         domain: str | None = None,
         direction: str | None = None,
     ) -> dict[str, Any]:
-        try:
-            out = await tool_registry.search_lectures(
-                _ctx(), query=query, top_k=top_k, domain=domain, direction=direction
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "search_lectures",
+            tool_registry.search_lectures,
+            query=query,
+            top_k=top_k,
+            domain=domain,
+            direction=direction,
+        )
 
     @mcp.tool(
         name="search_evidence",
@@ -210,72 +277,59 @@ def build_mcp(
         query: str,
         top_k: int = 5,
     ) -> dict[str, Any]:
-        try:
-            out = await tool_registry.search_evidence(
-                _ctx(), bv=bv, query=query, top_k=top_k
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "search_evidence",
+            tool_registry.search_evidence,
+            bv=bv,
+            query=query,
+            top_k=top_k,
+        )
 
     @mcp.tool(
         name="get_note_unit",
         description=_describe(tool_registry.get_note_unit),
     )
     async def get_note_unit(bv: str, unit_id: str) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_note_unit(_ctx(), bv=bv, unit_id=unit_id)
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_note_unit", tool_registry.get_note_unit, bv=bv, unit_id=unit_id
+        )
 
     @mcp.tool(
         name="get_evidence_object",
         description=_describe(tool_registry.get_evidence_object),
     )
     async def get_evidence_object(bv: str, evidence_id: str) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_evidence_object(
-                _ctx(), bv=bv, evidence_id=evidence_id
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_evidence_object",
+            tool_registry.get_evidence_object,
+            bv=bv,
+            evidence_id=evidence_id,
+        )
 
     @mcp.tool(
         name="get_chapter",
         description=_describe(tool_registry.get_chapter),
     )
     async def get_chapter(bv: str, chapter_idx: int) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_chapter(
-                _ctx(), bv=bv, chapter_idx=chapter_idx
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_chapter", tool_registry.get_chapter, bv=bv, chapter_idx=chapter_idx
+        )
 
     @mcp.tool(
         name="get_frame",
         description=_describe(tool_registry.get_frame),
     )
     async def get_frame(bv: str, frame_id: int) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_frame(_ctx(), bv=bv, frame_id=frame_id)
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool("get_frame", tool_registry.get_frame, bv=bv, frame_id=frame_id)
 
     @mcp.tool(
         name="get_quote_context",
         description=_describe(tool_registry.get_quote_context),
     )
     async def get_quote_context(bv: str, quote: str) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_quote_context(_ctx(), bv=bv, quote=quote)
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_quote_context", tool_registry.get_quote_context, bv=bv, quote=quote
+        )
 
     @mcp.tool(
         name="explain_frame",
@@ -284,16 +338,13 @@ def build_mcp(
     async def explain_frame(
         bv: str, frame_id: int, context_radius_seconds: int = 60
     ) -> dict[str, Any]:
-        try:
-            out = await tool_registry.explain_frame(
-                _ctx(),
-                bv=bv,
-                frame_id=frame_id,
-                context_radius_seconds=context_radius_seconds,
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "explain_frame",
+            tool_registry.explain_frame,
+            bv=bv,
+            frame_id=frame_id,
+            context_radius_seconds=context_radius_seconds,
+        )
 
     @mcp.tool(
         name="get_knowledge_units",
@@ -302,24 +353,21 @@ def build_mcp(
     async def get_knowledge_units(
         bv: str, kind: str | None = None
     ) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_knowledge_units(_ctx(), bv=bv, kind=kind)
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_knowledge_units", tool_registry.get_knowledge_units, bv=bv, kind=kind
+        )
 
     @mcp.tool(
         name="get_frame_description",
         description=_describe(tool_registry.get_frame_description),
     )
     async def get_frame_description(bv: str, frame_id: int) -> dict[str, Any]:
-        try:
-            out = await tool_registry.get_frame_description(
-                _ctx(), bv=bv, frame_id=frame_id
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "get_frame_description",
+            tool_registry.get_frame_description,
+            bv=bv,
+            frame_id=frame_id,
+        )
 
     @mcp.tool(
         name="list_lectures",
@@ -330,13 +378,13 @@ def build_mcp(
         domain: str | None = None,
         direction: str | None = None,
     ) -> dict[str, Any]:
-        try:
-            out = await tool_registry.list_lectures(
-                _ctx(), limit=limit, domain=domain, direction=direction
-            )
-        except ToolError as exc:
-            _handle_tool_error(exc)
-        return _dump(out)
+        return await _run_tool(
+            "list_lectures",
+            tool_registry.list_lectures,
+            limit=limit,
+            domain=domain,
+            direction=direction,
+        )
 
     if expose_summarize:
 
@@ -347,12 +395,11 @@ def build_mcp(
         async def summarize_video(
             url: str, force_refresh: bool = False
         ) -> dict[str, Any]:
-            try:
-                out = await tool_registry.summarize_video(
-                    _ctx(), url=url, force_refresh=force_refresh
-                )
-            except ToolError as exc:
-                _handle_tool_error(exc)
-            return _dump(out)
+            return await _run_tool(
+                "summarize_video",
+                tool_registry.summarize_video,
+                url=url,
+                force_refresh=force_refresh,
+            )
 
     return mcp

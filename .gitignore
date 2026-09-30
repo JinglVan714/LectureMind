@@ -50,6 +50,15 @@ README_develop.md
 /scripts/_verify_*.py
 /docs/*
 !/docs/deploy.md
+!/docs/cover.png
+!/docs/copilot.png
+
+# Internship writeups（个人求职材料，不公开）
+Internship/
+
+# Dev-only
+claude-progress.md
+feature_list.json
 
 .vscode/
 .idea/
@@ -59,6 +68,12 @@ README_develop.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Learning / reference materials (not part of the project)
+learn-harness-engineering/
+learn-harness-engineering-main.zip
+带教文档/
+Harness带教文档/
 
 # Build artefacts
 dist/
